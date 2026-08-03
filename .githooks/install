@@ -1,0 +1,13 @@
+#!/bin/sh
+# A repo-level core.hooksPath replaces a machine-wide one, so when a global path exists link into .git/hooks instead.
+root="$(git rev-parse --show-toplevel)" || exit 0
+if [ -n "$(git config --global core.hooksPath)" ]; then
+  git config --local --unset core.hooksPath
+  hooks="$(git rev-parse --git-common-dir)/hooks"
+  mkdir -p "$hooks"
+  for name in pre-commit pre-push; do
+    ln -sf "$root/.githooks/$name" "$hooks/$name"
+  done
+else
+  git config core.hooksPath .githooks
+fi

@@ -1,0 +1,5 @@
+#!/bin/sh
+export PATH="$HOME/.bun/bin:/opt/homebrew/bin:$PATH"
+cd "$(git rev-parse --show-toplevel)" || exit 1
+gitleaks detect --redact || exit 1
+bun run tools/scan-names.ts
