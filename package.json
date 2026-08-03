@@ -1,0 +1,72 @@
+{
+  "name": "offpeak",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*",
+    "services/*"
+  ],
+  "scripts": {
+    "router:dev": "bun run --filter @offpeak/router dev",
+    "scheduler:dev": "bun run --filter @offpeak/scheduler dev",
+    "auditor:dev": "bun run --filter @offpeak/auditor dev",
+    "host:dev": "bun run --filter @offpeak/host-agent dev",
+    "web:dev": "bun run --filter @offpeak/web dev",
+    "db:shared": "bun run packages/shared/src/migrate.ts",
+    "db:serving": "bun run db/serving/migrate.ts",
+    "tools:usage-faker": "bun run tools/usage-faker/main.ts",
+    "lint:claims": "bun run tools/lint-claims.ts",
+    "scan:names": "bun run tools/scan-names.ts",
+    "corpus:check": "bun run tools/validate-corpus.ts",
+    "test:b": "bun test packages apps services tools tests",
+    "test:integration": "bun test tests/integration",
+    "load:router": "bun run tools/load-router.ts",
+    "ci:local": "bun run scan:names && bun run lint:claims && bun run test:b",
+    "prepare": "sh .githooks/install || true",
+    "vectors": "bun run packages/shared/src/gen-vectors.ts",
+    "chain:local": "bun run tools/chain-local.ts",
+    "contracts:build": "cd contracts && forge build",
+    "contracts:test": "cd contracts && forge test",
+    "contracts:invariant": "cd contracts && forge test --match-path 'test/invariant/*'",
+    "abis": "cd contracts && forge build && cd .. && bun run tools/export-abis.ts",
+    "indexer:dev": "if [ \"$OFFPEAK_INDEXER_MODE\" = live ]; then bun run --filter @offpeak/indexer dev; else bun run --filter @offpeak/mock-indexer dev; fi",
+    "settlement:dev": "bun run services/settlement/src/main.ts",
+    "keepers:dev": "bun run --filter @offpeak/keepers dev",
+    "db:chain": "bun run db/chain/migrate.ts",
+    "facilitator:dev": "if [ \"$OFFPEAK_FACILITATOR_MODE\" = live ]; then bun run services/facilitator/src/main.ts; else bun run services/facilitator/src/main.ts --mock; fi",
+    "test:a": "bun test tests/integration/chain-local.test.ts tests/integration/ic1.test.ts tests/integration/ic2.test.ts tests/integration/indexer.test.ts tests/integration/boot.test.ts tests/integration/ic3.test.ts tests/integration/ic4.test.ts tests/integration/ic5.test.ts services/settlement services/common services/rulings services/facilitator services/keepers",
+    "scan:secrets": "gitleaks detect --redact",
+    "rulings:dev": "bun run services/rulings/src/main.ts",
+    "panel:packet": "bun run services/rulings/src/panel-cli.ts",
+    "contracts:fork": "cd contracts && OFFPEAK_RPC_URL=${OFFPEAK_RPC_URL:-https://robinhood.drpc.org} forge test --match-path 'test/fork/*'",
+    "contracts:gas": "cd contracts && forge snapshot --match-path 'test/gas/*' --check --tolerance 10",
+    "contracts:gas:update": "cd contracts && forge snapshot --match-path 'test/gas/*'",
+    "deploy:rehearse": "bun run tools/rehearse-deploy.ts",
+    "load:settlement": "bun run tools/load-settlement.ts",
+    "test:long": "OFFPEAK_LONG_TESTS=1 bun test tests/integration/settlement-72h.test.ts",
+    "deps:check": "bun run tools/check-deps.ts"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.3.0",
+    "viem": "^2.38.0"
+  },
+  "devDependencies": {
+    "@openzeppelin/contracts": "5.4.0",
+    "@types/bun": "^1.2.0",
+    "ioredis": "5",
+    "typescript": "^5.9.0"
+  },
+  "overrides": {
+    "ws": "8.21.0"
+  },
+  "trustedDependencies": [
+    "bufferutil",
+    "esbuild",
+    "fsevents",
+    "keccak",
+    "msgpackr-extract",
+    "secp256k1",
+    "utf-8-validate"
+  ]
+}

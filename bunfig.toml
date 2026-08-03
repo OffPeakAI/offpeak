@@ -1,0 +1,4 @@
+[install]
+# A new version waits 7 days before it can be installed. Most malicious releases are caught sooner.
+minimumReleaseAge = 604800
+exact = true
