@@ -1,0 +1,20 @@
+{
+  "name": "@offpeak/shared",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./sql/shared.sql": "./sql/shared.sql"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.3.0",
+    "@huggingface/jinja": "0.5.10",
+    "@huggingface/tokenizers": "0.2.0",
+    "@noble/hashes": "1.8.0",
+    "drizzle-orm": "0.45.4",
+    "secp256k1": "5.0.2",
+    "viem": "^2.38.0",
+    "zod": "^4.0.0"
+  }
+}
