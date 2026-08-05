@@ -1,0 +1,271 @@
+{
+  "note": "Anvil default mnemonic, accounts 1-9. Private keys are not stored. 1 router, 2 host, 3 buyer, 4-6 settlement, 7-9 ruling.",
+  "chainId": 4663,
+  "addresses": {
+    "router": "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+    "host": "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc",
+    "buyer": "0x90f79bf6eb2c4f870365e785982e1f101e93b906",
+    "settlers": [
+      "0x15d34aaf54267db7d7c367839aaf71a00a2c6a65",
+      "0x9965507d1a55bcc2695c58ba16fb37d819b0a4dc",
+      "0x976ea74026e726554db657fa54763abd0c3a0aa9"
+    ],
+    "rulings": [
+      "0x14dc79964da2c08b23698b3d3cc7ca32193d9955",
+      "0x23618e81e3f5cdf7f54c3d65f7fbc0abf5b21e8f",
+      "0xa0ee7a142d267c1f36714e4a8f75612f20a79720"
+    ],
+    "contracts": {
+      "MockUSDG": "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+      "MockOFPK": "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512",
+      "MockSwapAdapter": "0xa513E6E4b8f2a923D98304ec87F64353C4D5C853",
+      "OffpeakVault": "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0",
+      "HostRegistry": "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9",
+      "UsageLedger": "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9",
+      "X402Escrow": "0x5FC8d32690cc91D4c39d9d3abcBD16989F875707",
+      "ChannelManager": "0x0165878A594ca255338adfa4d48449f69242Eb8F",
+      "WindowMarket": "0x2279B7A0a67DB372996a5FaB50D91eAA73d2eBe6",
+      "AuditCourt": "0x8A791620dd6260079BF849Dc5567aDC3F2FdC318",
+      "OfpkHooks": "0xA51c1fc2f0D1a1b8494Ed1FE312d7C3a78Ed91C0",
+      "FeeSplitter": "0x610178dA211FEF7D417bC0e6FeD39F05609AD788",
+      "Permit2": "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+    }
+  },
+  "priceSheet": {
+    "hash": "0xf2ef6cbc8b4b46a924a1ab2e52ed503436ccf7dfd5b9b0c898c4a2238d86b072",
+    "structHash": "0xbf86292026e17bc1772a74dc4d20ea6a9078dc662a6aa7408f1f1608ffbe243d",
+    "signature": "0xd1687b462f32c2f156b99eeb509b70f1b48f4d35d0cc70b362ebc57792792212462225c34cdffd68d9f88ade4334f1d1d6474e764b2597899e762359a4af0f861c",
+    "host": "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc",
+    "modelDigest": "0x41cb2e305af69b1e464a7ff27d794d6b72fe44bba66020563c55527d2eb102c4",
+    "floorIn": "100000",
+    "floorOut": "400000",
+    "validFrom": "1700000000",
+    "nonce": "1",
+    "baseIn0": "200000",
+    "baseOut0": "800000"
+  },
+  "usage": [
+    {
+      "record": {
+        "reqId": "0x024c11f625a33384dbc4059954d2beacba7f6766ebfa341d1e831f52a94e0df5",
+        "buyerRef": "0x33d41a380fdf60aced459af9909ad5635a87e0d0e7258546559c2858e9c3c4b7",
+        "host": "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc",
+        "modelDigest": "0x41cb2e305af69b1e464a7ff27d794d6b72fe44bba66020563c55527d2eb102c4",
+        "tokensIn": 110,
+        "tokensOut": 21,
+        "promptHash": "0xd15b0d3e233c00ade1633251d33ae2b398a4793117bd5a48b2a474e842338d93",
+        "outputHash": "0x0afa2b17cb669058eb15a39759f5725458e216a2484f06c93d421758a6493e4d",
+        "priceIn": "250000",
+        "priceOut": "900000",
+        "hostCostMicro": "47",
+        "feeMicro": "2",
+        "payMode": 1,
+        "payRef": "0x2f25d16bbf4e77f1eac9a0ef6bab0ff91326f4dc5cccbd98a80093476546b540",
+        "ts": 1700003601,
+        "sheetHash": "0xf2ef6cbc8b4b46a924a1ab2e52ed503436ccf7dfd5b9b0c898c4a2238d86b072"
+      },
+      "structHash": "0xdcd1535b6319d2a278a53316237c54a732a0227b0474a3a614caacaf8be325da",
+      "routerSig": "0x823e54e5878cf31b8cbf249bad0dfea9c42d5be8cf68f5b094e9a34bc46e3e8a3894340c0db628ec0a9d4ac4b2a61e74266fe4f38e0c4f9a22a1a4c609f907e81b",
+      "hostSig": "0x3d68e93e4cfab9df1321c0bc855f4d6c5f9df8906b4e691fbd56d48d5680537958243c83e82789f1f20cb16c0c0997b2226394f5a03023eb50ca2840be4ec7ac1b",
+      "leaf": "0xfb5e14d86f2a7db9e13ea3d77d9a07adf22dca3d483f3e301026d5b0a278bc71",
+      "buyerPays": "49"
+    },
+    {
+      "record": {
+        "reqId": "0x121ed3d9cff6d9eec187d0e4c4165a6ced957fe2f2a9b5089d4b8544968aa50d",
+        "buyerRef": "0x4cca12deed73ed36686321eb74bef3df625b49a0e4fcfb6a797eaed09dda4447",
+        "host": "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc",
+        "modelDigest": "0x41cb2e305af69b1e464a7ff27d794d6b72fe44bba66020563c55527d2eb102c4",
+        "tokensIn": 140,
+        "tokensOut": 24,
+        "promptHash": "0xd15b0d3e233c00ade1633251d33ae2b398a4793117bd5a48b2a474e842338d93",
+        "outputHash": "0x0afa2b17cb669058eb15a39759f5725458e216a2484f06c93d421758a6493e4d",
+        "priceIn": "250000",
+        "priceOut": "900000",
+        "hostCostMicro": "57",
+        "feeMicro": "3",
+        "payMode": 2,
+        "payRef": "0x9c7191129763bccf8138d9ca466f78ce482717b7b70fb7e40bc679e3feb7b6c7",
+        "ts": 1700003604,
+        "sheetHash": "0xf2ef6cbc8b4b46a924a1ab2e52ed503436ccf7dfd5b9b0c898c4a2238d86b072"
+      },
+      "structHash": "0xbfbb803d712f0cd57f6081de6a49570eb3aa916806a66cd99340ad32cf824ad6",
+      "routerSig": "0x334505705a1f559c5842913b003906b17787331eb8f7d3e17fb290fff8307b103d426a70ab81c30f7420c1a3678a42ad6de24128e1d9bd3192b43b4705b9c8d21c",
+      "hostSig": "0x0e3cdd81f5d20bab006da81867c86baa7d92f8a3458b95ee56e8ff7c2454057b0724418b2d6f6aec95f144fc46e69f5dbd05279652fc1814dfc5ed1aa94ec27c1b",
+      "leaf": "0xf60e2e47605389a00dbb63a0e4780a5ce0561ab6db74e5078e77dd6d62245aba",
+      "buyerPays": "60"
+    },
+    {
+      "record": {
+        "reqId": "0x5dbfae5a8bf4bdf4738eb34ce0cc4434cde8ffecfb60c63b336ce49e4233389a",
+        "buyerRef": "0xa482ad86850f3dda8fceeafc0941305338a3188d1f0e54e16793fc6566577d34",
+        "host": "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc",
+        "modelDigest": "0x41cb2e305af69b1e464a7ff27d794d6b72fe44bba66020563c55527d2eb102c4",
+        "tokensIn": 100,
+        "tokensOut": 20,
+        "promptHash": "0xd15b0d3e233c00ade1633251d33ae2b398a4793117bd5a48b2a474e842338d93",
+        "outputHash": "0x0afa2b17cb669058eb15a39759f5725458e216a2484f06c93d421758a6493e4d",
+        "priceIn": "250000",
+        "priceOut": "900000",
+        "hostCostMicro": "43",
+        "feeMicro": "2",
+        "payMode": 0,
+        "payRef": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "ts": 1700003600,
+        "sheetHash": "0xf2ef6cbc8b4b46a924a1ab2e52ed503436ccf7dfd5b9b0c898c4a2238d86b072"
+      },
+      "structHash": "0x0dc41b8fc519deedc693dc98a77a9db4ae15d496c1bd65203b603fec45f753f5",
+      "routerSig": "0xe834d881ff0d8521e8ce33c93aabc638c1e7c178d9ac9f47ed9c61c9d5afce3357a1c65102a7541557d0d26eb55aa3ff9717b8be7d73e079a3afc04a593343dc1b",
+      "hostSig": "0xd8110802d13826126852e4d6eff7131d61b4f9babb9af0707eb29818cc36ad0774bfc34df4d4656bb12af2e7569994370281624ef6b3f10d81b9af864f9919101b",
+      "leaf": "0xb01c726ab0e5137284d9098f1499b6f1b459b3af929fb28f2524e50e5a35c4f0",
+      "buyerPays": "45"
+    },
+    {
+      "record": {
+        "reqId": "0x9208ede8813c8350c1350187660c622c1507eb2faed3a58ea8d1498dcf263140",
+        "buyerRef": "0xb34bd6e2040312aea5b3aaac6043128579997e987572b05bd5e871519f76f17b",
+        "host": "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc",
+        "modelDigest": "0x41cb2e305af69b1e464a7ff27d794d6b72fe44bba66020563c55527d2eb102c4",
+        "tokensIn": 120,
+        "tokensOut": 22,
+        "promptHash": "0xd15b0d3e233c00ade1633251d33ae2b398a4793117bd5a48b2a474e842338d93",
+        "outputHash": "0x0afa2b17cb669058eb15a39759f5725458e216a2484f06c93d421758a6493e4d",
+        "priceIn": "250000",
+        "priceOut": "900000",
+        "hostCostMicro": "50",
+        "feeMicro": "2",
+        "payMode": 3,
+        "payRef": "0x07d8822b18d3fb18924482bba5f42b44d14b812b1d167cf100b5521eb7c2b01c",
+        "ts": 1700003602,
+        "sheetHash": "0xf2ef6cbc8b4b46a924a1ab2e52ed503436ccf7dfd5b9b0c898c4a2238d86b072"
+      },
+      "structHash": "0x1f927a780362fa6f498d9b2d997249ee952df407c1688603bf49f026101be481",
+      "routerSig": "0xc387dbd02e30c4f688e9cf2f53f4b49f2c6e79ca9795185f66c5ed0e7ad5bfb14ed12ab1ffd0fdbf1ebb2624b62572d1910eb7fd149375e8a2e86f06a7a3554e1b",
+      "hostSig": "0x3aeb120cdb790a9866065847096e8303e3925a81856157c8901c23b5a61e07845f01b0edd4435d096641cc21e334b076e36cf61515645a06fec245ea7ec8945e1c",
+      "leaf": "0xb623f11db76365a392a91589d42153bdf3274f724312527a08909b37e78bce97",
+      "buyerPays": "52"
+    },
+    {
+      "record": {
+        "reqId": "0xc28375d014c6c69987c38c5762b1c0cb09af6d63c08543b9b12156dfe4649760",
+        "buyerRef": "0x600d0d152cd2c8dd699afebd73abf748a7413c6afbba7d3328556538364074b7",
+        "host": "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc",
+        "modelDigest": "0x41cb2e305af69b1e464a7ff27d794d6b72fe44bba66020563c55527d2eb102c4",
+        "tokensIn": 130,
+        "tokensOut": 50,
+        "promptHash": "0xd15b0d3e233c00ade1633251d33ae2b398a4793117bd5a48b2a474e842338d93",
+        "outputHash": "0x0afa2b17cb669058eb15a39759f5725458e216a2484f06c93d421758a6493e4d",
+        "priceIn": "0",
+        "priceOut": "0",
+        "hostCostMicro": "0",
+        "feeMicro": "0",
+        "payMode": 4,
+        "payRef": "0x3f19a1469fd9694c98ce71497a13d3f3d55c22ecb22ea6bf69f3495c81aa3ad1",
+        "ts": 1700003603,
+        "sheetHash": "0xf2ef6cbc8b4b46a924a1ab2e52ed503436ccf7dfd5b9b0c898c4a2238d86b072"
+      },
+      "structHash": "0x78c9d6954f7b13f4160197e73cf1dc47cad65047d129b5d7d996b5a59682eba2",
+      "routerSig": "0x2fbe0929871815a4f06071a6ecf6317d3c387b03944dc6dfbcedb1f97c4b77871a16862e0832a8d728b2a7e887acf985507211eefcd7c61675ea1dcdd975b1741b",
+      "hostSig": "0x13353f0c29bbf0b0128c0b7078ccfc90aa5d14406ceb332ac5eafddcb06b629617d747122fd5eb88e4bf5c409aec166c0354f66a0277b7dcd3dab1e54eda2cb81c",
+      "leaf": "0x46877c0c1578341cef1e13c112a2882fa814db503241b0a48bbb19ef99fcdcda",
+      "buyerPays": "0"
+    }
+  ],
+  "merkle": {
+    "root": "0xb27b4f1b96299b8d3bac523f6267e42f49eb2355d60180721945b03622330e1d",
+    "proofs": [
+      [
+        "0xf60e2e47605389a00dbb63a0e4780a5ce0561ab6db74e5078e77dd6d62245aba",
+        "0x87d33719d32b7e19daf4603fe62e33ebd6ae469d0ed98b1c252755128b6ca43c",
+        "0x46877c0c1578341cef1e13c112a2882fa814db503241b0a48bbb19ef99fcdcda"
+      ],
+      [
+        "0xfb5e14d86f2a7db9e13ea3d77d9a07adf22dca3d483f3e301026d5b0a278bc71",
+        "0x87d33719d32b7e19daf4603fe62e33ebd6ae469d0ed98b1c252755128b6ca43c",
+        "0x46877c0c1578341cef1e13c112a2882fa814db503241b0a48bbb19ef99fcdcda"
+      ],
+      [
+        "0xb623f11db76365a392a91589d42153bdf3274f724312527a08909b37e78bce97",
+        "0x029cf8f5217dcffc03b9e82e566c450b768346b6b39c3927b2833471d21cec7c",
+        "0x46877c0c1578341cef1e13c112a2882fa814db503241b0a48bbb19ef99fcdcda"
+      ],
+      [
+        "0xb01c726ab0e5137284d9098f1499b6f1b459b3af929fb28f2524e50e5a35c4f0",
+        "0x029cf8f5217dcffc03b9e82e566c450b768346b6b39c3927b2833471d21cec7c",
+        "0x46877c0c1578341cef1e13c112a2882fa814db503241b0a48bbb19ef99fcdcda"
+      ],
+      [
+        "0x2779faadd87e1c42a2ed1c991260e445c6b0296cbe7125403931f7728e2828ef"
+      ]
+    ]
+  },
+  "hourClose": {
+    "hour": "472223",
+    "records": 5,
+    "root": "0xb27b4f1b96299b8d3bac523f6267e42f49eb2355d60180721945b03622330e1d",
+    "totalsHash": "0xa830eb0fa91af44e9644265d107e2b16c1e7a5c1ae384102f48915a7d19c61ec",
+    "signature": "0x188f0c39b6fab00b80d828b17d0eeaed180a84a0daf33df5c6f3c93a059715633efaa111ad02d0f2be81e1c06b384fa7f740e1a81ee13c9aec796a92a1cce1721b",
+    "totals": {
+      "records": 5,
+      "tokensIn": "600",
+      "tokensOut": "137",
+      "prepaidDebit": "45",
+      "agentCollected": "161",
+      "windowDrawn": "180",
+      "hostCredit": "197",
+      "fees": "9"
+    }
+  },
+  "settleBatch": {
+    "thresholdSig": "0xbe4f110772efafb2b3b5f49fbd894227e1af23b6e52cdd9748d41825e1a674c66c68daecd1c345ce466c43221c0e822b2a48aa75d70b3f359ebc5f65a64b92ef1c6463fa9c7c9b8a00961119ef76a86fe15d92ab5f405ec628b83f427ae2b669372872bfa68ce37b14bc8bb4913aad9efc11c2fc5da9b6b9e6a7f64d485740ea371b",
+    "signers": [
+      "0x15d34aaf54267db7d7c367839aaf71a00a2c6a65",
+      "0x976ea74026e726554db657fa54763abd0c3a0aa9"
+    ],
+    "fees": "9",
+    "agentPoolDraw": "161",
+    "reserveDraw": "0"
+  },
+  "refundBatch": {
+    "batchId": "472223",
+    "payer": "0x90f79bf6eb2c4f870365e785982e1f101e93b906",
+    "amount": "1234",
+    "refundId": "0x39e096bb808f40ca8163d1c524e1c122a377e219274c5060c8c9b97e7870f7cb",
+    "structHash": "0x110fb4ccc3a74a4172a606495405f1670e5ffe0b965c6e67775fba7df6aeba2e",
+    "thresholdSig": "0x5887ccd972d99e5e13de93e2274d415301bfc4f3b28f781c274f8d2b3b574bc3096dda68ce3d77314ffde40b9c8291851c387164c57b0c383787aa7f1fc181831b9b90fb75086eb1f4d98d3d95e62df9407e0ad322718fa53ab3866973340723f36e8965e4cb1dfec60ae11e9ec304021fcc3b7a61444e4d9913a859b0129b0c051c"
+  },
+  "rewardBatch": {
+    "week": "2811",
+    "host": "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc",
+    "amount": "5678",
+    "structHash": "0xc609b209a859c299c7b4966d9b619498ed60c41ac01baf5e6ce8501019c3541a",
+    "thresholdSig": "0xb7d27ca622a820f379c78370a5d01b3a2fcf019491c65581185cad880942e3a34082a2510d7489abf826a85785c3c71ae3eff0ee97ab75c3fdaa170bdae3b05f1cfcd69dd815df28db61463145367c9adc8dd3a304c75fb1e24fad41cc13f06a893e6237cdb457b3eaf9b63670f8f5a1f6841404ee07a029fc6682a8b50afcbc361b"
+  },
+  "voucher": {
+    "channelId": "0x706f247b800ddcfc035df6460f09a2d3a7b2f718ef245fe540e82e2277a23255",
+    "seq": "1",
+    "cumulative": "123456",
+    "signature": "0xb8041e1c2ec8e0c802a4cb2bf489463fa5918891c7623858b939d1f1f466e69d5a017dfb39f69e278b90710ab711ded35c373d5b6a3aee259ee088623e4b06ae1c"
+  },
+  "permit2": {
+    "uptoWitnessType": "UptoWitness witness)TokenPermissions(address token,uint256 amount)UptoWitness(bytes32 reqId,address payee,uint256 maxAmount,uint64 validBefore,bytes32 resourceHash)",
+    "exactWitnessType": "ExactWitness witness)ExactWitness(bytes32 reqId,address payee,uint256 amount,uint64 validBefore,bytes32 resourceHash)TokenPermissions(address token,uint256 amount)",
+    "channelWitnessType": "ChannelOpenWitness witness)ChannelOpenWitness(bytes32 channelSalt,address payee,uint64 expiry)TokenPermissions(address token,uint256 amount)",
+    "uptoDigest": "0xe42f807baf44fae556e6bf4d3c1edbdb2a082784b0a5659663efeace87c14e53",
+    "exactDigest": "0x3dc4e0cd42be7e017863a0fb21ca0613c38dd53187a2b5ef4325d84c5bbedab6",
+    "uptoStruct": "0x40822554d533b59449fd498fe30154e758e992145edd94e2a74ea4d456f9bcde",
+    "exactStruct": "0xa527cdd6f635450075df3d306b8c0d1ef29e332374c91a2ad8e2da1d17fd4bba"
+  },
+  "ruling": {
+    "challengeId": "7",
+    "outcome": 1,
+    "slashBps": 2000,
+    "refundRoot": "0x60c23d2a7163ef21ef718483ade0568dea1f485ed4ed3d13c76620c40cf8ad04",
+    "reasonHash": "0x3d3ee6386b6ea68cef9c5b0d00eab64ce02cfc864a75ea05768dc7b3312999df",
+    "thresholdSig": "0x11937889746c6fa19ffc64e88eaff510997b891895da413d1c9cdc80458f0f4477f860e329f39483f23fe3e3c9c3dd69616cbcec9efd567aad8da9264a1432421b5900f7b36200c762f5d15ce33cb88803d8c30214f165c832d3c5e25f3a5b928f65c2c9cde2d7d2bb87e4bbbbf177733f8403c1d43350d2b1d8df9cca9e31b8901b",
+    "signers": [
+      "0x14dc79964da2c08b23698b3d3cc7ca32193d9955",
+      "0x23618e81e3f5cdf7f54c3d65f7fbc0abf5b21e8f"
+    ]
+  }
+}
