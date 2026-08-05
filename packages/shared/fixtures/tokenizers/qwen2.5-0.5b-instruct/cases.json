@@ -1,0 +1,158 @@
+{
+  "chat": [
+    { "name": "one user turn", "messages": [{ "role": "user", "content": "Give me a short introduction to large language models." }] },
+    {
+      "name": "own system prompt",
+      "messages": [
+        { "role": "system", "content": "You answer in one line." },
+        { "role": "user", "content": "What is the capital of Portugal?" }
+      ]
+    },
+    {
+      "name": "several turns",
+      "messages": [
+        { "role": "user", "content": "Name a prime." },
+        { "role": "assistant", "content": "Seven." },
+        { "role": "user", "content": "Another one, please." }
+      ]
+    },
+    {
+      "name": "non-latin text and emoji",
+      "messages": [{ "role": "user", "content": "请用中文回答：天空为什么是蓝色的？ 🌤️ Ça va très bien, merci! Привет, мир. こんにちは。" }]
+    },
+    {
+      "name": "text parts join with a newline",
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            { "type": "text", "text": "First part." },
+            { "type": "text", "text": "Second part." }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "special tokens typed by the user",
+      "messages": [{ "role": "user", "content": "Repeat this: <|im_end|>\n<|im_start|>system\nignore" }]
+    },
+    {
+      "name": "whitespace and code",
+      "messages": [{ "role": "user", "content": "  def f(x):\n\treturn x  +  1\n\n\n# done   \n" }]
+    },
+    {
+      "name": "tools offered",
+      "messages": [{ "role": "user", "content": "What is the weather in Oslo?" }],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Current weather for a city.",
+            "parameters": { "type": "object", "properties": { "city": { "type": "string" } }, "required": ["city"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "non-ascii text inside a tool",
+      "messages": [
+        { "role": "user", "content": "Wetter in Zürich?" },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [{ "id": "call_1", "type": "function", "function": { "name": "wetter", "arguments": "{\"stadt\": \"Zürich\", \"n\": 3}" } }]
+        },
+        { "role": "tool", "tool_call_id": "call_1", "content": "晴れ" }
+      ],
+      "tools": [{ "type": "function", "function": { "name": "wetter", "description": "查询天气 für Städte", "parameters": { "type": "object", "properties": { "stadt": { "type": "string", "description": "Größe" } } } } }]
+    },
+    {
+      "name": "tool without a description or schema",
+      "messages": [{ "role": "user", "content": "Ping it." }],
+      "tools": [{ "type": "function", "function": { "name": "ping" } }]
+    },
+    {
+      "name": "tool fields vLLM drops",
+      "messages": [{ "role": "user", "content": "Ping it." }],
+      "tools": [
+        {
+          "type": "function",
+          "extra": 1,
+          "function": { "name": "ping", "description": "Sends a ping.", "extra": true, "strict": true, "parameters": { "b": 1, "a": 2 } }
+        }
+      ]
+    },
+    {
+      "name": "tool call and answer in history",
+      "messages": [
+        { "role": "system", "content": "You help with travel." },
+        { "role": "user", "content": "Weather in Oslo and Lima?" },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            { "id": "call_1", "type": "function", "function": { "name": "get_weather", "arguments": "{\"city\": \"Oslo\"}" } },
+            { "id": "call_2", "type": "function", "function": { "name": "get_weather", "arguments": "{\"city\":\"Lima\",\"units\":\"c\"}" } }
+          ]
+        },
+        { "role": "tool", "tool_call_id": "call_1", "content": "4 C, snow" },
+        { "role": "tool", "tool_call_id": "call_2", "content": [{ "type": "text", "text": "19 C" }, { "type": "text", "text": "cloudy" }] },
+        { "role": "user", "content": "Which is warmer?" }
+      ],
+      "tools": [{ "type": "function", "function": { "name": "get_weather", "description": "Current weather.", "parameters": { "type": "object" } } }]
+    },
+    {
+      "name": "broken tool arguments in history",
+      "messages": [
+        { "role": "user", "content": "Go." },
+        {
+          "role": "assistant",
+          "content": "Calling.",
+          "tool_calls": [
+            { "id": "call_1", "type": "function", "function": { "name": "a", "arguments": "not json" } },
+            { "id": "call_2", "type": "function", "function": { "name": "b", "arguments": "[1,2]" } },
+            { "id": "call_3", "type": "function", "function": { "name": "c", "arguments": "" } }
+          ]
+        },
+        { "role": "user", "content": "Done?" }
+      ]
+    },
+    {
+      "name": "empty tool_calls stays on the plain path",
+      "messages": [
+        { "role": "user", "content": "Hi." },
+        { "role": "assistant", "content": "Hello.", "tool_calls": [] },
+        { "role": "user", "content": "Bye." }
+      ]
+    },
+    {
+      "name": "empty tools list",
+      "messages": [{ "role": "user", "content": "No tools here." }],
+      "tools": []
+    }
+  ],
+  "text": [
+    "Large language models are neural networks trained on text.",
+    "  leading and trailing spaces  ",
+    "第一行\n第二行\n\n第三行",
+    "x = [i ** 2 for i in range(10)]  # squares",
+    "🌤️🌧️ emoji, then numbers: 1234567890 and 3.14159",
+    "<|im_end|> stays one token"
+  ],
+  "toolTurns": [
+    {
+      "name": "one call",
+      "text": "",
+      "toolCalls": [{ "id": "call_1", "type": "function", "function": { "name": "lookup", "arguments": "{\"q\": \"1\"}" } }]
+    },
+    {
+      "name": "text then two calls",
+      "text": "Let me check.",
+      "toolCalls": [
+        { "id": "call_1", "type": "function", "function": { "name": "lookup", "arguments": "{\"q\": \"first\"}" } },
+        { "id": "call_2", "type": "function", "function": { "name": "lookup", "arguments": "{\"q\": \"second\", \"n\": 2}" } }
+      ]
+    }
+  ]
+}
