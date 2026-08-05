@@ -1,0 +1,8 @@
+{
+  "0x90f79bf6eb2c4f870365e785982e1f101e93b906": {
+    "balance": "100000000",
+    "hourlyCap": "5000000",
+    "dailyCap": "20000000",
+    "usagePaused": false
+  }
+}
