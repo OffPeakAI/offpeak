@@ -1,0 +1,7 @@
+GasTest:testGas_applyDraws100() (gas: 4161311)
+GasTest:testGas_authorizeBatch20() (gas: 1921230)
+GasTest:testGas_captureBatch50() (gas: 1388489)
+GasTest:testGas_settle100Credits() (gas: 14789653)
+GasTest:testGas_settle500Debits() (gas: 31084055)
+GasTest:testGas_settle500RepeatDebits() (gas: 12195284)
+GasTest:testGas_settleChannel() (gas: 129657)
