@@ -135,3 +135,127 @@ export class ModelTokenizer {
     if (typeof message.name === "string") out.name = message.name
     return out
   }
+
+  private apply(messages: ChatMessage[], tools: unknown[] | null, addGenerationPrompt: boolean): string {
+    const template = tools && tools.length > 0 ? this.toolTemplate : this.template
+    if (!template) throw new Error("this model has no chat template")
+    return template.render({
+      ...this.specials,
+      messages: messages.map((message) => this.message(message)),
+      tools: tools?.map(toolForTemplate),
+      add_generation_prompt: addGenerationPrompt,
+    })
+  }
+
+  /** The prompt exactly as vLLM renders it for this request, generation prompt included. */
+  render(body: ChatBody): string {
+    return this.apply(body.messages ?? [], Array.isArray(body.tools) ? body.tools : null, true)
+  }
+
+  /** Token ids of text that already holds its special tokens. Matches `add_special_tokens=False`. */
+  encode(text: string): number[] {
+    return this.tokenizer.encode(text, { add_special_tokens: false }).ids
+  }
+
+  decodeToken(id: number): string {
+    return this.tokenizer.decode([id], { skip_special_tokens: false })
+  }
+
+  countText(text: string): number {
+    return this.encode(text).length
+  }
+
+  countChat(body: ChatBody): number {
+    return this.countText(this.render(body))
+  }
+
+  /** The assistant turn a tool call came from, as this model's template writes one. */
+  private toolTurn(text: string, toolCalls: unknown[]): string | null {
+    try {
+      const question: ChatMessage[] = [{ role: "user", content: "x" }]
+      const prefix = this.apply(question, null, true)
+      const full = this.apply([...question, { role: "assistant", content: text, tool_calls: toolCalls }], null, false)
+      return full.startsWith(prefix) ? full.slice(prefix.length).trimEnd() : null
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * vLLM's `completion_tokens` holds the end token when the model stopped on its own, though the text does not.
+   * A tool turn from the template already ends in it.
+   */
+  countOutput(text: string, toolCalls?: unknown[] | null, finish?: string | null): number {
+    const ended = finish === "stop" || finish === "tool_calls" ? 1 : 0
+    if (!toolCalls || toolCalls.length === 0) return this.countText(text) + ended
+    const turn = this.toolTurn(text, toolCalls)
+    return turn === null ? this.countText(`${text}${JSON.stringify(toolCalls)}`) + ended : this.countText(turn)
+  }
+
+  /** vLLM's embeddings path keeps `add_special_tokens` on, input by input. */
+  countInputs(inputs: string[]): number {
+    return inputs.reduce((sum, input) => sum + this.tokenizer.encode(input).ids.length, 0)
+  }
+}
+
+function countBytes(spec: TokenizerSpec, text: string): number {
+  let rest = text
+  let count = 0
+  const specials = [...spec.addedTokens].sort((a, b) => b.content.length - a.content.length)
+  while (rest.length > 0) {
+    const hit = specials.find((token) => rest.startsWith(token.content))
+    if (hit) {
+      count += 1
+      rest = rest.slice(hit.content.length)
+      continue
+    }
+    const cp = rest.codePointAt(0)!
+    const chars = cp > 0xffff ? 2 : 1
+    count += new TextEncoder().encode(rest.slice(0, chars)).length
+    rest = rest.slice(chars)
+  }
+  return count
+}
+
+/** Builds a model's tokenizer from its pinned files. `read` answers with a file's text, or `null` when the model has none. */
+export function modelTokenizerFrom(read: (path: string) => string | null, contentFormat?: ModelTokenizerFiles["contentFormat"]) {
+  const config = read("tokenizer_config.json")
+  return new ModelTokenizer({
+    tokenizerJson: JSON.parse(read("tokenizer.json") ?? "null"),
+    tokenizerConfig: config ? JSON.parse(config) : {},
+    chatTemplate: read("chat_template.jinja") ?? undefined,
+    contentFormat,
+  })
+}
+
+/** With a `TokenizerSpec`, byte-level counts plus one token per known special string. Matches the mock engine. */
+export function countText(spec: TokenCounter, text: string): number {
+  return spec instanceof ModelTokenizer ? spec.countText(text) : countBytes(spec, text)
+}
+
+export function countChat(spec: TokenCounter, messages: ChatMessage[], tools?: unknown): number {
+  if (spec instanceof ModelTokenizer) return spec.countChat({ messages, tools })
+  return countBytes(spec, renderChat(messages, tools))
+}
+
+export function countOutput(spec: TokenCounter, text: string, toolCalls?: unknown[] | null, finish?: string | null): number {
+  if (spec instanceof ModelTokenizer) return spec.countOutput(text, toolCalls, finish)
+  const extra = toolCalls && toolCalls.length > 0 ? `\u0000${JSON.stringify(toolCalls)}` : ""
+  return countBytes(spec, `${text}${extra}`)
+}
+
+export function countInputs(spec: TokenCounter, inputs: string[]): number {
+  if (spec instanceof ModelTokenizer) return spec.countInputs(inputs)
+  return inputs.reduce((sum, input) => sum + countBytes(spec, input), 0)
+}
+
+export const LAUNCH_TOKENIZER: TokenizerSpec = {
+  addedTokens: [
+    { id: 256, content: "<bos>" },
+    { id: 257, content: "<eos>" },
+    { id: 258, content: "<user>" },
+    { id: 259, content: "<assistant>" },
+    { id: 260, content: "<system>" },
+    { id: 261, content: "<tool>" },
+  ],
+}

@@ -691,3 +691,342 @@ type Quote = { snapshotId: string; how: number; hostCandidates: HostCandidate[];
   Cost fields come only from `packages/shared/money.ts`. For `payMode 4` all price and cost fields are 0.
 - Persistence: `capturePayment` inserts into `shared.usage_records` and `serving.requests` (metadata only: req id, account, model, host, tokens, latency, ttft, status, error code, pay mode; never prompt or output text) in one transaction with the hold capture or agent-payment update.
 - `hourclose.ts`: BullMQ job at `hourEnd(H) + 600` s: lock the hour (`SELECT … FOR UPDATE` on a `serving.hour_locks` row so no insert races), build the tree and `RootTotals` from `shared.usage_records`, sign `HourClose`, insert `shared.usage_hours`. Idempotent. Must complete by `hourEnd(H) + 900`.
+
+### 4.3 Pricebook, load and live prices (`pricing/`)
+
+**Price sheets**
+```ts
+type PriceSheet = { host: Hex; modelDigest: Hex; baseIn: bigint[168]; baseOut: bigint[168]; floorIn: bigint; floorOut: bigint; validFrom: number; nonce: bigint };
+validateSheet(s: PriceSheet, sig: Hex): Result<{ sheetHash: Hex }, SheetError>
+```
+Rules: EIP-712 signature by the host operator (domain `OffpeakPriceSheet`); every base > 0; `floorIn * 10000 ≤ 6000 * min(baseIn)` and `floorOut * 10000 ≤ 6000 * min(baseOut)` (error `floor_above_0_6_min_base`); `validFrom ≥ now + 3600` (hosts cannot reprice the current hour); `nonce` strictly increasing per host and model; at most 24 sheet changes per host per week. Stored in `serving.price_sheets` with the signature; served at `GET /v1/prices/sheets/:hash`. The sheet in force for a request is the latest one with `validFrom ≤ ts`.
+
+**Load measurement (`load.ts`)**: the router, not the host, measures utilisation. For each host × model, every second: `served_tps = tokens streamed in the last 1 s (output) + prefill tokens / 4` (prefill weighted); `u = EWMA_60s(served_tps) / maxTps` where `maxTps` is the registered value from `HostRegistry` (via indexer). Every 15 s write `serving.host_load(host, model_digest, ts, util, ttft_p95, inflight, healthy)` (Timescale hypertable, 90-day retention, 1-minute continuous aggregate).
+
+**Live price (`live.ts`)**
+```ts
+loadFactorBps(u: number): number   // clamp(4000 + 10000·u, 4000, 12000)
+livePrice(sheet, how, lfBps): { in: PricePerM; out: PricePerM }
+  // in  = max(floorIn,  ceilDiv(baseIn[how]  * lfBps, 10000))
+  // out = max(floorOut, ceilDiv(baseOut[how] * lfBps, 10000))
+```
+A price snapshot (all hosts × models) is computed every 15 s, given an id, stored in Redis for 1 h. The request is billed at the snapshot in force at its start (`quote.snapshotId`), never re-priced mid-stream. Buyer price = host price + fee (3.2).
+
+**Forecast (`forecast.ts`)**: per host × model × hour of week, EWMA over the last 4 weeks of hourly mean `u` (default 0.3 when no history). `forecastPrice(host, model, hour)` = live-price formula on the forecast `u`. Used by `/v1/prices` (next 168 h) and the scheduler.
+
+**Stats (`stats.ts`)**: per host, 30-day effective discount = `1 − Σ billed host cost / Σ (tokens × base price at that request's hour)`, computed nightly into `serving.host_stats` and shown on the price page.
+
+### 4.4 Routing (`routing/`)
+```ts
+selectHost(ctx, model: ModelEntry, quote: PartialQuote, opts: { sealed: boolean; windowHost?: Hex; canary?: boolean }): HostCandidate[]
+```
+1. Candidates: hosts serving `modelDigest` with `routable == true` (indexer) and status `Active`; hosts in `Probation` only when `opts.canary`; sealed requests only hosts with a verified attestation (4.10); a Window request only the Window's host.
+2. Healthy: health probe OK within 30 s, 5-minute error rate < 5%, `u < 0.95`, and for interactive requests TTFT p95 over 15 minutes < 1.5 s.
+3. Price: live buyer price ≤ `maxPrice` when given.
+4. Order by live host price ascending; within 1% of the best, by routing weight `bondUsdg × (10000 + routingBonusBps) / 10000`, then audit record (fewer strikes, then more audited samples this week).
+5. Return the top 3 for failover.
+
+`hostclient.ts`: HTTP/2 keep-alive pool per host; each request carries `X-Offpeak-Req` = `{reqId, ts, bodyHash}` signed by the router key so the host agent can refuse traffic not from the router.
+
+### 4.5 Billing (`pay/`)
+
+#### 4.5.1 Prepaid (vault balance)
+```ts
+type BuyerChain = BuyerView & { servable: boolean; reason?: string; fetchedAt: number };
+getBuyer(ctx, wallet): Promise<BuyerChain>   // indexer, cached in Redis, invalidated by offpeak:chain push
+holdPrepaid(ctx, wallet, maxCostMicro): Promise<Hold | { error: "insufficient_reserve" | "withdraw_pending" | "paused" }>
+capturePrepaid(ctx, hold, actualMicro): Promise<void>
+releaseHold(ctx, hold): Promise<void>
+```
+`holds.lua` runs atomically per buyer and admits a hold only if all hold:
+- `servable` (no withdraw request, not paused, balance > 0, caps > 0);
+- current-hour spend + open holds in this hour + new hold ≤ effective hourly cap now (the **lower** of the current and any pending cap);
+- today's spend + open holds + new hold ≤ effective daily cap now;
+- unsettled spend (all `shared.usage_records` for this payer in hours after `lastSettledHour`, tracked in Redis counters rebuilt from SQL on start) + open holds + new hold ≤ on-chain `balance`.
+
+The hold is `maxCostMicro = cost(tokensInEst, maxTokensOut, live price) + fee`. Capture charges the actual cost (≤ hold; if actual > hold because of a tokenizer edge case, charge the hold and flag). Holds expire after 15 minutes. `WithdrawAllRequested`, `CapsChangeRequested`, `Paused` pushes cancel admission for that buyer within 1 s; in-flight requests finish (their start `ts` is before the request time).
+
+#### 4.5.2 Channels (primary agent path)
+```ts
+admitChannel(ctx, channelId, newMaxMicro): Promise<ChannelAdmit | ChannelError>
+acceptVoucher(ctx, channelId, v: { seq: bigint; cumulative: Micro; sig: Hex }): Promise<void>
+```
+- Channel view from the indexer: status `Open`, `expiry > now + 2h`, not `CloseRequested`.
+- Local state: `V` = latest accepted voucher cumulative (`shared.channel_state`), `U` = cost of served records not yet covered by a voucher.
+- Admit if `U + newMax ≤ creditLimit` (default `min(250,000 µUSDG, 10% of deposit)`) and `V + U + newMax ≤ deposit`.
+- After the response the envelope and `X-Offpeak-Channel-Owed` report `owed = V + U`. The client signs `Voucher{channelId, seq, cumulative = owed}` and sends it with its next request or via `POST /v1/channels/:id/voucher`.
+- `acceptVoucher`: payer signature valid (EOA or EIP-1271) under `OffpeakChannel`; `seq > latest`; `cumulative` equals an owed value the router reported at a response boundary (otherwise reject); then in one transaction update `shared.channel_state` and insert `shared.agent_payments{payment_id = keccak256(abi.encode(channelId, seq)), kind: "channel", amount_micro = cumulative − V, req_ids = covered records}`.
+- No chain transaction per request; signature checks only. Exposure if a client stops signing is bounded by `creditLimit`; this is a house risk and is reported in metrics (`channel_unvouchered_micro`).
+- On `CloseRequested` (push), stop admitting at once; the keeper (Doc A) lands the latest voucher.
+
+#### 4.5.3 x402 (`upto` fallback, `exact` for known-cost calls)
+- 402 body (x402 v2 `PaymentRequired`, also in the `PAYMENT-REQUIRED` header), `accepts` in this order:
+  1. `{ scheme: "channel", network: "eip155:4663", asset: USDG, extra: { channelManager, payee, minDeposit: "1000000", minExpirySeconds: 21600, creditLimit } }`
+  2. `{ scheme: "upto", network, asset, maxAmountRequired, payTo: vault, extra: { permit2, spender: x402Escrow, reqId, validBefore, witness: "UptoWitness" } }`, included only when `maxAmountRequired ≥ 50,000 µUSDG`
+  3. `{ scheme: "exact", … }` only for embeddings and fixed-cost calls.
+- `upto` flow (TTFT-safe):
+  1. `fac.verify` (≤ 40 ms). Invalid → 402 with reason.
+  2. `fac.settle({mode: "authorize"})` returns `submitted`; subscribe to `Authorized:<reqId>` / `AuthorizeFailed:<reqId>`.
+  3. Start the host call at once. Stream to the client until the pre-confirmation budget is reached (256 output tokens or 20,000 µUSDG of cost, whichever first). If `Authorized` has not arrived, buffer further tokens (do not send) until it does; if it has not arrived in 15 s, or `AuthorizeFailed` arrives, end the stream with an error event and do not bill. Interactive TTFT never waits on the chain.
+  4. After completion, `fac.capture({reqId, actual})` and insert `shared.agent_payments{payment_id: reqId, kind: "upto", amount_micro: actual}` with the usage record in one transaction.
+- `exact` (embeddings): verify, settle `exact`, serve; same budget rules apply to large inputs.
+- Metrics: `ttft_ms{pay_mode}`, `upto_preconfirm_stall_ms`, `upto_unbilled_micro`.
+
+#### 4.5.4 Windows
+- `X-Offpeak-Window: <id>` draws the Window first. Admit if `t0 ≤ now < t1`, holder (the key's wallet) available tokens = `balance × 1e6 − drawnPartial − pendingLocalDraws ≥ tokensInEst + maxTokensOut`. Route to the Window's host only.
+- Records: `payMode 4`, `payRef = bytes32(windowId)`, zero prices.
+- If tokens run short and `X-Offpeak-Window-Fallback: prepaid` is set, serve from prepaid instead; otherwise `402 window_exhausted`.
+- Throughput sampling: every minute per active Window, write `shared.window_perf(window_id, ts, tokens_per_s, demanded)` where `demanded` = any holder request waited or was in flight. Windows reserve capacity: the router keeps the Window host's share for holders and serves non-holders only from the remaining capacity.
+
+### 4.6 Hosts API and onboarding (`hosts-api/`)
+- `POST /v1/hosts/register`: body `{ operator, endpoint, models: [{name, digest, maxTps}], imageDigest, gpuClass, attestation? }` signed by the operator (EIP-191 personal message over the canonical JSON). Returns the `HostRegistry.register` calldata for the operator to send. When the indexer reports `HostRegistered`, the router probes the endpoint (`/offpeak/v1/info`, digest checks, sample request) and the host enters canary-only probation for 72 h.
+- `POST /v1/hosts/price-sheet`: signed `PriceSheet`; validated by 4.3.
+- `GET /v1/hosts/payouts`: credits pending, releasable, clawed (from the indexer) plus served tokens per hour.
+- `POST /v1/hosts/audit-response`: uploads the host's response document for a challenge (stored content-addressed) and returns `AuditCourt.respond` calldata with its hash.
+
+### 4.7 Scheduler: night jobs (`apps/scheduler`)
+- Intake: `POST /v1/batches` (or any chat request with `X-Offpeak-Flex`). Prepaid accounts only in P2 (channels in a later interface change).
+- `plan.ts`:
+  ```ts
+  planJob(job: { lines: BatchLine[]; model: ModelEntry; deadline: number; maxPrice?: Price; buyer: Hex }): Plan
+  type Plan = { lockedPrice: { in: PricePerM; out: PricePerM }; estimatedMaxMicro: Micro; slots: { hour: number; lines: number[] }[] };
+  ```
+  Eligible hours = whole hours from the next hour to the hour before `deadline − 30 min`. `lockedPrice` = the token-weighted **average** forecast live price over the eligible hours that the plan actually uses (not the minimum), computed when the job is accepted, plus fee. Spreading: water-fill lines into hours in order of forecast price, putting at most 20% of an hour's forecast idle capacity (all hosts for that model) and at most the buyer's hourly cap into any one hour, so jobs do not pile onto one hour. If `maxPrice` is given and the locked price exceeds it, reject with `price_above_cap` and the cheapest feasible deadline.
+- Admission: the whole `estimatedMaxMicro` must fit the buyer's caps across the planned hours and their balance; the scheduler places per-hour holds when each hour starts.
+- `run.ts`: at each slot hour, executes lines through the normal pipeline with `quote` overridden to `lockedPrice` (records carry the locked price; hosts that opted in to night jobs receive it, which is never below their floor because it averages `max(floor, …)` values). If live prices in the slot are above the locked price, the scheduler first moves lines to later eligible hours; in the last eligible hour it runs anyway at the locked price.
+- Output: OpenAI batch output JSONL with each line's `offpeak_usage` envelope; batch object carries `offpeak: { locked_price, deadline, planned_hours, estimated_cost, actual_cost }`.
+- Cancel: lines not yet run are released.
+
+### 4.8 Host agent (`apps/host-agent`)
+
+Runs on the host's machine next to vLLM. The host operator's key (`OFFPEAK_HOST_OPERATOR_KEY`) never leaves this machine.
+
+- `config.ts`: `host.yaml` with `operator`, `endpoint`, `gpuClass`, `image: vllm/vllm-openai@sha256:<digest>`, and models `[{ name, path, manifest, maxTps, vllmArgs }]`. Allowed `vllmArgs` are a fixed list per model in the approved recipe (tensor parallel size, max model len, dtype, enable prefix caching). Anything outside the recipe fails boot.
+- `digest.ts`: at boot, hash every model file, build the manifest (`path\tsha256`), compute `modelDigest` (3.2) and refuse to start if it differs from the registered digest. Re-hash daily.
+- `gpu.ts`: read `nvidia-smi --query-gpu=name,memory.total,uuid --format=csv`; map to a GPU class; refuse to start on mismatch with `host.yaml` and the registration.
+- `proxy.ts`: `POST /offpeak/v1/chat/completions` and `/offpeak/v1/embeddings` accept only requests with a valid router `X-Offpeak-Req` signature (router address from config, checked against `UsageLedger.routerSigner` at boot); forward to vLLM on localhost; stream back. `GET /offpeak/v1/info` returns `{ operator, modelDigests, imageDigest, gpuClass, agentVersion, sealed, nightJobModels }`. The agent speaks plain HTTP on loopback, behind a TLS proxy the operator runs, and checks the signature header before it reads a body. `POST /offpeak/v1/score` (reference hosts only, auditor-authenticated): teacher-forcing scorer that returns per-token log-probabilities of a given output under the model (`prompt_logprobs` over chat-template(prompt) + output, `max_tokens: 1`).
+- `meter.ts`: counts input and output tokens with the same tokenizer and template as the router; also records vLLM's `usage`.
+- `sign.ts`: `POST /offpeak/v1/sign` receives the router's `UsageRecord` and `routerSig`; checks that `reqId` was served here, that `modelDigest`, prices (against the host's own sheets) and token counts are within tolerance (3.4); returns `hostSig` and `hostCounts`. Keeps a local append-only log of signed records for 30 days (the host's own evidence in disputes).
+- `health.ts`: `GET /offpeak/v1/health` with in-flight requests and queue depth (advisory; the router measures load itself).
+- `cli.ts` (`offpeak-host`): `init`, `verify` (digests, GPU, image), `register` (prints and optionally sends `HostRegistry.register` with the operator key; bonds pulled in USDG and optionally $OFPK), `price-sheet set --file sheet.json` (validates the floor rule locally, signs EIP-712, posts), `credits` and `credits withdraw`, `exit`.
+- `mock-engine.ts` (`--mock-engine`): deterministic fake OpenAI server (output = a seeded function of the prompt) so the whole stack runs without GPUs; supports a `--swap-rate 0.1 --swap-model small` mode for auditor simulations.
+
+### 4.9 Auditor (`apps/auditor`)
+
+The auditor finds hosts that serve a different or quantised model than they registered, and metering or throughput breaches. It files bonded challenges with `OFFPEAK_AUDITOR_KEY`. Rulings and the human panel are Doc A's services; the auditor supplies the evidence.
+
+**Inputs**
+1. **Canaries** (`canaries.ts`): sent through ordinary-looking prepaid accounts (auditor-funded vault wallets, varied caps, ages and request patterns), at ~0.5% of each host's requests, with realistic prompts from an operator-held corpus file outside this repo, because hosts build from it (licensed or self-written; no customer data; `corpus/sample.json` is for tests only) and parameters drawn from the live distribution of real traffic (temperature, top_p, max_tokens, tools). The router cannot tell hosts which requests are canaries; it routes them normally (canary accounts are not flagged anywhere the host can observe). A subset are deterministic prompts at temperature 0 with short, robust expected answers; the check accepts any answer in the set observed on reference hosts across GPU classes.
+2. **Audit samples** (`sample.ts`): for buyers who opted in to audit sampling (1% off), a random 2% of requests keep the prompt and output, encrypted at rest with a per-day key, deleted after 72 h (`retention` job; keys destroyed with the data). Buyers who did not opt in contribute only hashes and metering checks.
+3. Minimum per host per model per week: ≥ 200 audited responses. Hosts with less traffic get extra canaries to reach it. Probation hosts get canaries only.
+
+**Likelihood audit (`score.ts`)**: for each sample, a studio-run reference host for the same model and GPU class (attested, sealed tier where available) scores the served output tokens under the claimed model (teacher forcing). Statistic per response: `ℓ = mean log p(token_t | prefix)` over output tokens. Baselines `μ, σ` per (model digest, GPU class, image digest, temperature bucket {0, (0,0.5], (0.5,1.0], >1.0}, output length bucket {≤64, ≤256, ≤1024, >1024}) from honest hosts. Standardise `z = (ℓ − μ) / σ` (one-sided: swaps and quantisation lower `ℓ`).
+
+**Sequential test (`sequential.ts`, published in `@offpeak/audit-tests` as `testId = "llr-mix-v1"`)**: mixture sequential probability ratio test over a host's samples in the week:
+`Λ_n = Σ_i log( (1 − ε)·φ(z_i) + ε·φ(z_i + δ) ) − log φ(z_i)` with `ε = 0.10` (swap fraction to detect) and `δ` from calibration (the shift a quantised or smaller model causes for that model). Evaluate only once `n ≥ 200`. Flag when `Λ_n ≥ log(A)` with `A` set so that the per-host-week false-flag rate on honest data is ≤ 1%. `z` is winsorised at ±3.5, one payer's samples add at most 3.5 to `Λ_n`, and only responses whose parameters calibration covered are scored, so opted-in buyers cannot force a flag.
+
+**Calibration plan (`calibrate.ts`)**
+1. Before P1: for each launch model, run honest studio hosts on at least two GPU classes, two vLLM image versions and varied batch loads (no batch-invariant mode) to collect ≥ 20,000 scored responses per model; fit baselines per bucket.
+2. Simulate swaps: int4 (AWQ/GPTQ) and fp8 quantisations, the next smaller sibling model, and a different fine-tune, mixed in at 5%, 10% and 25% of responses. Fit `δ` per model.
+3. Choose `A` by bootstrap over honest host-weeks (≥ 50 simulated host-weeks per model × GPU class) so the false-flag rate is ≤ 1%; report the power at `ε = 10%` within 200 samples (gate: ≥ 95%).
+4. Recalibrate when a new image digest, GPU class or model is approved, and weekly from live data from attested reference hosts only, gating both μ and σ (a host with no flags is not proven honest). Publish thresholds, baselines and the calibration report at `/v1/audits/calibration`.
+5. Track the live false-flag proxy: flags on attested reference hosts (should be zero) and on hosts later cleared by the panel.
+
+**Filing (`evidence.ts`, `file.ts`)**
+- **Swap** challenge only with two independent signals: the sequential test flags, **and** either canary exact-match failures above their own calibrated threshold or a replication of the likelihood test on a second, independent reference host. Without both, file nothing and increase canary rate for that host for a week.
+- **Metering** challenge: sustained token-count disagreements beyond tolerance (`serving.metering_flags`), or host signatures refusing correct counts.
+- **Throughput** challenge: for Windows, only when the host disputes a performance post.
+- Evidence bundle: sample leaves with Merkle proofs against posted roots, canary prompts and outputs in full (they are Offpeak's own), opted-in buyer samples as hashes plus encrypted bodies accessible only to ruling processes and panel members, scores, baselines, test id and version, statistic and threshold. Stored content-addressed; `Evidence.samplesRoot` commits to it; `Evidence.uri` points to the access-controlled store.
+- `AuditCourt.challenge(e)` with the auditor key (holds challenge-bond USDG; alert below 1,000 USDG).
+- The auditor never decides a slash and never contacts hosts directly about an audit.
+
+### 4.10 Sealed tier (host agent `sealed/`, router verifier, SDK)
+- Hardware: Intel TDX confidential VM with an NVIDIA GPU in confidential-computing mode. The pinned image digest and model digest are measured into the VM.
+- Host agent at boot, inside the VM: generate an X25519 HPKE key pair (private key never leaves memory); generate a counts signing key (it never leaves memory either); build `bindings = { v: 1, modelDigest, imageDigest, operator, hpkePublicKey, countsSigner, configHash, gpuEvidenceHash }`, where `configHash` is `sha256(canonicalJson({ modelName, engine, tsmRoot, gpuTool }))`; `report_data = sha256(canonicalJson(bindings)) ‖ nonce` (32-byte nonce, zero for the boot quote); obtain a TDX quote via the kernel configfs-tsm interface (`/sys/kernel/config/tsm/report`); collect GPU evidence with the NVIDIA attestation SDK, whose command is fixed in the image and never read from `host.yaml`. The engine must be `http://127.0.0.1` with no proxy in the environment, or the boot stops. `attestationRef = sha256(bootQuote)`, registered in `HostRegistry`. `GET /offpeak/v1/attest?nonce=` returns a fresh quote, GPU evidence, bindings and the HPKE key.
+- Router verifier (`routing/attest.ts`): verify the TDX quote with a DCAP quote verification service (`OFFPEAK_TDX_VERIFIER_URL`) and accept TCB status `UpToDate` or `SWHardeningNeeded` only; check MRTD, RTMRs and `configHash` against the allow-list for the pinned image; check `report_data` against the bindings; verify GPU evidence through NVIDIA's remote attestation service (overall result must be true); confirm `attestationRef` matches the registry. Re-verify every 24 h and on every host restart with a fresh nonce. Publish verified hosts at `GET /v1/sealed/hosts` with the verification transcript.
+- Wire format (`application/offpeak-hpke`; stream `application/offpeak-hpke-stream`): RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM, `info = "offpeak-hpke/v1"`. Request bytes: `0x01 ‖ clientTimeMs(u64 BE) ‖ enc(32) ‖ ciphertext`; AAD = the first 9 bytes ‖ ASCII path. Response: `responseNonce(16)` then frames `flag(1) ‖ len(u32 BE) ‖ ct` keyed from `context.Export("offpeak-hpke/v1 response", 16)` with HKDF salt `enc ‖ responseNonce`; nonce = base nonce XOR frame index; flag `0x01` marks the last frame so truncation is detectable; each frame's plaintext is `dataLen(u16 BE) ‖ data ‖ zeros`, always 202 bytes, and frames cut the stream at fixed offsets, so sizes do not show token lengths. Replay window ±60 s; the agent rejects a repeated `enc`.
+- Routing metadata the router needs travels in clear headers: `X-Offpeak-Model`, `X-Offpeak-Max-Tokens`, `X-Offpeak-Sealed-Host`. The router cannot count tokens on ciphertext, so sealed records use the attested host agent's counts (signed inside the VM with the key `countsSigner` names, which the router and SDK verify, because the operator key lives outside the VM); the router stops input at `request bytes + 256` for every pay mode, checks ciphertext length is consistent with the counts (bytes per token within the model's observed range, set in production, or the model is not served) and flags outliers. Docs state this.
+- Clients that verify for themselves take a fresh quote under their own nonce, relayed by the router so the host does not see who asked.
+- Prompt and output hashes for sealed records are over ciphertext bytes; `sealed = true` in the envelope.
+
+### 4.11 Database schema `serving` (Drizzle, `db/serving/schema.ts`)
+
+Money columns are `bigint` µUSDG (`mode: "bigint"`). Timestamps `timestamptz`. Addresses lowercase text.
+
+| Table | Columns (key ones) |
+|---|---|
+| `accounts` | `id`, `wallet` unique, `audit_opt_in` bool, `created_at` |
+| `api_keys` | `key_hash` pk (sha256 of `op_live_…`), `account_id`, `label`, `rpm_limit`, `created_at`, `revoked_at` |
+| `siwe_sessions` | `id`, `wallet`, `nonce`, `expires_at` |
+| `holds` | `id`, `account_id`, `wallet`, `hour`, `amount`, `status` (held/captured/released/expired), `req_id`, `expires_at` |
+| `hosts_cache` | `address`, `endpoint`, `status`, `routable`, `bond_usdg`, `routing_bonus_bps`, `gpu_class`, `image_digest`, `attestation_ref`, `strikes`, `updated_at` |
+| `host_models` | `host`, `model_digest`, `model_name`, `context`, `max_tps` |
+| `price_sheets` | `host`, `model_digest`, `valid_from`, `base_in bigint[168]`, `base_out bigint[168]`, `floor_in`, `floor_out`, `nonce`, `sig`, `sheet_hash` |
+| `host_load` (hypertable) | `host`, `model_digest`, `ts`, `util`, `ttft_p95_ms`, `inflight`, `healthy` |
+| `host_stats` | `host`, `day`, `served_tokens`, `billed_host_micro`, `base_value_micro`, `effective_discount_bps` |
+| `requests` | `req_id`, `account_id`, `wallet`, `model_digest`, `host`, `pay_mode`, `tokens_in`, `tokens_out`, `ttft_ms`, `duration_ms`, `status`, `error_code`, `sealed`, `ts` |
+| `metering_flags` | `req_id`, `host`, `router_counts`, `host_counts`, `reason` |
+| `channels_local` | `channel_id`, `payer`, `unvouchered_micro`, `last_owed`, `last_owed_req_ids text[]` |
+| `x402_requests` | `req_id`, `payer`, `max_amount`, `status`, `preconfirm_stall_ms` |
+| `jobs`, `job_lines`, `job_slots` | batch jobs, lines with status and output file offsets, planned hour slots |
+| `files` | `id`, `account_id`, `purpose`, `bytes`, `sha256`, `storage_key`, `expires_at` |
+| `audit_samples` | `req_id`, `host`, `model_digest`, `enc_body`, `day_key_id`, `expires_at` (≤ 72 h) |
+| `canary_accounts`, `canary_runs` | auditor wallets; runs with expected sets, outputs, pass/fail |
+| `audit_scores` | `req_id`, `host`, `model_digest`, `bucket`, `ll_mean`, `z`, `ref_host` |
+| `audit_baselines` | `model_digest`, `gpu_class`, `image_digest`, `temp_bucket`, `len_bucket`, `mu`, `sigma`, `n`, `version` |
+| `audit_runs` | `host`, `model_digest`, `week`, `n`, `llr`, `threshold`, `flagged`, `filed_challenge_id` |
+| `disputes` | `id`, `wallet`, `req_ids text[]`, `reason`, `submitted_material_hash`, `status`, `outcome`, `refund_id` |
+| `hour_locks` | `hour` pk |
+| `sealed_attestations` | `host`, `attestation_ref`, `verified_at`, `tcb_status`, `transcript jsonb` |
+
+Retention jobs: `audit_samples` deleted at `expires_at` (hourly); `host_load` 90 days; `requests` 400 days (metadata only).
+
+### 4.12 Offpeak public API (`offpeak/`)
+- `GET /v1/prices?model=` → `{ model, digest, now: { in, out, host }, hosts: [{ host, live: {in,out}, base: {in,out}, floor, effective_discount_30d_bps, sealed }], next168h: [{ hour, forecast_in, forecast_out }] }` (buyer prices incl. the default fee; caller-specific fee with auth).
+- `GET /v1/usage/:reqId` → `{ envelope, proof?: { hour, root, proof, txHash } }` (proof from the indexer once settled).
+- `GET /v1/usage?since=&limit=&before_ts=&before_id=` → the caller's records, newest first, with an API key or session: `{ records: [{ envelope, status }], next }`.
+- `GET /v1/tokenizers/:digest` → `{ context_length, tokenizer }`: the pinned tokenizer files a buyer needs to recount, or `null` when none are published. Buyers check them against the digest.
+- `POST /v1/windows/buy|cancel|list|claim` → `{ to, data, value: "0", chainId }` calldata for the user's wallet (plus a Permit2 or approve step when needed). `GET /v1/windows` board (P3): live Dutch price, resale listings with the fee shown as "1% + 10% of markup".
+- `POST /v1/channels/:id/voucher` → accepts a voucher (4.5.2). `GET /v1/channels/:id` → `{ deposit, claimed, cumulative, owed, latestSeq, status, expiry }`.
+- `POST /v1/disputes` `{ req_ids, reason, material? }` within 7 days of each record's `ts`. Automatic checks: recount tokens if the buyer supplies the prompt and output (hashes must match the record); verify signatures and price against the sheet. Outcomes: `upheld` → insert `shared.refunds` (Doc A pays it into the buyer's vault balance) and a metering flag; `rejected` with reasons. Response within 72 h.
+- `GET /v1/status` → feature flags (`channels`, `upto`, `night_jobs`, `windows`, `sealed`, `token_hooks`, `beta_cap`) and service health; the claims lint reads it.
+- `GET /v1/audits/calibration` (4.9).
+- `GET /v1/sealed/hosts` (4.10).
+
+### 4.13 MCP tools (`packages/mcp`)
+| Tool | Input | Output |
+|---|---|---|
+| `offpeak_complete` | `{ model, messages, max_tokens, max_price?, tools?, response_format? }` | completion text/tool calls + usage envelope |
+| `offpeak_prices` | `{ model? }` | live price, cheapest host, next 24 h forecast |
+| `offpeak_schedule_job` | `{ model, requests[], deadline, max_price? }` | job id, locked price, planned hours, estimated cost |
+| `offpeak_usage` | `{ req_id?, since?, recount? }` | records with verification result and proof status |
+
+Auth: API key (env `OFFPEAK_API_KEY`) or an agent wallet with a channel (`OFFPEAK_AGENT_WALLET_KEY` stays local; the MCP server signs vouchers itself). Tool descriptions follow Appendix P.
+
+### 4.14 SDK (`packages/sdk`, TypeScript)
+```ts
+const op = new Offpeak({ baseURL, apiKey?, wallet?: WalletClient, channel?: { deposit: Micro; expirySeconds: number } });
+op.openai                                     // a configured `openai` client (baseURL swap)
+op.chat(params, opts?: { maxPrice?, flex?, windowId?, sealed?: boolean })
+op.verifyUsage(env: UsageEnvelope, opts?: { recount?: { prompt, output } }): Promise<VerifyReport>  // both sigs, cost math, leaf, optional local recount
+op.proof(reqId): Promise<{ ok: boolean; onchain: boolean }>          // fetch proof and check UsageLedger.verifyLeaf via RPC
+op.channels.open(deposit, expiry) / .voucher(owed) / .close()        // auto-vouchers after each response
+op.x402.payUpto(requirement)                                          // Permit2 witness signing
+op.sealed.hosts(model) / op.sealed.chat(params)                       // verify attestation transcript, HPKE encrypt, decrypt stream
+```
+Sealed client rules: refuse a host whose transcript fails (quote verified by the configured verifier, TCB status, measurement allow-list, bindings, GPU result, registry `attestationRef`); allow `trustRouterVerification: false` to require the client's own verifier URL. The SDK never sends plaintext to the router for sealed calls.
+
+### 4.15 Web (`apps/web`)
+- **Price page (public):** per model the live buyer price, cheapest host, 168-hour forecast chart, hosts table (live, base, floor, 30-day effective discount, bond, status, sealed). Footer: "Third-party names describe compatibility only; no affiliation."
+- **Dashboard (SIWE):** balance, reserve, withdrawable now, caps (with the "lower caps apply after the next settled hour" note), deposit (approve or Permit2), withdraw, withdraw-all with a countdown to the 2-hour guarantee, usage list (envelope, local verification, proof status), API keys, audit-sampling opt-in (1% off) with the 72 h retention statement, disputes, channels (deposit, owed, close).
+- **Windows (P3):** board, buy at the live Dutch price, list for resale with the fee preview "1% of sale price + 10% of markup = X", cancel (95%), claims.
+- **Hosts:** onboarding guide, registration helper, payouts, challenges and responses.
+- **Docs:** API reference, honest limits (Appendix P), status.
+
+### 4.16 Claims lint (`tools/lint-claims.ts`)
+- Fails on banned phrases (Appendix P) in `apps/web`, `docs`, `packages/*/README.md`, MCP tool descriptions, API error strings.
+- Fails when text claims a feature is live while `GET /v1/status` (or the offline fixture) has its flag off; qualified phrases ("not switched on yet", "coming in P2") pass.
+- Fails when a competitor figure lacks a date and source link.
+
+---
+
+## 5. Tests (Doc B)
+- **Unit:** money math against vectors; live price and floor rule (property tests: for any valid sheet, idle `u = 0` gives ≤ 60% of base every hour); load factor bounds; holds Lua (concurrency fuzz with 1,000 parallel admits never exceeds caps or balance); voucher acceptance (wrong seq, wrong boundary, wrong signer, EIP-1271); 402 ordering and the `upto` minimum; tokenizer counts vs vLLM fixtures; record building and envelope verification vs vectors; scheduler water-filling (no hour above 20% of forecast idle capacity or the buyer's hourly cap; locked price = weighted average); sequential test on synthetic data.
+- **Router integration (mock indexer + mock facilitator + mock host):** prepaid stream end to end with envelope verification; `WithdrawAllRequested` push stops admission within 1 s and no record starts after it; caps decrease applies immediately; price above cap → 429 or 202 with flex; failover before first token; channel flow with 1,000 requests and auto-vouchers; client stops vouchering → stops at credit limit; `upto` with 400 ms and 5 s authorize delays: TTFT unaffected, output pauses at the budget, `AuthorizeFailed` ends unbilled; window draw-down and fallback; hour close idempotent under concurrent inserts.
+- **Auditor simulation (mock engine with swap mode):** `--swap-rate 0.10` flagged within 200 samples in ≥ 95% of runs; honest mock hosts with injected GPU-class noise flagged in ≤ 1% of host-weeks; swap filing requires the second signal.
+- **Sealed:** HPKE round trip vectors; truncated stream detected; replayed `enc` rejected; router logs and DB contain no plaintext (grep test over captured logs with a canary string).
+- **Load:** `bun run load:router` 500 concurrent streams against mock hosts: router overhead p95 < 30 ms to first token; holds admission p95 < 5 ms.
+- **Integration with Doc A (`test:integration`):** local anvil + real indexer, facilitator, settlement and keepers: IC1–IC6 scenarios from 3.12.
+
+---
+
+## 6. Launch gates
+
+A phase launches only when every gate marked for it passes and the evidence (CI run links, reports) is attached to the release issue.
+
+| Gate | Pass condition | Owner | Blocks |
+|---|---|---|---|
+| Vault exit | Fuzz/invariant: `withdraw(balance − reserve)` always works; `executeWithdrawAll` ≤ 2 h after request with settlement halted; no settle debits an hour after the request hour or a record after the request time | A | P1 |
+| Reserve | Cap decrease then withdraw can't leave unpaid usage; router never serves beyond the on-chain reserve (B's router test against A's contracts) | A + B | P1 |
+| Settlement | One settle per hour; debits = root totals; per-buyer hourly/daily caps; EIP-712 domain bound; host credits clawable for 24 h; three signers agree on 72 consecutive local hours of faker + real traffic | A | P1 |
+| Pricing | Billed = live price at request start; floor ≤ 0.6 × min hourly base enforced; caps never exceeded | B | P1 |
+| Swap detection | Simulation: a host swapping to a quantised or smaller model on ≥ 10% of responses is flagged within 200 audited samples; ≤ 1% false flags per host-week on honest hosts across at least two GPU classes; no 100% slash without panel confirmation (contract invariant) | B (stats) + A (court) | P1 |
+| Beta cap | `betaCapEnabled = true` on mainnet and verified by `VerifyWiring` | A | P1 |
+| x402 and channels | `upto` pulls the max before serving beyond the pre-confirmation budget; a revoked approval can't get free inference beyond that budget; channel close waits for the 2 h challenge period and the latest voucher always lands in tests | A + B | P2 |
+| Windows | Conservation across buy/cancel/resale/draw/claim; partial units non-transferable; failure claims funded by escrow + collateral; resale fee = 1% + 10% of markup | A | P3 |
+| External audit | Independent audit of all contracts deployed in that phase; all high/critical fixed and re-reviewed | A | Lifting the 500 USDG per-buyer beta cap; P2 and P3 contracts go live only after their audit |
+| L1 legal | Written counsel review of: no-KYC custodial-style USDG balances, $OFPK utility hooks, fee burn. Until it passes, `tokenHooksEnabled = false` and no $OFPK messaging | Project lead | Enabling token hooks and burn |
+| Claims | `bun run lint:claims` passes; competitor figures rechecked that week with dated source captures | B | each launch |
+
+Additional Doc B launch checks: TTFT p95 < 1.5 s on launch models under expected load; 3 launch models live on studio-run hosts with at least one outside host through probation (P1); sealed-tier transcript verifiable by the SDK with the client's own verifier (P3).
+
+---
+
+## 7. Milestone order (Doc B)
+
+Follow 3.12 for calendar weeks. Write tests first in each step.
+
+1. **B0 (W1, days 1–2):** `packages/shared` jointly with A (money, EIP-712, Merkle, vectors, `shared.sql`).
+2. **B1 (W1, days 3–5):** app skeletons, `db/serving` migrations, usage faker, mock host engine, router `/v1/models` + chat passthrough to the mock host. **IC0.**
+3. **B2 (W2):** tokenizer counting, record building and signing, host agent v1 (digest, GPU check, proxy, meter, sign), envelope in responses.
+4. **B3 (W3):** pricebook (sheets, floor rule), load measurement, live prices, routing, tools, JSON mode, embeddings, failover. **IC1.**
+5. **B4 (W4):** prepaid holds vs indexer (Lua), push reactions, hour close, `/v1/usage/:id`, `/v1/prices`, dashboard v1 and price page. **IC2.**
+6. **B5 (W5):** auditor (canaries, samples with retention, scoring, sequential test, calibration harness, evidence, filing); host onboarding with probation; disputes. **IC3.**
+7. **B6 (W6):** launch models on studio hosts, outside-host probation, docs and claims lint, load test. **Gate P1.**
+8. **B7 (W7–8):** channel payments (admission, vouchers, owed reporting), `upto` with pre-confirmation budget, `exact` for embeddings, 402 responses, SDK payment helpers, MCP tools. **IC4.**
+9. **B8 (W9–10):** scheduler and `/v1/batches`, `X-Offpeak-Flex`, forecasts. **Gate P2.**
+10. **B9 (W11–13):** Window draw-down, `shared.window_perf`, Windows board and resale UI. **IC5.**
+11. **B10 (W14–15):** sealed tier (host attestation, router verifier, SDK HPKE). **IC6.**
+12. **B11 (W16):** load test, docs, launch. **Gate P3.**
+
+---
+
+## 8. Do not (Doc B)
+
+- Do not change anything in section 3 without an interface-change PR approved by both owners.
+- Do not serve a prepaid buyer beyond the on-chain reserve, after a withdraw-all request, above a pending lower cap, or while usage is paused.
+- Do not put an on-chain transaction in front of the first token. Do not stream past the `upto` pre-confirmation budget before `Authorized`.
+- Do not accept channel requests after `CloseRequested` or within 2 h of `expiry`; do not delay writing accepted vouchers to `shared.channel_state`.
+- Do not re-price a request mid-stream, bill a price other than the snapshot at request start (or the locked night-job price), or accept a price sheet that breaks the floor rule.
+- Do not store prompts or outputs except opted-in audit samples (encrypted, ≤ 72 h); do not log request bodies; do not read sealed plaintext anywhere outside the host VM.
+- Do not resell or proxy any third-party hosted model API or aggregator account. Every model is open-weight and served by a registered, bonded host.
+- Do not file a swap challenge without two independent signals; do not let the auditor decide or execute a slash.
+- Do not let hosts identify canary traffic (no canary flags in host-visible headers, timing or accounts).
+- Do not hold or use any user's private key; return calldata for their wallet instead.
+- Do not read the `chain` schema directly; use the indexer API.
+- Do not use floats for money, or any time zone other than UTC in logic.
+- Do not write copy that breaks Appendix P; do not describe $OFPK as yield, rewards or a fee share.
+- Do not commit `.env*`, keys, model weights, customer data or corpora with unclear licences; do not commit with any identity other than `ALIAS Contributor <contributor@offpeak.invalid>`.
+- Do not copy code, names, comments, addresses or configuration from any other project or repository; write every module fresh from this spec.
+
+---
+
+## Appendix G. Repository hygiene
+- `.gitignore`: `node_modules`, `.env*`, `.data/`, `models/`, `*.safetensors`, `*.pem`, `*.key`, `apps/web/dist`.
+- Pre-commit hook (`.githooks/pre-commit`, enabled by `bun run prepare`): `gitleaks protect --staged --redact`, `bun run scan:names --staged`, `bun run lint:claims --changed`.
+- Pre-push: full-history `gitleaks detect --redact` and `scan:names`.
+- CI is disabled on the remote until the project lead enables it; run the same checks locally via `bun run ci:local`.
+
+---
+
+## Appendix P. Product rules (copy, UI, docs, API error text)
+
+These rules apply to every string a user can see: web pages, API errors, SDK docs, MCP tool descriptions, launch posts, README files. CI runs `bun run lint:claims` (Doc B builds it, both docs require it), which fails on the banned phrases below and on any claim that a feature is live while `GET /v1/status` says it is off.
+
+**What we don't say**
+- Never "Claude/GPT at a discount" or any closed model at a discount, "guaranteed cheapest", "staking rewards", "APY", "yield", "passive income", "returns". Say "off-peak price", "live price", "withdrawable balance".
+- $OFPK is utility only: fee discount tiers, extra bond weight for hosts (slashable), early access to Windows. Never describe it as a share of fees, a revenue stream, a credit stream or an investment. "Holding $OFPK alone earns nothing."
+- No partnership language with Robinhood, OpenRouter, model labs, Paxos or any host. Model names describe compatibility only. Site footer, verbatim: "Third-party names describe compatibility only; no affiliation."
+- Never claim competitors will be shut down. When comparing, quote the clause, give its date and link the archived source capture; let readers judge. Every competitor figure carries the date it was checked and is rechecked the week of each launch; unchecked figures are marked "(unverified)" or removed.
+
+**Honest limits (shown on the docs page and linked from pricing and signup)**
+- Open-weight models only. Offpeak doesn't sell closed models. Open models trail frontier models on the hardest tasks.
+- Prices move. The live price shown at request start is what you pay; caps protect you, and requests over your cap wait (night jobs) or fail with 429 (interactive).
+- Discounts depend on host supply and idle time. With few hosts, discounts are smaller.
+- Open hosts can read prompts, and so can Offpeak's router, unless you use the sealed tier with client-side encryption.
+- Audit sampling stores request bodies for up to 72 h, only if you opt in (opt-in buyers get 1% off).
+- Audits are statistical. They catch sustained model swaps, not every single response.
+- Usage records are signed by Offpeak's router and the host. You can recount your own requests and dispute any request within 7 days.
+- Withdrawing the reserved part of a balance can take up to 2 hours.
+- USDG can be frozen by its issuer; Permit2 is a shared dependency.
+- During the beta, deposits are capped at 500 USDG per buyer until the external contract audit is complete.
