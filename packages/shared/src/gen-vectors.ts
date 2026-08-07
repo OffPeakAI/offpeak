@@ -138,3 +138,137 @@ for (const record of records) {
     buyerPays: buyerPays(record.hostCostMicro, record.feeMicro).toString(),
   })
 }
+
+const leaves = signed.map((s) => s.leaf as Hex)
+const root = merkleRoot(leaves)
+const proofs = leaves.map((_, i) => merkleProof(leaves, i))
+
+let prepaidDebit = 0n
+let agentCollected = 0n
+let windowDrawn = 0n
+let hostCredit = 0n
+let fees = 0n
+let tokensIn = 0n
+let tokensOut = 0n
+for (const record of records) {
+  tokensIn += BigInt(record.tokensIn)
+  tokensOut += BigInt(record.tokensOut)
+  if (record.payMode === 0) prepaidDebit += record.hostCostMicro + record.feeMicro
+  if (record.payMode === 1 || record.payMode === 2 || record.payMode === 3) {
+    agentCollected += record.hostCostMicro + record.feeMicro
+  }
+  if (record.payMode === 4) windowDrawn += BigInt(record.tokensIn + record.tokensOut)
+  if (record.payMode !== 4) {
+    hostCredit += record.hostCostMicro
+    fees += record.feeMicro
+  }
+}
+const totals: RootTotals = {
+  records: records.length,
+  tokensIn,
+  tokensOut,
+  prepaidDebit,
+  agentCollected,
+  windowDrawn,
+  hostCredit,
+  fees,
+}
+const totalsHash = totalsHashOf(totals)
+const hourCloseMessage = { hour: 472223n, records: records.length, root, totalsHash }
+const hourCloseSig = await router.signTypedData({
+  domain: domain("OffpeakUsage", contracts.UsageLedger),
+  types: hourCloseTypes,
+  primaryType: "HourClose",
+  message: hourCloseMessage,
+})
+
+const settleMessage = {
+  chainId: 4663n,
+  vault: contracts.OffpeakVault as Hex,
+  hour: 472223n,
+  root,
+  totalsHash,
+  debits: [
+    {
+      buyer: buyer.address.toLowerCase() as Hex,
+      amount: prepaidDebit,
+      lastTs: BigInt(records.find((r) => r.payMode === 0)?.ts ?? 0),
+    },
+  ],
+  credits: [{ host: host.address.toLowerCase() as Hex, amount: hostCredit }],
+  windowDraws: [] as { windowId: bigint; holder: Hex; tokens: bigint }[],
+  fees,
+  agentPoolDraw: agentCollected,
+  reserveDraw: 0n,
+  agentPaymentsHash: keccak256(encodeAbiParameters([{ type: "bytes32[]" }], [[]])),
+}
+const orderedSettlers = [...settlers].sort((a, b) =>
+  a.address.toLowerCase() < b.address.toLowerCase() ? -1 : 1,
+)
+const pair = orderedSettlers.slice(0, 2)
+const pairSigs = await Promise.all(
+  pair.map((signer) =>
+    signer.signTypedData({
+      domain: domain("OffpeakSettlement", contracts.OffpeakVault),
+      types: settleTypes,
+      primaryType: "SettleBatch",
+      message: settleMessage,
+    }),
+  ),
+)
+
+const refundMessage = {
+  batchId: 472223n,
+  refunds: [{ payer: buyer.address.toLowerCase() as Hex, amount: 1_234n, refundId: keccak256(toBytes("vector-refund")) }],
+}
+const refundSigs = await Promise.all(
+  pair.map((signer) =>
+    signer.signTypedData({
+      domain: domain("OffpeakSettlement", contracts.OffpeakVault),
+      types: refundTypes,
+      primaryType: "RefundBatch",
+      message: refundMessage,
+    }),
+  ),
+)
+
+const rewardMessage = {
+  week: 2811n,
+  credits: [{ host: host.address.toLowerCase() as Hex, amount: 5_678n }],
+}
+const rewardSigs = await Promise.all(
+  pair.map((signer) =>
+    signer.signTypedData({
+      domain: domain("OffpeakSettlement", contracts.OffpeakVault),
+      types: rewardTypes,
+      primaryType: "RewardBatch",
+      message: rewardMessage,
+    }),
+  ),
+)
+
+const channelId = keccak256(toBytes("vector-channel"))
+const voucherSig = await buyer.signTypedData({
+  domain: domain("OffpeakChannel", contracts.ChannelManager),
+  types: voucherTypes,
+  primaryType: "Voucher",
+  message: { channelId, seq: 1n, cumulative: 123_456n },
+})
+
+const uptoTypes = permitWitnessTypes("UptoWitness")
+const uptoMessage = {
+  permitted: { token: contracts.MockUSDG as Hex, amount: 50_000n },
+  spender: contracts.X402Escrow as Hex,
+  nonce: 1n,
+  deadline: 1_800_000_000n,
+  witness: {
+    reqId: keccak256(toBytes("upto-req")),
+    payee: contracts.OffpeakVault as Hex,
+    maxAmount: 50_000n,
+    validBefore: 1_800_000_000n,
+    resourceHash: keccak256(toBytes("resource")),
+  },
+}
+const uptoStruct = hashStruct("PermitWitnessTransferFrom", uptoTypes as never, uptoMessage)
+const permitSeparator = domainSeparator("Permit2", contracts.Permit2 as Hex, null)
+const uptoDigest = typedDataDigest(uptoStruct, permitSeparator)
