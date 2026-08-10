@@ -275,3 +275,200 @@ contract OffpeakVault is IOffpeakVault, EIP712, Ownable2Step, ReentrancyGuardTra
         usagePaused = paused;
         emit Paused(usagePaused, settlesPaused);
     }
+
+    function setSettlesPaused(bool paused) external onlyGuardian {
+        settlesPaused = paused;
+        emit Paused(usagePaused, settlesPaused);
+    }
+
+    function setSettlers(address[3] calldata next) external onlyOwner {
+        _requireSorted(next);
+        emit SignersChanged(settlers, next);
+        settlers = next;
+    }
+
+    function setGuardian(address next) external onlyOwner {
+        emit GuardianChanged(guardian, next);
+        guardian = next;
+    }
+
+    function disableBetaCap() external onlyOwner {
+        betaCapEnabled = false;
+        emit BetaCapDisabled();
+    }
+
+    function reserveOf(address buyer) external view returns (uint256) {
+        return _reserveOf(_buyers[buyer]);
+    }
+
+    function effectiveCaps(address buyer, uint64 hour) external view returns (uint128 hourlyCap, uint128 dailyCap) {
+        return _effectiveCaps(_buyers[buyer], hour);
+    }
+
+    function dayDebit(address buyer) external view returns (uint64 day, uint128 debited) {
+        Buyer storage b = _buyers[buyer];
+        return (b.lastDebitDay, b.debitedToday);
+    }
+
+    function buyerState(address buyer) external view returns (BuyerView memory v) {
+        Buyer storage b = _buyers[buyer];
+        (uint128 hourlyCap, uint128 dailyCap) = _capsNow(b);
+        bool decreasePending = b.capsEffectiveAfterHour != 0 && lastSettledHour < b.capsEffectiveAfterHour;
+        v.balance = b.balance;
+        v.reserve = _reserveOf(b);
+        v.hourlyCap = hourlyCap;
+        v.dailyCap = dailyCap;
+        if (decreasePending) {
+            v.pendingHourlyCap = b.pendingHourlyCap;
+            v.pendingDailyCap = b.pendingDailyCap;
+            v.capsEffectiveAfterHour = b.capsEffectiveAfterHour;
+        }
+        v.withdrawRequestedAt = b.withdrawRequestedAt;
+        if (b.withdrawRequestedAt != 0) v.withdrawDueAt = b.withdrawRequestedAt + uint64(WITHDRAW_ALL_MAX_DELAY);
+        v.lastSettledHour = lastSettledHour;
+        v.usagePaused = usagePaused;
+    }
+
+    function _credit(address buyer, uint256 amount) private {
+        Buyer storage b = _buyers[buyer];
+        if (b.withdrawRequestedAt != 0) revert WithdrawPending(buyer);
+        _foldCaps(buyer, b);
+        b.balance += amount;
+        if (betaCapEnabled && b.balance > BETA_CAP) revert BetaCapExceeded(buyer, b.balance);
+        emit Deposited(buyer, amount, b.balance);
+    }
+
+    function _checkBatch(SettleBatch calldata b, RootTotals calldata t, bytes calldata thresholdSig) private view {
+        if (settlesPaused) revert SettlesPaused();
+        if (b.chainId != block.chainid || b.vault != address(this)) revert WrongBatchTarget();
+        uint64 expected = lastSettledHour + 1;
+        if (b.hour != expected) revert WrongHour(b.hour, expected);
+        uint256 readyAt = HourMath.hourEnd(b.hour) + HOUR_CLOSE_GRACE;
+        if (block.timestamp < readyAt) revert HourNotReady(b.hour, readyAt);
+        if (b.debits.length > MAX_DEBITS) revert BatchTooLarge(b.debits.length, MAX_DEBITS);
+        if (b.credits.length > MAX_CREDITS) revert BatchTooLarge(b.credits.length, MAX_CREDITS);
+        if (b.windowDraws.length > MAX_WINDOW_DRAWS) revert BatchTooLarge(b.windowDraws.length, MAX_WINDOW_DRAWS);
+        ThresholdSig.verify2of3(settlers, _hashTypedDataV4(Typehashes.hash(b)), thresholdSig);
+        bytes32 totalsHash = Typehashes.hash(t);
+        if (totalsHash != b.totalsHash) revert TotalsHashMismatch(b.totalsHash, totalsHash);
+    }
+
+    function _sumCredits(Credit[] calldata list) private pure returns (uint256 total, Credit[] memory credits) {
+        credits = list;
+        address previous;
+        for (uint256 i; i < credits.length; ++i) {
+            if (credits[i].host <= previous) revert NotSorted();
+            previous = credits[i].host;
+            total += credits[i].amount;
+        }
+    }
+
+    function _applyDebits(Debit[] calldata debits, uint64 hour, uint128 prepaidDebit)
+        private
+        returns (uint256 taken, uint256 shortfall)
+    {
+        uint256 requested;
+        address previous;
+        for (uint256 i; i < debits.length; ++i) {
+            Debit calldata d = debits[i];
+            if (d.buyer <= previous) revert NotSorted();
+            previous = d.buyer;
+            requested += d.amount;
+            uint128 debited = _applyDebit(d, hour);
+            taken += debited;
+            shortfall += d.amount - debited;
+        }
+        if (requested != prepaidDebit) revert DebitTotalMismatch(requested, prepaidDebit);
+    }
+
+    function _applyDebit(Debit calldata d, uint64 hour) private returns (uint128 debited) {
+        if (d.amount == 0) revert ZeroDebit(d.buyer);
+        if (HourMath.hourOf(d.lastTs) != hour) revert DebitOutsideHour(d.buyer, d.lastTs, hour);
+        Buyer storage b = _buyers[d.buyer];
+        uint64 requestedAt = b.withdrawRequestedAt;
+        if (requestedAt != 0 && d.lastTs > requestedAt) revert DebitAfterRequest(d.buyer, d.lastTs, requestedAt);
+
+        _foldCaps(d.buyer, b);
+        (uint128 hourlyCap, uint128 dailyCap) = _effectiveCaps(b, hour);
+        if (d.amount > hourlyCap) revert CapExceeded(d.buyer, hour, d.amount, hourlyCap);
+        uint64 day = HourMath.dayOf(hour);
+        if (b.lastDebitDay != day) {
+            b.lastDebitDay = day;
+            b.debitedToday = 0;
+        }
+        b.debitedToday += d.amount;
+        if (b.debitedToday > dailyCap) revert DailyCapExceeded(d.buyer, day, b.debitedToday, dailyCap);
+
+        debited = d.amount;
+        if (d.amount > b.balance) {
+            debited = uint128(b.balance);
+            emit DebitClamped(hour, d.buyer, d.amount, debited);
+        }
+        b.balance -= debited;
+        emit Debited(hour, d.buyer, d.amount, debited, b.balance);
+    }
+
+    /// Fees absorb a shortfall first, then the reserve, then every credit pro rata with dust left in the reserve.
+    function _coverShortfall(uint64 hour, uint256 shortfall, Credit[] memory credits, uint256 credited, uint256 fees)
+        private
+        returns (uint256, uint256)
+    {
+        uint256 fromFees = shortfall < fees ? shortfall : fees;
+        fees -= fromFees;
+        uint256 left = shortfall - fromFees;
+        uint256 fromReserve = left < protocolReserve ? left : protocolReserve;
+        protocolReserve -= fromReserve;
+        left -= fromReserve;
+        if (left == 0) return (credited, fees);
+
+        uint256 remaining = credited - left;
+        uint256 paid;
+        for (uint256 i; i < credits.length; ++i) {
+            credits[i].amount = uint128(uint256(credits[i].amount) * remaining / credited);
+            paid += credits[i].amount;
+        }
+        protocolReserve += remaining - paid;
+        emit CreditShortfall(hour, uint128(left));
+        return (paid, fees);
+    }
+
+    function _foldCaps(address buyer, Buyer storage b) private {
+        uint64 effectiveAfter = b.capsEffectiveAfterHour;
+        if (effectiveAfter == 0 || lastSettledHour < effectiveAfter) return;
+        b.hourlyCap = b.pendingHourlyCap;
+        b.dailyCap = b.pendingDailyCap;
+        b.pendingHourlyCap = 0;
+        b.pendingDailyCap = 0;
+        b.capsEffectiveAfterHour = 0;
+        emit CapsChanged(buyer, b.hourlyCap, b.dailyCap);
+    }
+
+    function _capsNow(Buyer storage b) private view returns (uint128, uint128) {
+        return _effectiveCaps(b, lastSettledHour + 1);
+    }
+
+    function _effectiveCaps(Buyer storage b, uint64 hour) private view returns (uint128, uint128) {
+        uint64 effectiveAfter = b.capsEffectiveAfterHour;
+        if (effectiveAfter != 0 && hour > effectiveAfter) return (b.pendingHourlyCap, b.pendingDailyCap);
+        return (b.hourlyCap, b.dailyCap);
+    }
+
+    function _reserveOf(Buyer storage b) private view returns (uint256) {
+        if (b.balance == 0) return 0;
+        uint64 lastHour =
+            HourMath.hourOf(b.withdrawRequestedAt != 0 ? b.withdrawRequestedAt : block.timestamp);
+        if (lastHour <= lastSettledHour) return 0;
+        uint256 openHours = lastHour - lastSettledHour;
+        // Counted by UTC day touched: two open hours around midnight can each spend a full daily cap.
+        uint256 openDays = HourMath.dayOf(lastHour) - HourMath.dayOf(lastSettledHour + 1) + 1;
+        (uint128 hourlyCap, uint128 dailyCap) = _capsNow(b);
+        uint256 byHour = uint256(hourlyCap) * openHours;
+        uint256 byDay = uint256(dailyCap) * openDays;
+        uint256 reserve = byHour < byDay ? byHour : byDay;
+        return reserve < b.balance ? reserve : b.balance;
+    }
+
+    function _requireSorted(address[3] memory set) private pure {
+        if (set[0] == address(0) || set[0] >= set[1] || set[1] >= set[2]) revert UnsortedSigners();
+    }
+}
