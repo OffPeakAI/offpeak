@@ -189,3 +189,140 @@ function boot() {
     return child
   })
 }
+
+function applyReply(row: Reply) {
+      try {
+      if (row.kind === "error" || row.error) {
+        for (const id of row.ids) {
+          const waiter = waiters.get(id)
+          if (!waiter) continue
+          waiters.delete(id)
+          waiter.reject(new Error(row.error ?? "sig"))
+        }
+        armIdle()
+        return
+      }
+      const sigBytes = row.sigs ? asBuf(row.sigs) : undefined
+      const addrBytes = row.addrs ? asBuf(row.addrs) : undefined
+      const hashBytes = row.bodyHashes ? asBuf(row.bodyHashes) : undefined
+      for (let i = 0; i < row.ids.length; i++) {
+        const waiter = waiters.get(row.ids[i]!)
+        if (!waiter) continue
+        waiters.delete(row.ids[i]!)
+        if (row.kind === "signPersonal" || row.kind === "signRouter") {
+          const sig = `0x${sigBytes!.subarray(i * 65, i * 65 + 65).toString("hex")}` as Hex
+          let message = row.messages?.[i]
+          let addr: Hex
+          if (row.kind === "signRouter") {
+            const bodyHash = `0x${hashBytes!.subarray(i * 32, i * 32 + 32).toString("hex")}`
+            const job = waiter.job
+            if (job.op === "signRouter") {
+              message = `{"bodyHash":"${bodyHash}","reqId":"${job.reqId}","ts":${job.ts}}`
+              addr = addressOfKey(job.privateKey)
+            } else addr = `0x${addrBytes!.subarray(i * 20, i * 20 + 20).toString("hex")}` as Hex
+            waiter.resolve(`${sig}\n${bodyHash}`)
+          } else {
+            addr = `0x${addrBytes!.subarray(i * 20, i * 20 + 20).toString("hex")}` as Hex
+            waiter.resolve(sig)
+          }
+          if (message) remember(sig, message, addr)
+        } else if (row.kind === "signDigest") {
+          waiter.resolve(`0x${sigBytes!.subarray(i * 65, i * 65 + 65).toString("hex")}`)
+        } else {
+          waiter.resolve(`0x${addrBytes!.subarray(i * 20, i * 20 + 20).toString("hex")}`)
+        }
+      }
+      armIdle()
+      } catch (error) {
+        for (const id of row.ids ?? []) {
+          const waiter = waiters.get(id)
+          if (!waiter) continue
+          waiters.delete(id)
+          waiter.reject(error instanceof Error ? error : new Error("sig"))
+        }
+        armIdle()
+      }
+}
+
+function flush() {
+  if (flushTimer) {
+    clearTimeout(flushTimer)
+    flushTimer = null
+  }
+  const batch = queue
+  queue = []
+  if (batch.length === 0) return
+  boot()
+  if (!workers) return
+  const groups = new Map<Job["op"], Job[]>()
+  for (const job of batch) {
+    const list = groups.get(job.op) ?? []
+    list.push(job)
+    groups.set(job.op, list)
+  }
+  for (const jobs of groups.values()) {
+    const slices: Job[][] = workers.map(() => [])
+    jobs.forEach((job, index) => slices[index % workers!.length]!.push(job))
+    slices.forEach((slice, index) => {
+      if (slice.length > 0) workers![index]!.send(payload(slice))
+    })
+  }
+}
+
+function submit(job: NewJob): Promise<string> {
+  boot()
+  const id = seq++
+  const task = { ...job, id } as Job
+  const promise = new Promise<string>((resolve, reject) => {
+    waiters.set(id, { resolve, reject, job: task })
+  })
+  queue.push(task)
+  if (queue.length >= 200) flush()
+  else if (!flushTimer) flushTimer = setTimeout(flush, 1)
+  return promise
+}
+
+export function privateKeyOf(account: Keyed): Hex {
+  if (account.localKey) return account.localKey
+  const key = account.getHdKey?.().privateKey
+  if (!key) throw new Error("account has no local key")
+  return bytesToHex(key)
+}
+
+export function signPersonal(message: string, privateKey: Hex): Promise<Hex> {
+  return submit({ op: "signPersonal", message, privateKey }) as Promise<Hex>
+}
+
+export function recoverPersonal(message: string, signature: Hex): Promise<Hex> {
+  const hit = takeCached(signature, message)
+  if (hit) return Promise.resolve(hit)
+  return submit({ op: "recoverPersonal", message, signature }) as Promise<Hex>
+}
+
+export function signRouterCanon(
+  privateKey: Hex,
+  input: { canon: string; reqId: string; ts: number },
+): Promise<{ sig: Hex; bodyHash: Hex }> {
+  return submit({ op: "signRouter", canon: input.canon, reqId: input.reqId, ts: input.ts, privateKey }).then((packed) => {
+    const split = packed.indexOf("\n")
+    return { sig: packed.slice(0, split) as Hex, bodyHash: packed.slice(split + 1) as Hex }
+  })
+}
+
+export function signDigest(hash: Hex, privateKey: Hex): Promise<Hex> {
+  return submit({ op: "signDigest", hash, privateKey }) as Promise<Hex>
+}
+
+export function recoverDigest(hash: Hex, signature: Hex): Promise<Hex> {
+  return submit({ op: "recoverDigest", hash, signature }) as Promise<Hex>
+}
+
+export async function signTyped(account: Keyed, typed: Parameters<typeof hashTypedData>[0]): Promise<Hex> {
+  const hash = hashTypedData(typed)
+  return signDigest(hash, privateKeyOf(account))
+}
+
+export async function recoverTyped(typed: Parameters<typeof hashTypedData>[0], signature: Hex): Promise<Hex> {
+  const hash = hashTypedData(typed)
+  return recoverDigest(hash, signature)
+}
