@@ -157,3 +157,205 @@ contract HostRegistry is IHostRegistry, EIP712, Ownable2Step, ReentrancyGuardTra
         emit HostStatusChanged(msg.sender, uint8(Status.Probation));
         _pullBonds(p.bondUsdg, p.bondOfpk);
     }
+
+    function updateServing(
+        bytes32[] calldata modelDigests,
+        uint32[] calldata maxTps,
+        bytes32 imageDigest,
+        bytes32 gpuClass,
+        bytes32 attestationRef
+    ) external {
+        Host storage h = _hosts[msg.sender];
+        if (h.status != Status.Probation && h.status != Status.Active) revert WrongStatus(msg.sender, h.status);
+        if (!allowedGpuClass[gpuClass]) revert GpuClassNotAllowed(gpuClass);
+        bool changed = imageDigest != h.imageDigest || gpuClass != h.gpuClass
+            || keccak256(abi.encode(modelDigests)) != keccak256(abi.encode(_models[msg.sender]));
+        h.imageDigest = imageDigest;
+        h.gpuClass = gpuClass;
+        h.attestationRef = attestationRef;
+        _setModels(msg.sender, modelDigests, maxTps);
+        if (changed) {
+            h.status = Status.Probation;
+            h.probationEnds = uint64(block.timestamp + PROBATION);
+            emit HostStatusChanged(msg.sender, uint8(Status.Probation));
+        }
+        emit ServingUpdated(msg.sender, imageDigest, gpuClass, modelDigests, maxTps, h.probationEnds, attestationRef);
+    }
+
+    function activate(address host) external {
+        Host storage h = _hosts[host];
+        if (h.status != Status.Probation) revert WrongStatus(host, h.status);
+        if (block.timestamp < h.probationEnds) revert ProbationNotOver(h.probationEnds);
+        uint256 required = requiredBond(host);
+        if (h.bondUsdg < required) revert BondBelowRequired(h.bondUsdg, required);
+        h.status = Status.Active;
+        emit HostStatusChanged(host, uint8(Status.Active));
+    }
+
+    function verifyPriceSheet(PriceSheet calldata s, bytes calldata sig) external view returns (bool ok, bytes32 sheetHash) {
+        sheetHash = _hashTypedDataV4(Typehashes.hash(s));
+        ok = _floorHolds(s.floorIn, s.baseIn) && _floorHolds(s.floorOut, s.baseOut)
+            && SignatureChecker.isValidSignatureNow(s.host, sheetHash, sig);
+    }
+
+    function topUpBond(uint256 usdgAmount, uint256 ofpkAmount) external nonReentrant {
+        Host storage h = _hosts[msg.sender];
+        if (h.status == Status.None) revert NotRegistered(msg.sender);
+        h.bondUsdg += usdgAmount;
+        h.bondOfpk += ofpkAmount;
+        totalOwed += usdgAmount;
+        emit BondChanged(msg.sender, h.bondUsdg, h.bondOfpk);
+        _pullBonds(usdgAmount, ofpkAmount);
+    }
+
+    function updateEndpoint(bytes32 endpointHash) external {
+        Host storage h = _hosts[msg.sender];
+        if (h.status == Status.None) revert NotRegistered(msg.sender);
+        h.endpointHash = endpointHash;
+        emit EndpointUpdated(msg.sender, endpointHash);
+    }
+
+    /// A delisted host stays Delisted through its exit, so leaving cannot clear the listing.
+    function exit() external {
+        Host storage h = _hosts[msg.sender];
+        Status status = h.status;
+        bool canExit = status == Status.Probation || status == Status.Active
+            || (status == Status.Delisted && h.exitAvailableAt == 0);
+        if (!canExit) revert WrongStatus(msg.sender, status);
+        if (h.openChallenges > 0) revert OpenChallenges(msg.sender, h.openChallenges);
+        h.exitAvailableAt = uint64(block.timestamp + UNBONDING);
+        if (status != Status.Delisted) {
+            h.status = Status.Exiting;
+            emit HostStatusChanged(msg.sender, uint8(Status.Exiting));
+        }
+    }
+
+    function finalizeExit() external nonReentrant {
+        Host storage h = _hosts[msg.sender];
+        if (h.exitAvailableAt == 0 || (h.status != Status.Exiting && h.status != Status.Delisted)) {
+            revert WrongStatus(msg.sender, h.status);
+        }
+        if (block.timestamp < h.exitAvailableAt) revert ExitNotAvailable(h.exitAvailableAt);
+        if (h.openChallenges > 0) revert OpenChallenges(msg.sender, h.openChallenges);
+        uint256 bondUsdg = h.bondUsdg;
+        uint256 bondOfpk = h.bondOfpk;
+        h.bondUsdg = 0;
+        h.bondOfpk = 0;
+        h.exitAvailableAt = 0;
+        totalOwed -= bondUsdg;
+        emit BondChanged(msg.sender, 0, 0);
+        if (h.status == Status.Exiting) {
+            h.status = Status.None;
+            emit HostStatusChanged(msg.sender, uint8(Status.None));
+        }
+        if (bondUsdg > 0) usdg.safeTransfer(msg.sender, bondUsdg);
+        if (bondOfpk > 0) ofpk.safeTransfer(msg.sender, bondOfpk);
+    }
+
+    function withdrawCredits() external nonReentrant {
+        Host storage h = _hosts[msg.sender];
+        if (h.openChallenges > 0) revert OpenChallenges(msg.sender, h.openChallenges);
+        if (h.status == Status.Frozen) revert HostFrozen(msg.sender);
+        if (h.forfeited) revert CreditsForfeited(msg.sender);
+        uint256 total = _takeReleasable(msg.sender);
+        emit CreditsWithdrawn(msg.sender, total);
+        if (total > 0) usdg.safeTransfer(msg.sender, total);
+    }
+
+    /// After a full slash, anyone can move the host's released credits into the reserve.
+    function sweepForfeitedCredits(address host) external nonReentrant {
+        if (!_hosts[host].forfeited) revert NotForfeited(host);
+        uint256 total = _takeReleasable(host);
+        emit CreditsWithdrawn(host, total);
+        if (total == 0) return;
+        usdg.forceApprove(vault, total);
+        IOffpeakVault(vault).fundReserve(total);
+    }
+
+    function _takeReleasable(address host) private returns (uint256 total) {
+        CreditEntry[] storage entries = _credits[host];
+        uint256 i = _creditHead[host];
+        uint256 end = i + MAX_WITHDRAW_ENTRIES;
+        if (end > entries.length) end = entries.length;
+        for (; i < end; ++i) {
+            CreditEntry storage entry = entries[i];
+            if (entry.releasableAt > block.timestamp) break;
+            if (!entry.clawed) total += entry.amount;
+            delete entries[i];
+        }
+        _creditHead[host] = i;
+        totalOwed -= total;
+    }
+
+    /// One entry per host per hour, so nobody can pad the list until a seizure runs out of gas.
+    function _recordCredit(address host, uint64 hour, uint64 releasableAt, uint128 amount) private {
+        CreditEntry[] storage entries = _credits[host];
+        uint256 count = entries.length;
+        if (count > _creditHead[host]) {
+            CreditEntry storage last = entries[count - 1];
+            if (last.hour == hour && !last.clawed) {
+                last.amount += amount;
+                last.releasableAt = releasableAt;
+                return;
+            }
+        }
+        entries.push(CreditEntry(hour, releasableAt, amount, false));
+    }
+
+    function _recordOwed(Credit[] calldata credits) private {
+        uint256 total;
+        for (uint256 i; i < credits.length; ++i) {
+            total += credits[i].amount;
+        }
+        totalOwed += total;
+        uint256 balance = usdg.balanceOf(address(this));
+        if (balance < totalOwed) revert UnbackedCredits(balance, totalOwed);
+    }
+
+    /// Never reverts on a host's state, so a settle can always land.
+    function accrueCredits(uint64 hour, Credit[] calldata credits) external {
+        if (msg.sender != vault && msg.sender != windowMarket) revert NotAuthorized(msg.sender);
+        _recordOwed(credits);
+        uint64 releasableAt = uint64(block.timestamp + CREDIT_DELAY);
+        for (uint256 i; i < credits.length; ++i) {
+            Credit calldata credit = credits[i];
+            if (credit.amount == 0) continue;
+            _recordCredit(credit.host, hour, releasableAt, credit.amount);
+            _addToRing(_hosts[credit.host], credit.amount);
+            emit CreditsAccrued(credit.host, hour, credit.amount, releasableAt);
+        }
+    }
+
+    /// Rewards are not revenue: they follow the credit delay but stay out of the required-bond ring.
+    /// Also how the court returns seized credits, which were already counted in the ring.
+    function accrueRewards(uint64 week, Credit[] calldata credits) external {
+        if (msg.sender != feeSplitter && msg.sender != auditCourt) revert NotAuthorized(msg.sender);
+        _recordOwed(credits);
+        uint64 releasableAt = uint64(block.timestamp + CREDIT_DELAY);
+        for (uint256 i; i < credits.length; ++i) {
+            Credit calldata credit = credits[i];
+            if (credit.amount == 0) continue;
+            _credits[credit.host].push(CreditEntry(0, releasableAt, credit.amount, false));
+            emit RewardsAccrued(credit.host, week, credit.amount, releasableAt);
+        }
+    }
+
+    function clawBack(address host, uint64 hour, bytes32 reason) external nonReentrant {
+        if (msg.sender != auditCourt && msg.sender != guardian) revert NotAuthorized(msg.sender);
+        CreditEntry[] storage entries = _credits[host];
+        uint256 head = _creditHead[host];
+        uint256 total;
+        for (uint256 i = entries.length; i > head; --i) {
+            CreditEntry storage entry = entries[i - 1];
+            if (entry.releasableAt <= block.timestamp) break;
+            if (entry.hour == hour && !entry.clawed) {
+                entry.clawed = true;
+                total += entry.amount;
+            }
+        }
+        if (total == 0) return;
+        totalOwed -= total;
+        emit CreditsClawedBack(host, hour, uint128(total), reason);
+        usdg.forceApprove(vault, total);
+        IOffpeakVault(vault).fundReserve(total);
+    }
