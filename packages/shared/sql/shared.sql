@@ -101,3 +101,126 @@ BEGIN
   RAISE EXCEPTION 'deletes are forbidden on %', TG_TABLE_NAME;
 END;
 $$;
+
+CREATE OR REPLACE FUNCTION shared.guard_usage_records() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+  closed boolean;
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF EXISTS (SELECT 1 FROM shared.usage_hours h WHERE h.hour = NEW.hour) THEN
+      RAISE EXCEPTION 'hour % is closed', NEW.hour;
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  IF NEW.req_id IS DISTINCT FROM OLD.req_id
+     OR NEW.hour IS DISTINCT FROM OLD.hour
+     OR NEW.ts IS DISTINCT FROM OLD.ts
+     OR NEW.payer IS DISTINCT FROM OLD.payer
+     OR NEW.buyer_ref IS DISTINCT FROM OLD.buyer_ref
+     OR NEW.host IS DISTINCT FROM OLD.host
+     OR NEW.model_digest IS DISTINCT FROM OLD.model_digest
+     OR NEW.tokens_in IS DISTINCT FROM OLD.tokens_in
+     OR NEW.tokens_out IS DISTINCT FROM OLD.tokens_out
+     OR NEW.prompt_hash IS DISTINCT FROM OLD.prompt_hash
+     OR NEW.output_hash IS DISTINCT FROM OLD.output_hash
+     OR NEW.price_in IS DISTINCT FROM OLD.price_in
+     OR NEW.price_out IS DISTINCT FROM OLD.price_out
+     OR NEW.host_cost_micro IS DISTINCT FROM OLD.host_cost_micro
+     OR NEW.fee_micro IS DISTINCT FROM OLD.fee_micro
+     OR NEW.fee_bps IS DISTINCT FROM OLD.fee_bps
+     OR NEW.pay_mode IS DISTINCT FROM OLD.pay_mode
+     OR NEW.pay_ref IS DISTINCT FROM OLD.pay_ref
+     OR NEW.sheet_hash IS DISTINCT FROM OLD.sheet_hash
+     OR NEW.window_id IS DISTINCT FROM OLD.window_id
+     OR NEW.router_sig IS DISTINCT FROM OLD.router_sig
+     OR NEW.host_sig IS DISTINCT FROM OLD.host_sig
+     OR NEW.leaf IS DISTINCT FROM OLD.leaf
+     OR NEW.sealed IS DISTINCT FROM OLD.sealed
+     OR NEW.created_at IS DISTINCT FROM OLD.created_at
+  THEN
+    RAISE EXCEPTION 'only status and settled_hour_tx may change';
+  END IF;
+
+  SELECT EXISTS (SELECT 1 FROM shared.usage_hours h WHERE h.hour = OLD.hour) INTO closed;
+  IF NEW.status IS DISTINCT FROM OLD.status AND closed THEN
+    RAISE EXCEPTION 'status is frozen after hour close';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS usage_records_guard ON shared.usage_records;
+CREATE TRIGGER usage_records_guard
+BEFORE INSERT OR UPDATE ON shared.usage_records
+FOR EACH ROW EXECUTE FUNCTION shared.guard_usage_records();
+
+DROP TRIGGER IF EXISTS usage_records_no_delete ON shared.usage_records;
+CREATE TRIGGER usage_records_no_delete
+BEFORE DELETE ON shared.usage_records
+FOR EACH ROW EXECUTE FUNCTION shared.forbid_delete();
+
+DROP TRIGGER IF EXISTS usage_hours_no_delete ON shared.usage_hours;
+CREATE TRIGGER usage_hours_no_delete
+BEFORE DELETE ON shared.usage_hours
+FOR EACH ROW EXECUTE FUNCTION shared.forbid_delete();
+
+DROP TRIGGER IF EXISTS agent_payments_no_delete ON shared.agent_payments;
+CREATE TRIGGER agent_payments_no_delete
+BEFORE DELETE ON shared.agent_payments
+FOR EACH ROW EXECUTE FUNCTION shared.forbid_delete();
+
+DROP TRIGGER IF EXISTS channel_state_no_delete ON shared.channel_state;
+CREATE TRIGGER channel_state_no_delete
+BEFORE DELETE ON shared.channel_state
+FOR EACH ROW EXECUTE FUNCTION shared.forbid_delete();
+
+DROP TRIGGER IF EXISTS window_perf_no_delete ON shared.window_perf;
+CREATE TRIGGER window_perf_no_delete
+BEFORE DELETE ON shared.window_perf
+FOR EACH ROW EXECUTE FUNCTION shared.forbid_delete();
+
+DROP TRIGGER IF EXISTS refunds_no_delete ON shared.refunds;
+CREATE TRIGGER refunds_no_delete
+BEFORE DELETE ON shared.refunds
+FOR EACH ROW EXECUTE FUNCTION shared.forbid_delete();
+
+CREATE TABLE IF NOT EXISTS shared.evidence_bundles (
+  samples_root text PRIMARY KEY,
+  body         jsonb NOT NULL,
+  created_at   timestamptz NOT NULL DEFAULT now()
+);
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'offpeak_router') THEN
+    CREATE ROLE offpeak_router;
+  END IF;
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'offpeak_chain') THEN
+    CREATE ROLE offpeak_chain;
+  END IF;
+END $$;
+
+GRANT USAGE ON SCHEMA shared TO offpeak_router, offpeak_chain;
+GRANT SELECT ON ALL TABLES IN SCHEMA shared TO offpeak_router, offpeak_chain;
+GRANT INSERT ON
+  shared.usage_records,
+  shared.usage_hours,
+  shared.agent_payments,
+  shared.channel_state,
+  shared.window_perf,
+  shared.refunds,
+  shared.evidence_bundles
+TO offpeak_router;
+
+GRANT INSERT ON shared.refunds TO offpeak_chain;
+
+GRANT UPDATE (status) ON shared.usage_records TO offpeak_router;
+GRANT UPDATE (settled_hour_tx) ON shared.usage_records TO offpeak_chain;
+GRANT UPDATE (settle_tx, settled_at) ON shared.usage_hours TO offpeak_chain;
+GRANT UPDATE (collected_tx, collected_hour, drawn_hour, written_off_hour) ON shared.agent_payments TO offpeak_chain;
+GRANT UPDATE (latest_seq, cumulative, voucher_sig, updated_at) ON shared.channel_state TO offpeak_router;
+GRANT UPDATE (claimed) ON shared.channel_state TO offpeak_chain;
+GRANT UPDATE (paid_hour) ON shared.refunds TO offpeak_chain;
+GRANT UPDATE (tokens_per_s, demanded) ON shared.window_perf TO offpeak_router;
