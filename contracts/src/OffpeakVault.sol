@@ -173,3 +173,105 @@ contract OffpeakVault is IOffpeakVault, EIP712, Ownable2Step, ReentrancyGuardTra
             emit CapsChanged(msg.sender, nextHourly, nextDaily);
         }
     }
+
+    function withdraw(uint256 amount) external nonReentrant {
+        Buyer storage b = _buyers[msg.sender];
+        _foldCaps(msg.sender, b);
+        uint256 available = b.balance - _reserveOf(b);
+        if (amount > available) revert WithdrawExceedsAvailable(amount, available);
+        b.balance -= amount;
+        emit Withdrawn(msg.sender, amount, b.balance);
+        usdg.safeTransfer(msg.sender, amount);
+    }
+
+    function requestWithdrawAll() external {
+        Buyer storage b = _buyers[msg.sender];
+        if (b.withdrawRequestedAt != 0) revert WithdrawAlreadyRequested(msg.sender);
+        uint64 requestedAt = uint64(block.timestamp);
+        b.withdrawRequestedAt = requestedAt;
+        emit WithdrawAllRequested(msg.sender, requestedAt, requestedAt + uint64(WITHDRAW_ALL_MAX_DELAY));
+    }
+
+    function cancelWithdrawAll() external {
+        Buyer storage b = _buyers[msg.sender];
+        if (b.withdrawRequestedAt == 0) revert NoWithdrawRequest(msg.sender);
+        b.withdrawRequestedAt = 0;
+        emit WithdrawAllCancelled(msg.sender);
+    }
+
+    function executeWithdrawAll(address buyer) external nonReentrant {
+        Buyer storage b = _buyers[buyer];
+        uint64 requestedAt = b.withdrawRequestedAt;
+        if (requestedAt == 0) revert NoWithdrawRequest(buyer);
+        uint64 dueAt = requestedAt + uint64(WITHDRAW_ALL_MAX_DELAY);
+        if (block.timestamp < dueAt && lastSettledHour < HourMath.hourOf(requestedAt)) {
+            revert WithdrawNotDue(buyer, dueAt);
+        }
+        uint256 amount = b.balance;
+        b.balance = 0;
+        b.withdrawRequestedAt = 0;
+        emit WithdrawAllExecuted(buyer, amount);
+        usdg.safeTransfer(buyer, amount);
+    }
+
+    function settle(SettleBatch calldata b, RootTotals calldata t, bytes calldata thresholdSig) external nonReentrant {
+        _checkBatch(b, t, thresholdSig);
+        (uint256 credited, Credit[] memory credits) = _sumCredits(b.credits);
+        uint256 inflow = uint256(t.prepaidDebit) + b.agentPoolDraw + b.reserveDraw;
+        if (inflow != credited + b.fees) revert ConservationBroken(inflow, credited + b.fees);
+
+        (uint256 taken, uint256 shortfall) = _applyDebits(b.debits, b.hour, t.prepaidDebit);
+        if (agentPool < b.agentPoolDraw) revert InsufficientAgentPool(agentPool, b.agentPoolDraw);
+        if (protocolReserve < b.reserveDraw) revert InsufficientProtocolReserve(protocolReserve, b.reserveDraw);
+        agentPool -= b.agentPoolDraw;
+        protocolReserve -= b.reserveDraw;
+
+        uint256 fees = b.fees;
+        if (shortfall > 0) (credited, fees) = _coverShortfall(b.hour, shortfall, credits, credited, fees);
+        lastSettledHour = b.hour;
+
+        ledger.postRoot(b.hour, b.root, b.totalsHash, t.records);
+        if (credited > 0) {
+            usdg.safeTransfer(address(registry), credited);
+            registry.accrueCredits(b.hour, credits);
+        }
+        if (fees > 0) {
+            usdg.safeTransfer(address(feeSplitter), fees);
+            feeSplitter.notify(fees);
+        }
+        if (b.windowDraws.length > 0) windowMarket.applyDraws(b.hour, b.windowDraws);
+        emit Settled(b.hour, b.root, b.totalsHash, uint128(taken), uint128(credited), uint128(fees));
+    }
+
+    function refund(RefundBatch calldata r, bytes calldata thresholdSig) external nonReentrant {
+        if (settlesPaused) revert SettlesPaused();
+        if (r.refunds.length > MAX_REFUNDS) revert BatchTooLarge(r.refunds.length, MAX_REFUNDS);
+        ThresholdSig.verify2of3(settlers, _hashTypedDataV4(Typehashes.hash(r)), thresholdSig);
+        for (uint256 i; i < r.refunds.length; ++i) {
+            Refund calldata item = r.refunds[i];
+            if (refundPaid[item.refundId]) revert RefundAlreadyPaid(item.refundId);
+            if (protocolReserve < item.amount) revert InsufficientProtocolReserve(protocolReserve, item.amount);
+            refundPaid[item.refundId] = true;
+            protocolReserve -= item.amount;
+            _buyers[item.payer].balance += item.amount;
+            emit Refunded(item.payer, item.amount, item.refundId);
+        }
+    }
+
+    /// The caller has already transferred `amount` of USDG to this contract.
+    function creditAgentPool(uint256 amount, bytes32 paymentId) external {
+        if (msg.sender != x402Escrow && msg.sender != channelManager) revert NotAgentPayer(msg.sender);
+        agentPool += amount;
+        emit AgentPoolCredited(paymentId, amount);
+    }
+
+    function fundReserve(uint256 amount) external nonReentrant {
+        protocolReserve += amount;
+        emit ReserveFunded(msg.sender, amount, protocolReserve);
+        usdg.safeTransferFrom(msg.sender, address(this), amount);
+    }
+
+    function setUsagePaused(bool paused) external onlyGuardian {
+        usagePaused = paused;
+        emit Paused(usagePaused, settlesPaused);
+    }
