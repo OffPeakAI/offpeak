@@ -95,3 +95,103 @@ contract X402Escrow is IX402Escrow, ReentrancyGuardTransient {
         if (msg.sender != address(this)) revert OnlySelf();
         _authorize(call.p, call.sig, call.payer, call.w);
     }
+
+    function capture(bytes32 reqId, uint256 actual) external onlyCapturer nonReentrant {
+        _capture(reqId, actual);
+    }
+
+    function captureBatch(bytes32[] calldata reqIds, uint256[] calldata actuals) external onlyCapturer nonReentrant {
+        if (reqIds.length != actuals.length) revert LengthMismatch();
+        if (reqIds.length > MAX_BATCH) revert BatchTooLarge(reqIds.length, MAX_BATCH);
+        for (uint256 i; i < reqIds.length; ++i) {
+            _capture(reqIds[i], actuals[i]);
+        }
+    }
+
+    function settleExact(ISignatureTransfer.PermitTransferFrom calldata p, bytes calldata sig, address payer, ExactWitness calldata w)
+        external
+        onlyRelay
+        nonReentrant
+    {
+        _checkPermit(p, w.reqId, w.payee, w.amount, w.validBefore);
+        _escrows[w.reqId] = EscrowView(payer, uint128(w.amount), uint128(w.amount), w.validBefore, STATUS_EXACT);
+        permit2.permitWitnessTransferFrom(
+            p,
+            ISignatureTransfer.SignatureTransferDetails({to: payee, requestedAmount: w.amount}),
+            payer,
+            Typehashes.hash(w),
+            Typehashes.EXACT_WITNESS_TYPESTRING,
+            sig
+        );
+        IOffpeakVault(payee).creditAgentPool(w.amount, w.reqId);
+        emit ExactSettled(w.reqId, payer, w.amount);
+    }
+
+    function expire(bytes32 reqId) external nonReentrant {
+        EscrowView storage e = _escrows[reqId];
+        if (e.status != STATUS_AUTHORIZED) revert EscrowClosed(reqId);
+        uint256 at = uint256(e.validBefore) + EXPIRY_GRACE;
+        if (block.timestamp <= at) revert NotExpired(at);
+        e.status = STATUS_EXPIRED;
+        emit Expired(reqId, e.max);
+        _refund(e.payer, e.max);
+    }
+
+    function claimOwed() external nonReentrant {
+        uint256 amount = owed[msg.sender];
+        owed[msg.sender] = 0;
+        usdg.safeTransfer(msg.sender, amount);
+    }
+
+    function escrowView(bytes32 reqId) external view returns (EscrowView memory) {
+        return _escrows[reqId];
+    }
+
+    function _checkPermit(
+        ISignatureTransfer.PermitTransferFrom calldata p,
+        bytes32 reqId,
+        address witnessPayee,
+        uint256 amount,
+        uint64 validBefore
+    ) private view {
+        if (witnessPayee != payee) revert WrongPayee(witnessPayee);
+        if (p.permitted.token != address(usdg) || p.permitted.amount != amount) revert WrongPermit();
+        if (validBefore <= block.timestamp) revert ExpiredAuthorization(validBefore);
+        if (_escrows[reqId].status != STATUS_NONE) revert ReqIdUsed(reqId);
+    }
+
+    function _authorize(ISignatureTransfer.PermitTransferFrom calldata p, bytes calldata sig, address payer, UptoWitness calldata w)
+        private
+    {
+        _checkPermit(p, w.reqId, w.payee, w.maxAmount, w.validBefore);
+        if (w.maxAmount < UPTO_MIN_MAX) revert MaxTooLow(w.maxAmount);
+        _escrows[w.reqId] = EscrowView(payer, uint128(w.maxAmount), 0, w.validBefore, STATUS_AUTHORIZED);
+        permit2.permitWitnessTransferFrom(
+            p,
+            ISignatureTransfer.SignatureTransferDetails({to: address(this), requestedAmount: w.maxAmount}),
+            payer,
+            Typehashes.hash(w),
+            Typehashes.UPTO_WITNESS_TYPESTRING,
+            sig
+        );
+        emit Authorized(w.reqId, payer, w.maxAmount, w.validBefore);
+    }
+
+    function _capture(bytes32 reqId, uint256 actual) private {
+        EscrowView storage e = _escrows[reqId];
+        if (e.status != STATUS_AUTHORIZED) revert EscrowClosed(reqId);
+        if (actual > e.max) revert OverMax(actual, e.max);
+        if (block.timestamp > uint256(e.validBefore) + EXPIRY_GRACE) revert ExpiredAuthorization(e.validBefore);
+        uint256 refunded = e.max - actual;
+        e.status = STATUS_CAPTURED;
+        e.captured = uint128(actual);
+        emit Captured(reqId, actual, refunded);
+        usdg.safeTransfer(payee, actual);
+        IOffpeakVault(payee).creditAgentPool(actual, reqId);
+        if (refunded > 0) _refund(e.payer, refunded);
+    }
+
+    function _refund(address payer, uint256 amount) private {
+        if (!usdg.trySafeTransfer(payer, amount)) owed[payer] += amount;
+    }
+}

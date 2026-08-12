@@ -206,3 +206,232 @@ contract WindowMarket is IWindowMarket, ERC1155, EIP712, ReentrancyGuardTransien
         usdg.safeTransferFrom(msg.sender, address(this), units * price);
         _mint(msg.sender, id, units, "");
     }
+
+    function cancel(uint256 id, uint256 units) external nonReentrant {
+        Window storage w = _known(id);
+        if (block.timestamp >= w.t0) revert WindowStarted(id);
+        if (units == 0) revert ZeroUnits();
+        Holding storage h = _holdings[id][msg.sender];
+        uint256 hostValue = units * h.hostBasis;
+        uint256 feeValue = units * h.feeBasis;
+        uint256 toHolder = hostValue * CANCEL_REFUND_BPS / 10_000;
+        uint256 toHost = hostValue - toHolder;
+        w.sold -= uint64(units);
+        w.escrowHost -= hostValue;
+        w.escrowFees -= feeValue;
+        _burn(msg.sender, id, units);
+        emit WindowCancelled(id, msg.sender, units, toHolder + feeValue);
+        _creditHost(w.host, toHost);
+        usdg.safeTransfer(msg.sender, toHolder + feeValue);
+    }
+
+    function list(uint256 id, uint256 units, uint256 pricePerUnit) external nonReentrant returns (uint256 listingId) {
+        Window storage w = _known(id);
+        if (block.timestamp >= w.t1) revert WindowEnded(id);
+        if (units == 0) revert ZeroUnits();
+        if (pricePerUnit > type(uint64).max) revert PriceAboveMax(pricePerUnit, type(uint64).max);
+        _move(msg.sender, address(this), id, units);
+        Holding storage h = _holdings[id][msg.sender];
+        h.listed += uint64(units);
+        listingId = nextListingId++;
+        listings[listingId] = Listing({
+            id: id,
+            seller: msg.sender,
+            units: uint64(units),
+            pricePerUnit: uint64(pricePerUnit),
+            hostBasis: h.hostBasis,
+            costBasis: h.costBasis,
+            feeBasis: h.feeBasis
+        });
+        emit Listed(listingId, id, msg.sender, units, pricePerUnit);
+    }
+
+    function delist(uint256 listingId) external nonReentrant {
+        Listing storage l = listings[listingId];
+        if (l.seller != msg.sender) revert NotSeller(msg.sender);
+        uint256 units = l.units;
+        if (units == 0) revert ListingClosed(listingId);
+        uint256 id = l.id;
+        _snapshot(id, msg.sender);
+        _holdings[id][msg.sender].listed -= uint64(units);
+        _merge(id, msg.sender, units, l.hostBasis, l.costBasis, l.feeBasis);
+        l.units = 0;
+        emit Delisted(listingId);
+        _move(address(this), msg.sender, id, units);
+    }
+
+    function buyListing(uint256 listingId, uint256 units, uint256 maxPricePerUnit) external nonReentrant {
+        Listing storage l = listings[listingId];
+        if (units == 0) revert ZeroUnits();
+        if (l.units == 0) revert ListingClosed(listingId);
+        if (units > l.units) revert InsufficientUnits(l.units, units);
+        uint256 id = l.id;
+        if (block.timestamp >= _windows[id].t1) revert WindowEnded(id);
+        uint256 price = l.pricePerUnit;
+        if (price > maxPricePerUnit) revert PriceAboveMax(price, maxPricePerUnit);
+
+        address seller = l.seller;
+        uint256 sale = units * price;
+        uint256 markup = price > l.costBasis ? (price - l.costBasis) * units : 0;
+        uint256 fee = sale * RESALE_FEE_BPS / 10_000 + markup * RESALE_MARKUP_BPS / 10_000;
+        _snapshot(id, seller);
+        _snapshot(id, msg.sender);
+        _holdings[id][seller].listed -= uint64(units);
+        l.units -= uint64(units);
+        _merge(id, msg.sender, units, l.hostBasis, uint64(price), l.feeBasis);
+        emit ListingFilled(listingId, msg.sender, units, fee);
+        usdg.safeTransferFrom(msg.sender, address(this), sale);
+        _sendFees(fee);
+        usdg.safeTransfer(seller, sale - fee);
+        _move(address(this), msg.sender, id, units);
+    }
+
+    /// Half the host's price returns for unused tokens, the rest pays the host for holding the capacity.
+    function claimExpired(uint256 id) external nonReentrant {
+        Window storage w = _known(id);
+        if (!_claimable(w) || _failed(w)) revert NotClaimable(id);
+        Holding storage h = _holdings[id][msg.sender];
+        if (h.listed > 0) revert StillListed(id, h.listed);
+        uint256 balance = balanceOf(msg.sender, id);
+        uint256 refund;
+        uint256 toHost;
+        if (balance > 0) {
+            (uint256 hostValue, uint256 feeValue) = _unusedValue(w, h, balance);
+            uint256 hostRefund = hostValue * EXPIRY_REFUND_BPS / 10_000;
+            toHost = hostValue - hostRefund;
+            refund = hostRefund + feeValue;
+            w.escrowHost -= hostValue;
+            w.escrowFees -= feeValue;
+            h.drawnPartial = 0;
+            _burn(msg.sender, id, balance);
+        }
+        emit Claimed(id, msg.sender, CLAIM_EXPIRED, refund);
+        if (toHost > 0) _creditHost(w.host, toHost);
+        _closeOut(w);
+        if (refund > 0) usdg.safeTransfer(msg.sender, refund);
+    }
+
+    /// Refunds what was paid for undrawn tokens, plus a share of all the collateral by units held at the start.
+    function claimFailure(uint256 id) external nonReentrant {
+        Window storage w = _known(id);
+        if (!_claimable(w) || !_failed(w)) revert NotClaimable(id);
+        Holding storage h = _holdings[id][msg.sender];
+        if (h.listed > 0) revert StillListed(id, h.listed);
+        _snapshot(id, msg.sender);
+        uint256 balance = balanceOf(msg.sender, id);
+        (uint256 hostValue, uint256 feeValue) = _unusedValue(w, h, balance);
+        uint256 share = w.collateral * h.unitsAtStart / w.sold;
+        w.collateralPaid += share;
+        w.sharedUnits += h.unitsAtStart;
+        h.unitsAtStart = 0;
+        w.escrowHost -= hostValue;
+        w.escrowFees -= feeValue;
+        h.drawnPartial = 0;
+        if (balance > 0) _burn(msg.sender, id, balance);
+        uint256 refund = hostValue + feeValue + share;
+        emit Claimed(id, msg.sender, CLAIM_FAILURE, refund);
+        _closeOut(w);
+        if (refund > 0) usdg.safeTransfer(msg.sender, refund);
+    }
+
+    /// Inside settle, so nothing here may revert: a draw the holder cannot cover shrinks to what they hold,
+    /// and settlement checks balances first, so that path only guards against a stalled hour.
+    function applyDraws(uint64 hour, WindowDraw[] calldata draws) external nonReentrant {
+        if (msg.sender != vault) revert NotVault(msg.sender);
+        Credit[] memory credits = new Credit[](draws.length);
+        uint256 hosts;
+        uint256 fees;
+        uint256 paid;
+        for (uint256 i; i < draws.length; ++i) {
+            (uint64 tokens, uint256 units, uint256 hostShare, uint256 feeShare) = _draw(draws[i], hour);
+            emit Drawn(draws[i].windowId, draws[i].holder, tokens, units);
+            if (tokens == 0) continue;
+            fees += feeShare;
+            paid += hostShare;
+            hosts = _addCredit(credits, hosts, _windows[draws[i].windowId].host, hostShare);
+        }
+        assembly ("memory-safe") {
+            mstore(credits, hosts)
+        }
+        if (paid > 0) {
+            usdg.safeTransfer(address(registry), paid);
+            registry.accrueCredits(hour, credits);
+        }
+        _sendFees(fees);
+    }
+
+    function postPerformance(WindowPerformance calldata p, bytes calldata thresholdSig) external nonReentrant {
+        Window storage w = _known(p.windowId);
+        if (block.timestamp < w.t1) revert WindowNotEnded(p.windowId);
+        if (w.perfState != PERF_NONE && w.perfState != PERF_DISPUTED) revert PerformanceClosed(p.windowId);
+        // Past the fallback claims have opened on what was posted, so a late post could pay collateral twice.
+        if (block.timestamp >= uint256(w.t1) + CLAIM_FALLBACK_S) revert PerformanceClosed(p.windowId);
+        if (IOffpeakVault(vault).settlesPaused()) revert SettlesPaused();
+        address[3] memory settlers = _settlers();
+        ThresholdSig.verify2of3(settlers, _hashTypedDataV4(Typehashes.hash(p)), thresholdSig);
+        bool repost = w.perfState == PERF_DISPUTED;
+        // The first post's signatures are still valid, so only a settler may answer a dispute with them.
+        if (repost && msg.sender != settlers[0] && msg.sender != settlers[1] && msg.sender != settlers[2]) {
+            revert PerformanceClosed(p.windowId);
+        }
+        w.measuredSeconds = p.measuredSeconds;
+        w.belowMinSeconds = p.belowMinSeconds;
+        w.perfState = repost ? PERF_FINAL : PERF_POSTED;
+        w.perfFinalAt = uint64(repost ? block.timestamp : block.timestamp + PERF_DISPUTE_S);
+        emit PerformancePosted(p.windowId, p.measuredSeconds, p.belowMinSeconds, _failed(w), w.perfFinalAt);
+    }
+
+    function disputePerformance(uint256 id) external {
+        Window storage w = _known(id);
+        if (msg.sender != w.host) revert NotHost(msg.sender);
+        if (w.perfState != PERF_POSTED || block.timestamp >= w.perfFinalAt) revert PerformanceClosed(id);
+        w.perfState = PERF_DISPUTED;
+        emit PerformanceDisputed(id);
+    }
+
+    function windowView(uint256 id) external view returns (WindowView memory view_) {
+        Window storage w = _windows[id];
+        uint256 hostPrice = _hostPrice(w);
+        view_ = WindowView({
+            id: id,
+            host: w.host,
+            modelDigest: w.modelDigest,
+            t0: w.t0,
+            t1: w.t1,
+            minTps: w.minTps,
+            units: w.units,
+            hostPricePerUnit: hostPrice,
+            buyerPricePerUnit: hostPrice + _feePerUnit(hostPrice, msg.sender),
+            failed: _failed(w)
+        });
+    }
+
+    function holderView(uint256 id, address holder) external view returns (HolderView memory view_) {
+        Holding storage h = _holdings[id][holder];
+        view_ = HolderView({
+            balance: balanceOf(holder, id),
+            lockedPartial: h.drawnPartial > 0 ? 1 : 0,
+            drawnTokens: h.drawnPartial,
+            costBasis: h.costBasis
+        });
+    }
+
+    function claimOwed() external nonReentrant {
+        uint256 amount = owed[msg.sender];
+        owed[msg.sender] = 0;
+        usdg.safeTransfer(msg.sender, amount);
+    }
+
+    function _known(uint256 id) private view returns (Window storage w) {
+        w = _windows[id];
+        if (w.host == address(0)) revert UnknownWindow(id);
+    }
+
+    function _checkParams(WindowParams calldata w) private view {
+        if (w.units == 0 || w.minTps == 0) revert ZeroUnits();
+        if (w.t0 % 3600 != 0 || w.t1 % 3600 != 0 || w.t1 <= w.t0 || w.t0 <= block.timestamp) revert BadTiming();
+        if (w.t1 > block.timestamp + MAX_LEAD_S) revert BadTiming();
+        if (w.t1 - w.t0 > MAX_WINDOW_S) revert WindowTooLong();
+        if (w.auctionStart >= w.auctionEnd || w.auctionEnd > w.t0) revert BadTiming();
+        if (w.startPricePerUnit < w.endPricePerUnit || w.endPricePerUnit == 0) revert BadTiming();
+    }
