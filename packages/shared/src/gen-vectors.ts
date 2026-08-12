@@ -272,3 +272,135 @@ const uptoMessage = {
 const uptoStruct = hashStruct("PermitWitnessTransferFrom", uptoTypes as never, uptoMessage)
 const permitSeparator = domainSeparator("Permit2", contracts.Permit2 as Hex, null)
 const uptoDigest = typedDataDigest(uptoStruct, permitSeparator)
+
+const exactTypes = permitWitnessTypes("ExactWitness")
+const exactMessage = {
+  permitted: { token: contracts.MockUSDG as Hex, amount: 10_000n },
+  spender: contracts.X402Escrow as Hex,
+  nonce: 2n,
+  deadline: 1_800_000_000n,
+  witness: {
+    reqId: keccak256(toBytes("exact-req")),
+    payee: contracts.OffpeakVault as Hex,
+    amount: 10_000n,
+    validBefore: 1_800_000_000n,
+    resourceHash: keccak256(toBytes("resource-exact")),
+  },
+}
+const exactStruct = hashStruct("PermitWitnessTransferFrom", exactTypes as never, exactMessage)
+const exactDigest = typedDataDigest(exactStruct, permitSeparator)
+
+const rulingMessage = {
+  challengeId: 7n,
+  outcome: 1,
+  slashBps: 2000,
+  refundRoot: keccak256(toBytes("refunds")),
+  reasonHash: keccak256(toBytes("metering")),
+}
+const rulingOrdered = [...rulings].sort((a, b) => (a.address.toLowerCase() < b.address.toLowerCase() ? -1 : 1))
+const rulingSigs = await Promise.all(
+  rulingOrdered.slice(0, 2).map((signer) =>
+    signer.signTypedData({
+      domain: domain("OffpeakAudit", contracts.AuditCourt),
+      types: rulingTypes,
+      primaryType: "Ruling",
+      message: rulingMessage,
+    }),
+  ),
+)
+
+const json = {
+  note: "Anvil default mnemonic, accounts 1-9. Private keys are not stored. 1 router, 2 host, 3 buyer, 4-6 settlement, 7-9 ruling.",
+  chainId: 4663,
+  addresses: {
+    router: router.address.toLowerCase(),
+    host: host.address.toLowerCase(),
+    buyer: buyer.address.toLowerCase(),
+    settlers: settlers.map((s) => s.address.toLowerCase()),
+    rulings: rulings.map((s) => s.address.toLowerCase()),
+    contracts,
+  },
+  priceSheet: {
+    hash: sheetHash,
+    structHash: sheetStruct,
+    signature: priceSig,
+    host: priceMessage.host,
+    modelDigest: priceMessage.modelDigest,
+    floorIn: priceMessage.floorIn.toString(),
+    floorOut: priceMessage.floorOut.toString(),
+    validFrom: priceMessage.validFrom.toString(),
+    nonce: priceMessage.nonce.toString(),
+    baseIn0: priceMessage.baseIn[0]!.toString(),
+    baseOut0: priceMessage.baseOut[0]!.toString(),
+  },
+  usage: signed,
+  merkle: { root, proofs },
+  hourClose: {
+    hour: hourCloseMessage.hour.toString(),
+    records: hourCloseMessage.records,
+    root,
+    totalsHash,
+    signature: hourCloseSig,
+    totals: {
+      records: totals.records,
+      tokensIn: totals.tokensIn.toString(),
+      tokensOut: totals.tokensOut.toString(),
+      prepaidDebit: totals.prepaidDebit.toString(),
+      agentCollected: totals.agentCollected.toString(),
+      windowDrawn: totals.windowDrawn.toString(),
+      hostCredit: totals.hostCredit.toString(),
+      fees: totals.fees.toString(),
+    },
+  },
+  settleBatch: {
+    thresholdSig: `0x${pairSigs.map((s) => s.slice(2)).join("")}`,
+    signers: pair.map((p) => p.address.toLowerCase()),
+    fees: fees.toString(),
+    agentPoolDraw: agentCollected.toString(),
+    reserveDraw: "0",
+  },
+  refundBatch: {
+    batchId: refundMessage.batchId.toString(),
+    payer: refundMessage.refunds[0]!.payer,
+    amount: refundMessage.refunds[0]!.amount.toString(),
+    refundId: refundMessage.refunds[0]!.refundId,
+    structHash: hashStruct("RefundBatch", refundTypes as never, refundMessage),
+    thresholdSig: `0x${refundSigs.map((s) => s.slice(2)).join("")}`,
+  },
+  rewardBatch: {
+    week: rewardMessage.week.toString(),
+    host: rewardMessage.credits[0]!.host,
+    amount: rewardMessage.credits[0]!.amount.toString(),
+    structHash: hashStruct("RewardBatch", rewardTypes as never, rewardMessage),
+    thresholdSig: `0x${rewardSigs.map((s) => s.slice(2)).join("")}`,
+  },
+  voucher: {
+    channelId,
+    seq: "1",
+    cumulative: "123456",
+    signature: voucherSig,
+  },
+  permit2: {
+    uptoWitnessType: UPTO_WITNESS_TYPESTRING,
+    exactWitnessType: EXACT_WITNESS_TYPESTRING,
+    channelWitnessType: CHANNEL_WITNESS_TYPESTRING,
+    uptoDigest,
+    exactDigest,
+    uptoStruct,
+    exactStruct,
+  },
+  ruling: {
+    challengeId: "7",
+    outcome: 1,
+    slashBps: 2000,
+    refundRoot: rulingMessage.refundRoot,
+    reasonHash: rulingMessage.reasonHash,
+    thresholdSig: `0x${rulingSigs.map((s) => s.slice(2)).join("")}`,
+    signers: rulingOrdered.slice(0, 2).map((s) => s.address.toLowerCase()),
+  },
+}
+
+const out = join(dirname(fileURLToPath(import.meta.url)), "../fixtures/vectors.json")
+mkdirSync(dirname(out), { recursive: true })
+writeFileSync(out, `${JSON.stringify(json, null, 2)}\n`)
+console.log(`wrote ${out}`)
