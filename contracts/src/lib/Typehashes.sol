@@ -83,3 +83,107 @@ library Typehashes {
             )
         );
     }
+
+    function hash(Debit[] memory debits) internal pure returns (bytes32) {
+        bytes32[] memory hashes = new bytes32[](debits.length);
+        for (uint256 i; i < debits.length; ++i) {
+            hashes[i] = keccak256(abi.encode(DEBIT_TYPEHASH, debits[i].buyer, debits[i].amount, debits[i].lastTs));
+        }
+        return keccak256(abi.encodePacked(hashes));
+    }
+
+    function hash(Credit[] memory credits) internal pure returns (bytes32) {
+        bytes32[] memory hashes = new bytes32[](credits.length);
+        for (uint256 i; i < credits.length; ++i) {
+            hashes[i] = keccak256(abi.encode(CREDIT_TYPEHASH, credits[i].host, credits[i].amount));
+        }
+        return keccak256(abi.encodePacked(hashes));
+    }
+
+    function hash(WindowDraw[] memory draws) internal pure returns (bytes32) {
+        bytes32[] memory hashes = new bytes32[](draws.length);
+        for (uint256 i; i < draws.length; ++i) {
+            hashes[i] = keccak256(abi.encode(WINDOW_DRAW_TYPEHASH, draws[i].windowId, draws[i].holder, draws[i].tokens));
+        }
+        return keccak256(abi.encodePacked(hashes));
+    }
+
+    function hash(RefundBatch memory r) internal pure returns (bytes32) {
+        bytes32[] memory hashes = new bytes32[](r.refunds.length);
+        for (uint256 i; i < r.refunds.length; ++i) {
+            Refund memory refund = r.refunds[i];
+            hashes[i] = keccak256(abi.encode(REFUND_TYPEHASH, refund.payer, refund.amount, refund.refundId));
+        }
+        return keccak256(abi.encode(REFUND_BATCH_TYPEHASH, r.batchId, keccak256(abi.encodePacked(hashes))));
+    }
+
+    function hash(RewardBatch memory r) internal pure returns (bytes32) {
+        return keccak256(abi.encode(REWARD_BATCH_TYPEHASH, r.week, hash(r.credits)));
+    }
+
+    function hash(Voucher memory v) internal pure returns (bytes32) {
+        return keccak256(abi.encode(VOUCHER_TYPEHASH, v.channelId, v.seq, v.cumulative));
+    }
+
+    function hash(CooperativeClose memory c) internal pure returns (bytes32) {
+        return keccak256(abi.encode(COOPERATIVE_CLOSE_TYPEHASH, c.channelId, c.finalCumulative, c.deadline));
+    }
+
+    function hash(PriceSheet memory s) internal pure returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                PRICE_SHEET_TYPEHASH,
+                s.host,
+                s.modelDigest,
+                keccak256(abi.encodePacked(s.baseIn)),
+                keccak256(abi.encodePacked(s.baseOut)),
+                s.floorIn,
+                s.floorOut,
+                s.validFrom,
+                s.nonce
+            )
+        );
+    }
+
+    function hash(Ruling memory r) internal pure returns (bytes32) {
+        return keccak256(abi.encode(RULING_TYPEHASH, r.challengeId, r.outcome, r.slashBps, r.refundRoot, r.reasonHash));
+    }
+
+    function hash(PanelDecision memory d) internal pure returns (bytes32) {
+        return keccak256(
+            abi.encode(PANEL_DECISION_TYPEHASH, d.challengeId, d.decision, d.finalSlashBps, d.refundRoot, d.reasonHash)
+        );
+    }
+
+    function hash(WindowPerformance memory p) internal pure returns (bytes32) {
+        return keccak256(
+            abi.encode(WINDOW_PERFORMANCE_TYPEHASH, p.windowId, p.measuredSeconds, p.belowMinSeconds, p.evidenceRoot)
+        );
+    }
+
+    function hash(UptoWitness memory w) internal pure returns (bytes32) {
+        return keccak256(abi.encode(UPTO_WITNESS_TYPEHASH, w.reqId, w.payee, w.maxAmount, w.validBefore, w.resourceHash));
+    }
+
+    function hash(ExactWitness memory w) internal pure returns (bytes32) {
+        return keccak256(abi.encode(EXACT_WITNESS_TYPEHASH, w.reqId, w.payee, w.amount, w.validBefore, w.resourceHash));
+    }
+
+    function hash(ChannelOpenWitness memory w) internal pure returns (bytes32) {
+        return keccak256(abi.encode(CHANNEL_OPEN_WITNESS_TYPEHASH, w.channelSalt, w.payee, w.expiry));
+    }
+
+    function usageLeaf(bytes32 usageStructHash, bytes memory routerSig, bytes memory hostSig)
+        internal
+        pure
+        returns (bytes32)
+    {
+        return keccak256(
+            bytes.concat(keccak256(abi.encode(usageStructHash, keccak256(routerSig), keccak256(hostSig))))
+        );
+    }
+
+    function agentPaymentsHash(bytes32[] memory paymentIds) internal pure returns (bytes32) {
+        return keccak256(abi.encode(paymentIds));
+    }
+}

@@ -172,3 +172,226 @@ contract ChannelManagerTest is AgentFixture {
         vm.prank(payee);
         manager.settleChannel(id, v, sig);
     }
+
+    function test_aVoucherForAnotherChannelIsRefused() public {
+        Voucher memory v = _voucher(keccak256("other"), 1, 1e6);
+        bytes memory sig = _voucherSig(agentKey, v);
+        vm.expectRevert(abi.encodeWithSelector(ChannelManager.WrongChannel.selector, keccak256("other")));
+        vm.prank(keeper);
+        manager.settleChannel(id, v, sig);
+    }
+
+    function test_staleSequencesAreRefused() public {
+        _claim(5, 2e6);
+        Voucher memory v = _voucher(id, 5, 3e6);
+        bytes memory sig = _voucherSig(agentKey, v);
+        vm.expectRevert(abi.encodeWithSelector(ChannelManager.StaleVoucher.selector, uint64(5), uint64(5)));
+        vm.prank(keeper);
+        manager.settleChannel(id, v, sig);
+    }
+
+    function test_cumulativeMustGrowAndStayInsideTheDeposit() public {
+        _claim(1, 2e6);
+        Voucher memory lower = _voucher(id, 2, 2e6);
+        bytes memory sig = _voucherSig(agentKey, lower);
+        vm.expectRevert(abi.encodeWithSelector(ChannelManager.BadCumulative.selector, uint128(2e6), uint128(2e6), DEPOSIT));
+        vm.prank(keeper);
+        manager.settleChannel(id, lower, sig);
+
+        Voucher memory over = _voucher(id, 2, uint128(DEPOSIT) + 1);
+        sig = _voucherSig(agentKey, over);
+        vm.expectRevert(abi.encodeWithSelector(ChannelManager.BadCumulative.selector, uint128(DEPOSIT) + 1, uint128(2e6), DEPOSIT));
+        vm.prank(keeper);
+        manager.settleChannel(id, over, sig);
+    }
+
+    function test_contractWalletsCanPay() public {
+        ContractWalletPayer wallet = new ContractWalletPayer();
+        usdg.mint(address(wallet), DEPOSIT);
+        wallet.approveToken(address(usdg), address(manager));
+        bytes32 channelId = wallet.openChannel(manager, DEPOSIT, uint64(block.timestamp + 1 days), keccak256("w"));
+        Voucher memory v = _voucher(channelId, 1, 1e6);
+        wallet.approve(_channelDigest(Typehashes.hash(v)));
+        vm.prank(keeper);
+        manager.settleChannel(channelId, v, "");
+        assertEq(manager.channelView(channelId).claimed, 1e6);
+    }
+
+    function test_aPayerAddingCodeCannotStrandItsVouchers() public {
+        Voucher memory v = _voucher(id, 1, 1e6);
+        bytes memory sig = _voucherSig(agentKey, v);
+        vm.etch(agent, hex"00");
+        vm.prank(keeper);
+        manager.settleChannel(id, v, sig);
+        assertEq(manager.channelView(id).claimed, 1e6);
+    }
+
+    function test_aFrozenPayerCannotHoldUpAClose() public {
+        vm.prank(agent);
+        manager.requestClose(id);
+        vm.warp(block.timestamp + 2 hours);
+        vm.mockCallRevert(address(usdg), abi.encodeWithSelector(usdg.transfer.selector, agent, DEPOSIT), "frozen");
+        manager.finalizeClose(id);
+        vm.clearMockedCalls();
+        assertEq(manager.channelView(id).status, 3);
+        assertEq(manager.owed(agent), DEPOSIT);
+        vm.prank(agent);
+        manager.claimOwed();
+        assertEq(manager.owed(agent), 0);
+    }
+
+    // Closing
+
+    function test_requestCloseStartsTheTwoHourChallenge() public {
+        uint64 endsAt = uint64(block.timestamp + 2 hours);
+        vm.expectEmit(address(manager));
+        emit IChannelManager.CloseRequested(id, endsAt);
+        vm.prank(agent);
+        manager.requestClose(id);
+        assertEq(manager.channelView(id).status, 2);
+        assertEq(manager.channelView(id).challengeEndsAt, endsAt);
+    }
+
+    function test_onlyThePayerClosesBeforeExpiry() public {
+        vm.expectRevert(abi.encodeWithSelector(ChannelManager.NotAllowed.selector, address(this)));
+        manager.requestClose(id);
+
+        vm.warp(manager.channelView(id).expiry);
+        manager.requestClose(id);
+        assertEq(manager.channelView(id).status, 2);
+    }
+
+    function test_aCloseCannotFinalizeBeforeTheChallengeEnds() public {
+        vm.prank(agent);
+        manager.requestClose(id);
+        uint64 endsAt = manager.channelView(id).challengeEndsAt;
+        vm.warp(endsAt - 1);
+        vm.expectRevert(abi.encodeWithSelector(ChannelManager.ChallengeNotOver.selector, endsAt));
+        manager.finalizeClose(id);
+
+        vm.warp(endsAt);
+        manager.finalizeClose(id);
+        assertEq(manager.channelView(id).status, 3);
+    }
+
+    function test_theLatestVoucherLandsDuringTheChallenge() public {
+        _claim(1, 1e6);
+        vm.prank(agent);
+        manager.requestClose(id);
+        vm.warp(manager.channelView(id).challengeEndsAt - 1);
+        _claim(2, 7e6);
+
+        vm.warp(block.timestamp + 1);
+        uint256 agentBefore = usdg.balanceOf(agent);
+        vm.expectEmit(address(manager));
+        emit IChannelManager.ChannelClosed(id, 7e6, 3e6);
+        manager.finalizeClose(id);
+        assertEq(usdg.balanceOf(agent) - agentBefore, 3e6);
+        assertEq(vault.agentPool(), 7e6);
+    }
+
+    function test_noVoucherLandsOnceTheChallengeEnds() public {
+        vm.prank(agent);
+        manager.requestClose(id);
+        uint64 endsAt = manager.channelView(id).challengeEndsAt;
+        vm.warp(endsAt);
+        Voucher memory v = _voucher(id, 1, 1e6);
+        bytes memory sig = _voucherSig(agentKey, v);
+        vm.expectRevert(abi.encodeWithSelector(ChannelManager.ChallengeOver.selector, endsAt));
+        vm.prank(keeper);
+        manager.settleChannel(id, v, sig);
+    }
+
+    function test_nothingHappensToAClosedChannel() public {
+        vm.prank(agent);
+        manager.requestClose(id);
+        vm.warp(block.timestamp + 2 hours);
+        manager.finalizeClose(id);
+
+        vm.expectRevert(abi.encodeWithSelector(ChannelManager.WrongStatus.selector, id, uint8(3)));
+        manager.finalizeClose(id);
+        vm.expectRevert(abi.encodeWithSelector(ChannelManager.WrongStatus.selector, id, uint8(3)));
+        vm.prank(agent);
+        manager.requestClose(id);
+        vm.expectRevert(abi.encodeWithSelector(ChannelManager.WrongStatus.selector, id, uint8(3)));
+        vm.prank(agent);
+        manager.topUp(id, 1);
+        Voucher memory v = _voucher(id, 1, 1e6);
+        bytes memory sig = _voucherSig(agentKey, v);
+        vm.expectRevert(abi.encodeWithSelector(ChannelManager.WrongStatus.selector, id, uint8(3)));
+        vm.prank(keeper);
+        manager.settleChannel(id, v, sig);
+    }
+
+    function test_aChannelCanBeClaimedAfterItsExpiryUntilClosed() public {
+        vm.warp(manager.channelView(id).expiry + 1 hours);
+        _claim(1, 1e6);
+        assertEq(manager.channelView(id).claimed, 1e6);
+    }
+
+    // Cooperative close
+
+    function test_cooperativeClosePaysAndRefundsAtOnce() public {
+        _claim(1, 1e6);
+        (CooperativeClose memory c, bytes memory payerSig, bytes memory routerSig) = _coop(4e6);
+        uint256 agentBefore = usdg.balanceOf(agent);
+        vm.expectEmit(address(manager));
+        emit IChannelManager.ChannelClosed(id, 4e6, 6e6);
+        manager.cooperativeClose(id, c, payerSig, routerSig);
+        assertEq(vault.agentPool(), 4e6);
+        assertEq(usdg.balanceOf(agent) - agentBefore, 6e6);
+        assertEq(manager.channelView(id).status, 3);
+    }
+
+    function test_cooperativeCloseWorksDuringAChallenge() public {
+        vm.prank(agent);
+        manager.requestClose(id);
+        (CooperativeClose memory c, bytes memory payerSig, bytes memory routerSig) = _coop(1e6);
+        manager.cooperativeClose(id, c, payerSig, routerSig);
+        assertEq(manager.channelView(id).status, 3);
+    }
+
+    function test_cooperativeCloseNeedsBothSides() public {
+        (CooperativeClose memory c, bytes memory payerSig,) = _coop(1e6);
+        vm.expectRevert(ChannelManager.BadSignature.selector);
+        manager.cooperativeClose(id, c, payerSig, payerSig);
+
+        (,, bytes memory routerSig) = _coop(1e6);
+        vm.expectRevert(ChannelManager.BadSignature.selector);
+        manager.cooperativeClose(id, c, routerSig, routerSig);
+    }
+
+    function test_cooperativeCloseExpires() public {
+        (CooperativeClose memory c, bytes memory payerSig, bytes memory routerSig) = _coop(1e6);
+        vm.warp(c.deadline + 1);
+        vm.expectRevert(abi.encodeWithSelector(ChannelManager.DeadlinePassed.selector, c.deadline));
+        manager.cooperativeClose(id, c, payerSig, routerSig);
+    }
+
+    function test_cooperativeCloseCannotGoBelowClaimedOrAboveDeposit() public {
+        _claim(1, 2e6);
+        (CooperativeClose memory c, bytes memory payerSig, bytes memory routerSig) = _coop(1e6);
+        vm.expectRevert(abi.encodeWithSelector(ChannelManager.BadCumulative.selector, uint128(1e6), uint128(2e6), DEPOSIT));
+        manager.cooperativeClose(id, c, payerSig, routerSig);
+
+        (c, payerSig, routerSig) = _coop(uint128(DEPOSIT) + 1);
+        vm.expectRevert(abi.encodeWithSelector(ChannelManager.BadCumulative.selector, uint128(DEPOSIT) + 1, uint128(2e6), DEPOSIT));
+        manager.cooperativeClose(id, c, payerSig, routerSig);
+    }
+
+    function test_aReplayedCooperativeCloseCannotRefundTwice() public {
+        (CooperativeClose memory c, bytes memory payerSig, bytes memory routerSig) = _coop(1e6);
+        manager.cooperativeClose(id, c, payerSig, routerSig);
+        uint256 agentAfter = usdg.balanceOf(agent);
+        vm.expectRevert(abi.encodeWithSelector(ChannelManager.WrongStatus.selector, id, uint8(3)));
+        manager.cooperativeClose(id, c, payerSig, routerSig);
+        assertEq(usdg.balanceOf(agent), agentAfter);
+    }
+
+    function test_cooperativeCloseChecksTheChannel() public {
+        (CooperativeClose memory c, bytes memory payerSig, bytes memory routerSig) = _coop(1e6);
+        bytes32 other = _openChannel(1, keccak256("other"));
+        vm.expectRevert(abi.encodeWithSelector(ChannelManager.WrongChannel.selector, id));
+        manager.cooperativeClose(other, c, payerSig, routerSig);
+    }
+}
