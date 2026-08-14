@@ -126,3 +126,142 @@ struct PanelDecision {
     bytes32 refundRoot;
     bytes32 reasonHash;
 }
+
+struct WindowPerformance {
+    uint256 windowId;
+    uint32 measuredSeconds;
+    uint32 belowMinSeconds;
+    bytes32 evidenceRoot;
+}
+
+struct UptoWitness {
+    bytes32 reqId;
+    address payee;
+    uint256 maxAmount;
+    uint64 validBefore;
+    bytes32 resourceHash;
+}
+
+struct ExactWitness {
+    bytes32 reqId;
+    address payee;
+    uint256 amount;
+    uint64 validBefore;
+    bytes32 resourceHash;
+}
+
+struct ChannelOpenWitness {
+    bytes32 channelSalt;
+    address payee;
+    uint64 expiry;
+}
+
+struct AuthorizeCall {
+    ISignatureTransfer.PermitTransferFrom p;
+    bytes sig;
+    address payer;
+    UptoWitness w;
+}
+
+struct EscrowView {
+    address payer;
+    uint128 max;
+    uint128 captured;
+    uint64 validBefore;
+    uint8 status;
+}
+
+struct BuyerView {
+    uint256 balance;
+    uint256 reserve;
+    uint128 hourlyCap;
+    uint128 dailyCap;
+    uint128 pendingHourlyCap;
+    uint128 pendingDailyCap;
+    uint64 capsEffectiveAfterHour;
+    uint64 withdrawRequestedAt;
+    uint64 withdrawDueAt;
+    uint64 lastSettledHour;
+    bool usagePaused;
+}
+
+struct RegisterParams {
+    bytes32[] modelDigests;
+    uint32[] maxTps;
+    bytes32 imageDigest;
+    bytes32 gpuClass;
+    bytes32 endpointHash;
+    bytes32 attestationRef;
+    uint256 bondUsdg;
+    uint256 bondOfpk;
+}
+
+struct HostView {
+    address operator;
+    uint8 status;
+    uint256 bondUsdg;
+    uint256 bondOfpk;
+    uint256 requiredBond;
+    bytes32 imageDigest;
+    bytes32 gpuClass;
+    bytes32 attestationRef;
+    uint64 probationEnds;
+    uint8 strikes;
+    uint32 openChallenges;
+    uint256 releasableCredits;
+    uint256 pendingCredits;
+}
+
+struct ChannelView {
+    address payer;
+    uint256 deposit;
+    uint128 claimed;
+    uint64 lastSeq;
+    uint64 expiry;
+    uint64 challengeEndsAt;
+    uint8 status;
+}
+
+struct WindowParams {
+    bytes32 modelDigest;
+    uint64 t0;
+    uint64 t1;
+    uint32 minTps;
+    uint64 units;
+    uint64 startPricePerUnit;
+    uint64 endPricePerUnit;
+    uint64 auctionStart;
+    uint64 auctionEnd;
+}
+
+struct WindowView {
+    uint256 id;
+    address host;
+    bytes32 modelDigest;
+    uint64 t0;
+    uint64 t1;
+    uint32 minTps;
+    uint64 units;
+    uint256 hostPricePerUnit;
+    uint256 buyerPricePerUnit;
+    bool failed;
+}
+
+struct HolderView {
+    uint256 balance;
+    uint64 lockedPartial;
+    uint64 drawnTokens;
+    uint64 costBasis;
+}
+
+struct Evidence {
+    address host;
+    uint8 kind;
+    bytes32 modelDigest;
+    bytes32 samplesRoot;
+    uint32 sampleCount;
+    bytes32 testId;
+    int256 statistic;
+    int256 threshold;
+    string uri;
+}
