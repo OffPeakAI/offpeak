@@ -304,3 +304,335 @@ contract OffpeakVaultTest is VaultFixture {
         assertEq(_balance(buyer), 0);
         assertEq(vault.buyerState(buyer).withdrawRequestedAt, 0);
     }
+
+    function test_executeAsSoonAsTheRequestHourSettles() public {
+        _fundWithCaps(buyer, 50e6, CAP);
+        uint64 hour = uint64(block.timestamp / 3600);
+        vm.prank(buyer);
+        vault.requestWithdrawAll();
+        _settleEmptyThrough(hour);
+        assertLt(block.timestamp, START + 7200);
+        vault.executeWithdrawAll(buyer);
+        assertEq(usdg.balanceOf(buyer), 50e6);
+    }
+
+    // Section 4.1 required scenarios
+
+    function test_requestHourRule() public {
+        uint64 hour = uint64(block.timestamp / 3600);
+        _fundWithCaps(buyer, 50e6, CAP);
+        _settleEmptyThrough(hour - 1);
+        uint256 requestAt = uint256(hour) * 3600 + 3540;
+        vm.warp(requestAt);
+        vm.prank(buyer);
+        vault.requestWithdrawAll();
+
+        (SettleBatch memory late, RootTotals memory lateTotals) =
+            _batch(hour, _oneDebit(buyer, CAP, uint64(requestAt + 1)), CAP - 1);
+        _warpPast(hour);
+        bytes memory lateSig = _signBatch(late);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                OffpeakVault.DebitAfterRequest.selector, buyer, uint64(requestAt + 1), uint64(requestAt)
+            )
+        );
+        vault.settle(late, lateTotals, lateSig);
+
+        (SettleBatch memory b, RootTotals memory t) = _batch(hour, _oneDebit(buyer, CAP, uint64(requestAt)), CAP - 1);
+        _settle(b, t);
+        assertEq(_balance(buyer), 50e6 - CAP);
+
+        (SettleBatch memory next, RootTotals memory nextTotals) =
+            _batch(hour + 1, _oneDebit(buyer, 1, uint64((uint256(hour) + 1) * 3600)), 0);
+        _warpPast(hour + 1);
+        bytes memory nextSig = _signBatch(next);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                OffpeakVault.DebitAfterRequest.selector, buyer, uint64((uint256(hour) + 1) * 3600), uint64(requestAt)
+            )
+        );
+        vault.settle(next, nextTotals, nextSig);
+
+        vault.executeWithdrawAll(buyer);
+        assertEq(usdg.balanceOf(buyer), 50e6 - CAP);
+    }
+
+    function test_lateSettlementClampsAndFeesThenReserveCover() public {
+        uint64 hour = uint64(block.timestamp / 3600);
+        _fundWithCaps(buyer, 50e6, CAP);
+        _settleEmptyThrough(hour - 1);
+        _fundReserve(CAP);
+        vm.prank(buyer);
+        vault.requestWithdrawAll();
+        uint256 requestedAt = block.timestamp;
+
+        vm.prank(guardian);
+        vault.setSettlesPaused(true);
+        vm.warp(requestedAt + 7200);
+        vault.executeWithdrawAll(buyer);
+        assertEq(usdg.balanceOf(buyer), 50e6);
+        vm.prank(guardian);
+        vault.setSettlesPaused(false);
+
+        uint128 credit = CAP - 1e6;
+        (SettleBatch memory b, RootTotals memory t) = _batch(hour, _oneDebit(buyer, CAP, uint64(requestedAt)), credit);
+        vm.expectEmit(address(vault));
+        emit IOffpeakVault.DebitClamped(hour, buyer, CAP, 0);
+        _settle(b, t);
+
+        assertEq(usdg.balanceOf(address(registry)), credit);
+        assertEq(usdg.balanceOf(address(splitter)), 0, "fees go first");
+        assertEq(vault.protocolReserve(), CAP - credit, "the reserve covers the rest");
+        assertEq(usdg.balanceOf(address(vault)), vault.protocolReserve(), "vault conservation");
+    }
+
+    function test_capDecreaseThenWithdrawCannotLeaveUnpaidUsage() public {
+        uint64 hour = uint64(block.timestamp / 3600);
+        _fundWithCaps(buyer, 50e6, CAP);
+        _settleEmptyThrough(hour - 1);
+
+        vm.startPrank(buyer);
+        vault.setCaps(1e6, 0);
+        vm.expectRevert(abi.encodeWithSelector(OffpeakVault.WithdrawExceedsAvailable.selector, 49e6, 40e6));
+        vault.withdraw(49e6);
+        vault.withdraw(40e6);
+        vm.stopPrank();
+        assertEq(_balance(buyer), CAP, "the reserve still holds the old cap");
+
+        (SettleBatch memory b, RootTotals memory t) = _batch(hour, _oneDebit(buyer, CAP, uint64(block.timestamp)), CAP);
+        vm.recordLogs();
+        _settle(b, t);
+        assertEq(_balance(buyer), 0);
+        assertEq(usdg.balanceOf(address(registry)), CAP, "served usage at the old cap settles in full");
+        assertEq(vault.buyerState(buyer).hourlyCap, 1e6);
+    }
+
+    // settle: authorisation and batch shape
+
+    function test_settleRejectsWhilePaused() public {
+        vm.prank(guardian);
+        vault.setSettlesPaused(true);
+        (SettleBatch memory b, RootTotals memory t) = _emptyBatch(_nextHour());
+        _warpPast(b.hour);
+        bytes memory sig = _signBatch(b);
+        vm.expectRevert(OffpeakVault.SettlesPaused.selector);
+        vault.settle(b, t, sig);
+    }
+
+    function test_settleRejectsAnotherChainOrVault() public {
+        (SettleBatch memory b, RootTotals memory t) = _emptyBatch(_nextHour());
+        _warpPast(b.hour);
+        b.chainId = 1;
+        bytes memory sig = _signBatch(b);
+        vm.expectRevert(OffpeakVault.WrongBatchTarget.selector);
+        vault.settle(b, t, sig);
+
+        b.chainId = CHAIN_ID;
+        b.vault = address(1);
+        sig = _signBatch(b);
+        vm.expectRevert(OffpeakVault.WrongBatchTarget.selector);
+        vault.settle(b, t, sig);
+    }
+
+    function test_settleIsStrictlySequential() public {
+        uint64 next = _nextHour();
+        (SettleBatch memory skip, RootTotals memory t) = _emptyBatch(next + 1);
+        _warpPast(next + 1);
+        bytes memory sig = _signBatch(skip);
+        vm.expectRevert(abi.encodeWithSelector(OffpeakVault.WrongHour.selector, next + 1, next));
+        vault.settle(skip, t, sig);
+
+        (SettleBatch memory b, RootTotals memory totals) = _emptyBatch(next);
+        _settle(b, totals);
+        sig = _signBatch(b);
+        vm.expectRevert(abi.encodeWithSelector(OffpeakVault.WrongHour.selector, next, next + 1));
+        vault.settle(b, totals, sig);
+    }
+
+    function test_settleWaitsForTheCloseGrace() public {
+        uint64 next = _nextHour();
+        uint256 readyAt = (uint256(next) + 1) * 3600 + 600;
+        (SettleBatch memory b, RootTotals memory t) = _emptyBatch(next);
+        bytes memory sig = _signBatch(b);
+        vm.warp(readyAt - 1);
+        vm.expectRevert(abi.encodeWithSelector(OffpeakVault.HourNotReady.selector, next, readyAt));
+        vault.settle(b, t, sig);
+        vm.warp(readyAt);
+        vault.settle(b, t, sig);
+        assertEq(vault.lastSettledHour(), next);
+    }
+
+    function test_settleRejectsBadSignatures() public {
+        (SettleBatch memory b, RootTotals memory t) = _emptyBatch(_nextHour());
+        _warpPast(b.hour);
+        bytes32 digest = _settlementDigest(Typehashes.hash(b));
+
+        vm.expectRevert(ThresholdSig.BadThresholdSig.selector);
+        vault.settle(b, t, _sig(settlerKeys[0], digest));
+
+        (, uint256 outsider) = makeAddrAndKey("outsider");
+        bytes memory two = bytes.concat(_sig(settlerKeys[0], digest), _sig(outsider, digest));
+        vm.expectRevert(ThresholdSig.BadThresholdSig.selector);
+        vault.settle(b, t, two);
+
+        bytes memory sig = _signBatch(b);
+        b.fees = 1;
+        vm.expectRevert(ThresholdSig.BadThresholdSig.selector);
+        vault.settle(b, t, sig);
+    }
+
+    function test_settleRejectsTotalsThatDoNotHashToTheBatch() public {
+        (SettleBatch memory b, RootTotals memory t) = _emptyBatch(_nextHour());
+        _warpPast(b.hour);
+        bytes memory sig = _signBatch(b);
+        bytes32 expected = b.totalsHash;
+        t.tokensIn = 1;
+        vm.expectRevert(abi.encodeWithSelector(OffpeakVault.TotalsHashMismatch.selector, expected, Typehashes.hash(t)));
+        vault.settle(b, t, sig);
+    }
+
+    function test_settleEnforcesBatchLimits() public {
+        (SettleBatch memory b, RootTotals memory t) = _emptyBatch(_nextHour());
+        _warpPast(b.hour);
+        b.debits = new Debit[](2001);
+        bytes memory sig = _signBatch(b);
+        vm.expectRevert(abi.encodeWithSelector(OffpeakVault.BatchTooLarge.selector, 2001, 2000));
+        vault.settle(b, t, sig);
+    }
+
+    function test_settleChecksDebitsAgainstTotals() public {
+        uint64 next = _nextHour();
+        _fundWithCaps(buyer, 50e6, CAP);
+        (SettleBatch memory b, RootTotals memory t) = _batch(next, _oneDebit(buyer, 1e6, _inHour(next)), 1e6);
+        t.prepaidDebit = 2e6;
+        t.hostCredit = 2e6;
+        b.credits[0].amount = 2e6;
+        _seal(b, t);
+        _warpPast(next);
+        bytes memory sig = _signBatch(b);
+        vm.expectRevert(abi.encodeWithSelector(OffpeakVault.DebitTotalMismatch.selector, 1e6, uint128(2e6)));
+        vault.settle(b, t, sig);
+    }
+
+    function test_settleRequiresSortedUniqueDebits() public {
+        uint64 next = _nextHour();
+        _fundWithCaps(buyer, 50e6, CAP);
+        _fundWithCaps(other, 50e6, CAP);
+        Debit[] memory debits = new Debit[](2);
+        debits[0] = Debit({buyer: other, amount: 1e6, lastTs: _inHour(next)});
+        debits[1] = Debit({buyer: buyer, amount: 1e6, lastTs: _inHour(next)});
+        (SettleBatch memory b, RootTotals memory t) = _batch(next, debits, 2e6);
+        _warpPast(next);
+        bytes memory sig = _signBatch(b);
+        vm.expectRevert(OffpeakVault.NotSorted.selector);
+        vault.settle(b, t, sig);
+
+        debits[0] = Debit({buyer: buyer, amount: 1e6, lastTs: _inHour(next)});
+        (b, t) = _batch(next, debits, 2e6);
+        sig = _signBatch(b);
+        vm.expectRevert(OffpeakVault.NotSorted.selector);
+        vault.settle(b, t, sig);
+    }
+
+    function test_settleRequiresSortedUniqueCredits() public {
+        uint64 next = _nextHour();
+        _fundWithCaps(buyer, 50e6, CAP);
+        (SettleBatch memory b, RootTotals memory t) = _batch(next, _oneDebit(buyer, 2e6, _inHour(next)), 2e6);
+        b.credits = new Credit[](2);
+        b.credits[0] = Credit({host: hostB, amount: 1e6});
+        b.credits[1] = Credit({host: hostA, amount: 1e6});
+        _warpPast(next);
+        bytes memory sig = _signBatch(b);
+        vm.expectRevert(OffpeakVault.NotSorted.selector);
+        vault.settle(b, t, sig);
+    }
+
+    function test_settleRejectsZeroDebits() public {
+        uint64 next = _nextHour();
+        (SettleBatch memory b, RootTotals memory t) = _batch(next, _oneDebit(buyer, 0, _inHour(next)), 0);
+        _warpPast(next);
+        bytes memory sig = _signBatch(b);
+        vm.expectRevert(abi.encodeWithSelector(OffpeakVault.ZeroDebit.selector, buyer));
+        vault.settle(b, t, sig);
+    }
+
+    function test_settleRejectsDebitsFromAnotherHour() public {
+        uint64 next = _nextHour();
+        _fundWithCaps(buyer, 50e6, CAP);
+        uint64 wrong = _inHour(next + 1);
+        (SettleBatch memory b, RootTotals memory t) = _batch(next, _oneDebit(buyer, 1e6, wrong), 1e6);
+        _warpPast(next);
+        bytes memory sig = _signBatch(b);
+        vm.expectRevert(abi.encodeWithSelector(OffpeakVault.DebitOutsideHour.selector, buyer, wrong, next));
+        vault.settle(b, t, sig);
+    }
+
+    function test_settleEnforcesTheHourlyCap() public {
+        uint64 next = _nextHour();
+        _fundWithCaps(buyer, 50e6, CAP);
+        (SettleBatch memory b, RootTotals memory t) = _batch(next, _oneDebit(buyer, CAP + 1, _inHour(next)), CAP + 1);
+        _warpPast(next);
+        bytes memory sig = _signBatch(b);
+        vm.expectRevert(abi.encodeWithSelector(OffpeakVault.CapExceeded.selector, buyer, next, CAP + 1, CAP));
+        vault.settle(b, t, sig);
+    }
+
+    function test_settleEnforcesTheDailyCapAndRollsItOver() public {
+        uint64 dayStart = (_nextHour() / 24 + 1) * 24;
+        _settleEmptyThrough(dayStart - 1);
+        _fund(buyer, 100e6);
+        vm.prank(buyer);
+        vault.setCaps(CAP, CAP + 1e6);
+
+        (SettleBatch memory b, RootTotals memory t) = _batch(dayStart, _oneDebit(buyer, CAP, _inHour(dayStart)), CAP);
+        _settle(b, t);
+
+        uint64 second = dayStart + 1;
+        (b, t) = _batch(second, _oneDebit(buyer, 2e6, _inHour(second)), 2e6);
+        _warpPast(second);
+        bytes memory sig = _signBatch(b);
+        vm.expectRevert(
+            abi.encodeWithSelector(OffpeakVault.DailyCapExceeded.selector, buyer, dayStart / 24, CAP + 2e6, CAP + 1e6)
+        );
+        vault.settle(b, t, sig);
+
+        _settleEmptyThrough(dayStart + 23);
+        uint64 nextDay = dayStart + 24;
+        (b, t) = _batch(nextDay, _oneDebit(buyer, CAP, _inHour(nextDay)), CAP);
+        _settle(b, t);
+        assertEq(_balance(buyer), 100e6 - 2 * CAP);
+    }
+
+    function test_settleEnforcesConservation() public {
+        uint64 next = _nextHour();
+        _fundWithCaps(buyer, 50e6, CAP);
+        (SettleBatch memory b, RootTotals memory t) = _batch(next, _oneDebit(buyer, 1e6, _inHour(next)), 1e6);
+        b.fees = 1;
+        _warpPast(next);
+        bytes memory sig = _signBatch(b);
+        vm.expectRevert(abi.encodeWithSelector(OffpeakVault.ConservationBroken.selector, 1e6, 1e6 + 1));
+        vault.settle(b, t, sig);
+    }
+
+    function test_settleCannotOverdrawTheAgentPool() public {
+        (SettleBatch memory b, RootTotals memory t) = _emptyBatch(_nextHour());
+        _fundAgentPool(1e6 - 1);
+        b.agentPoolDraw = 1e6;
+        b.fees = 1e6;
+        _warpPast(b.hour);
+        bytes memory sig = _signBatch(b);
+        vm.expectRevert(abi.encodeWithSelector(OffpeakVault.InsufficientAgentPool.selector, 1e6 - 1, uint128(1e6)));
+        vault.settle(b, t, sig);
+    }
+
+    function test_settleCannotOverdrawTheReserve() public {
+        (SettleBatch memory b, RootTotals memory t) = _emptyBatch(_nextHour());
+        b.reserveDraw = 1e6;
+        b.fees = 1e6;
+        _warpPast(b.hour);
+        bytes memory sig = _signBatch(b);
+        vm.expectRevert(abi.encodeWithSelector(OffpeakVault.InsufficientProtocolReserve.selector, 0, uint256(1e6)));
+        vault.settle(b, t, sig);
+    }
+
+    // settle: effects

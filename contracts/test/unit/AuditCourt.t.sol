@@ -210,3 +210,264 @@ contract AuditCourtTest is CourtFixture {
         assertEq(registry.hostView(host).openChallenges, 0);
         assertEq(registry.hostView(host).bondUsdg, BOND);
     }
+
+    function test_breachSlashesTwentyPercentAtOnceAndReturnsTheBond() public {
+        uint256 id = _responded(CANARY);
+        vm.expectEmit(address(auditCourt));
+        emit IAuditCourt.ChallengeFinalized(id, 2_000, 400e6, 0);
+        _rule(id, BREACH, 2_000, keccak256("root"));
+
+        HostView memory v = registry.hostView(host);
+        assertEq(v.bondUsdg, BOND - 400e6);
+        assertEq(v.strikes, 1);
+        assertEq(v.status, ACTIVE);
+        assertEq(v.openChallenges, 0);
+        assertEq(usdg.balanceOf(challenger), CHALLENGE_BOND);
+        assertEq(auditCourt.challengeView(id).refundable, 400e6);
+        assertEq(auditCourt.challengeView(id).refundRoot, keccak256("root"));
+    }
+
+    function test_theSecondStrikeDelists() public {
+        _rule(_responded(CANARY), BREACH, 2_000, NO_ROOT);
+        _rule(_responded(CANARY), BREACH, 2_000, NO_ROOT);
+        assertEq(registry.hostView(host).status, DELISTED);
+        assertEq(registry.hostView(host).strikes, 2);
+    }
+
+    // Swap and panel review
+
+    function test_aSwapRulingSlashesNothingAndFreezesTheHost() public {
+        _accrue(host, 8e6);
+        uint256 id = _responded(SWAP);
+        vm.expectEmit(address(auditCourt));
+        emit IAuditCourt.PanelReviewOpened(id, uint64(block.timestamp + 7 days));
+        _rule(id, OUTCOME_SWAP, 10_000, NO_ROOT);
+
+        HostView memory v = registry.hostView(host);
+        assertEq(v.bondUsdg, BOND, "no slash before the panel");
+        assertEq(v.status, FROZEN);
+        assertEq(v.pendingCredits, 0);
+        assertFalse(registry.routable(host));
+        assertEq(auditCourt.challengeView(id).seized, 8e6);
+        assertEq(usdg.balanceOf(address(auditCourt)), CHALLENGE_BOND + 8e6, "credits wait in the court");
+    }
+
+    function test_rulingKeysAloneCanNeverFullySlash() public {
+        uint256 id = _inReview();
+        vm.warp(block.timestamp + 365 days);
+        Ruling memory r = _ruling(id, OUTCOME_SWAP, 10_000, NO_ROOT);
+        bytes memory sig = _rulingSig(r);
+        vm.expectRevert(abi.encodeWithSelector(AuditCourt.WrongState.selector, id, AuditCourt.State.PanelReview));
+        auditCourt.postRuling(r, sig);
+
+        auditCourt.finalize(id);
+        assertEq(registry.hostView(host).bondUsdg, BOND, "a timeout dismisses, it never slashes");
+    }
+
+    function test_appealIsHostOnlyAndInsideTheReview() public {
+        uint256 id = _inReview();
+        vm.expectRevert(abi.encodeWithSelector(AuditCourt.NotHost.selector, address(this)));
+        auditCourt.appeal(id, keccak256("appeal"));
+
+        vm.expectEmit(address(auditCourt));
+        emit IAuditCourt.AppealFiled(id, keccak256("appeal"));
+        vm.prank(host);
+        auditCourt.appeal(id, keccak256("appeal"));
+
+        uint64 endsAt = auditCourt.challengeView(id).reviewEndsAt;
+        vm.warp(endsAt);
+        vm.expectRevert(abi.encodeWithSelector(AuditCourt.ReviewOver.selector, endsAt));
+        vm.prank(host);
+        auditCourt.appeal(id, keccak256("appeal"));
+    }
+
+    function test_appealOutsideAReviewReverts() public {
+        uint256 id = _responded(CANARY);
+        vm.expectRevert(abi.encodeWithSelector(AuditCourt.WrongState.selector, id, AuditCourt.State.Filed));
+        vm.prank(host);
+        auditCourt.appeal(id, keccak256("appeal"));
+    }
+
+    function test_aSlashCannotLandBeforeTheAppealWindowCloses() public {
+        uint256 id = _inReview();
+        uint64 endsAt = auditCourt.challengeView(id).reviewEndsAt;
+        PanelDecision memory d = _decision(id, CONFIRM, 10_000, NO_ROOT);
+        panel.approve(_auditDigest(Typehashes.hash(d)));
+        vm.expectRevert(abi.encodeWithSelector(AuditCourt.ReviewNotOver.selector, endsAt));
+        auditCourt.postPanelDecision(d, "");
+
+        PanelDecision memory down = _decision(id, DOWNGRADE, 2_000, NO_ROOT);
+        panel.approve(_auditDigest(Typehashes.hash(down)));
+        vm.expectRevert(abi.encodeWithSelector(AuditCourt.ReviewNotOver.selector, endsAt));
+        auditCourt.postPanelDecision(down, "");
+
+        vm.warp(endsAt);
+        auditCourt.postPanelDecision(d, "");
+    }
+
+    function test_thePanelCanDismissAtAnyTime() public {
+        uint256 id = _inReview();
+        _decide(id, PANEL_DISMISS, 0, NO_ROOT);
+        auditCourt.finalize(id);
+        assertEq(registry.hostView(host).status, ACTIVE);
+    }
+
+    function test_decisionsNeedThePanel() public {
+        uint256 id = _inReview();
+        _reviewDone(id);
+        PanelDecision memory d = _decision(id, CONFIRM, 10_000, NO_ROOT);
+        vm.expectRevert(AuditCourt.BadPanelSignature.selector);
+        auditCourt.postPanelDecision(d, "");
+    }
+
+    function test_rulingKeysCannotActAsThePanel() public {
+        vm.prank(owner);
+        auditCourt.proposeSigners(rulers, address(panel));
+        vm.warp(block.timestamp + 8 days);
+        auditCourt.applySigners();
+        uint256 id = _inReview();
+        _reviewDone(id);
+        PanelDecision memory d = _decision(id, CONFIRM, 10_000, NO_ROOT);
+        bytes32 digest = _auditDigest(Typehashes.hash(d));
+        bytes memory sig = bytes.concat(_sig(rulerKeys[0], digest), _sig(rulerKeys[1], digest));
+        vm.expectRevert(AuditCourt.BadPanelSignature.selector);
+        auditCourt.postPanelDecision(d, sig);
+    }
+
+    function test_eachDecisionHasOneSlashSize() public {
+        uint256 id = _inReview();
+        _reviewDone(id);
+        uint8[3] memory decisions = [CONFIRM, DOWNGRADE, PANEL_DISMISS];
+        uint16[3] memory wrong = [uint16(2_000), uint16(10_000), uint16(1)];
+        for (uint256 i; i < 3; ++i) {
+            PanelDecision memory d = _decision(id, decisions[i], wrong[i], NO_ROOT);
+            panel.approve(_auditDigest(Typehashes.hash(d)));
+            vm.expectRevert(abi.encodeWithSelector(AuditCourt.BadSlash.selector, decisions[i], wrong[i]));
+            auditCourt.postPanelDecision(d, "");
+        }
+    }
+
+    function test_unknownDecisionsRevert() public {
+        uint256 id = _inReview();
+        PanelDecision memory d = _decision(id, 3, 0, NO_ROOT);
+        panel.approve(_auditDigest(Typehashes.hash(d)));
+        vm.expectRevert(abi.encodeWithSelector(AuditCourt.UnknownOutcome.selector, uint8(3)));
+        auditCourt.postPanelDecision(d, "");
+    }
+
+    function test_decisionsNeedAnOpenReview() public {
+        uint256 id = _responded(CANARY);
+        vm.expectRevert(abi.encodeWithSelector(AuditCourt.WrongState.selector, id, AuditCourt.State.Filed));
+        auditCourt.postPanelDecision(_decision(id, CONFIRM, 10_000, NO_ROOT), "");
+    }
+
+    // Outcomes of a review
+
+    function test_confirmSlashesEverythingDelistsAndFundsTheReserve() public {
+        _accrue(host, 8e6);
+        uint256 id = _inReview();
+        _reviewDone(id);
+        _decide(id, CONFIRM, 10_000, keccak256("root"));
+        assertEq(registry.hostView(host).bondUsdg, BOND, "the slash waits for finalize");
+
+        vm.expectEmit(address(auditCourt));
+        emit IAuditCourt.ChallengeFinalized(id, 10_000, BOND, 0);
+        auditCourt.finalize(id);
+
+        HostView memory v = registry.hostView(host);
+        assertEq(v.bondUsdg, 0);
+        assertEq(v.status, DELISTED);
+        assertEq(v.openChallenges, 0);
+        assertEq(vault.protocolReserve(), 8e6, "seized credits fund refunds");
+        assertEq(usdg.balanceOf(challenger), CHALLENGE_BOND);
+        assertEq(auditCourt.challengeView(id).refundable, BOND);
+        assertEq(usdg.balanceOf(address(auditCourt)), BOND);
+    }
+
+    function test_downgradeSlashesTwentyPercentAndGivesCreditsBack() public {
+        _accrue(host, 8e6);
+        uint256 id = _inReview();
+        _reviewDone(id);
+        _decide(id, DOWNGRADE, 2_000, NO_ROOT);
+        auditCourt.finalize(id);
+
+        HostView memory v = registry.hostView(host);
+        assertEq(v.bondUsdg, BOND - 400e6);
+        assertEq(v.status, ACTIVE);
+        assertEq(v.strikes, 1);
+        assertEq(v.pendingCredits, 8e6);
+        vm.warp(block.timestamp + 24 hours);
+        vm.prank(host);
+        registry.withdrawCredits();
+        assertEq(usdg.balanceOf(host), 8e6);
+    }
+
+    function test_aDowngradeOnASecondStrikeDelists() public {
+        _rule(_responded(CANARY), BREACH, 2_000, NO_ROOT);
+        uint256 id = _inReview();
+        _reviewDone(id);
+        _decide(id, DOWNGRADE, 2_000, NO_ROOT);
+        auditCourt.finalize(id);
+        assertEq(registry.hostView(host).status, DELISTED);
+    }
+
+    function test_panelDismissalReturnsTheFullBondAndTheCredits() public {
+        _accrue(host, 8e6);
+        uint256 id = _inReview();
+        _decide(id, PANEL_DISMISS, 0, NO_ROOT);
+        auditCourt.finalize(id);
+
+        HostView memory v = registry.hostView(host);
+        assertEq(v.bondUsdg, BOND);
+        assertEq(v.status, ACTIVE);
+        assertEq(v.strikes, 0);
+        assertEq(v.pendingCredits, 8e6);
+        assertEq(usdg.balanceOf(challenger), CHALLENGE_BOND, "the ruling keys agreed, so the bond is whole");
+        assertEq(usdg.balanceOf(address(auditCourt)), 0);
+    }
+
+    function test_restoredCreditsDoNotRaiseTheRequiredBond() public {
+        _accrue(host, 11_000e6);
+        uint256 required = registry.requiredBond(host);
+        uint256 id = _inReview();
+        _decide(id, PANEL_DISMISS, 0, NO_ROOT);
+        auditCourt.finalize(id);
+        assertEq(registry.requiredBond(host), required);
+    }
+
+    function test_finalizeNeedsADecisionOrATimeout() public {
+        uint256 id = _inReview();
+        vm.expectRevert(abi.encodeWithSelector(AuditCourt.NotFinalizable.selector, id));
+        auditCourt.finalize(id);
+    }
+
+    function test_aFinalizedChallengeCannotRunTwice() public {
+        uint256 id = _inReview();
+        _decide(id, PANEL_DISMISS, 0, NO_ROOT);
+        auditCourt.finalize(id);
+        vm.expectRevert(abi.encodeWithSelector(AuditCourt.NotFinalizable.selector, id));
+        auditCourt.finalize(id);
+    }
+
+    // Timeouts
+
+    function test_noPanelDecisionInFourteenDaysDismisses() public {
+        _accrue(host, 8e6);
+        uint256 id = _inReview();
+        uint256 timeoutAt = auditCourt.challengeView(id).filedAt + 14 days;
+        vm.warp(timeoutAt - 1);
+        vm.expectRevert(abi.encodeWithSelector(AuditCourt.NotFinalizable.selector, id));
+        auditCourt.finalize(id);
+
+        vm.warp(timeoutAt);
+        vm.expectEmit(address(auditCourt));
+        emit IAuditCourt.PanelTimeout(id);
+        vm.prank(makeAddr("anyone"));
+        auditCourt.finalize(id);
+
+        HostView memory v = registry.hostView(host);
+        assertEq(v.status, ACTIVE);
+        assertEq(v.bondUsdg, BOND);
+        assertEq(v.pendingCredits, 8e6);
+        assertEq(usdg.balanceOf(challenger), CHALLENGE_BOND);
+    }

@@ -299,3 +299,273 @@ contract WindowMarketTest is WindowFixture {
         windows.safeTransferFrom(bob, alice, id, 1, "");
         assertApproxEqAbs(windows.holdingState(id, alice).hostBasis, cheap, 2);
     }
+
+    function test_batchTransfersAreOff() public {
+        _buy(alice, id, 3);
+        uint256[] memory ids = new uint256[](2);
+        ids[0] = id;
+        ids[1] = id;
+        uint256[] memory values = new uint256[](2);
+        values[0] = 2;
+        values[1] = 1;
+        vm.prank(alice);
+        vm.expectRevert(WindowMarket.BatchTransfersOff.selector);
+        windows.safeBatchTransferFrom(alice, bob, ids, values, "");
+    }
+
+    function test_unitsCannotLeaveWhileUsedTokensAreUnsettled() public {
+        _buy(alice, id, 2);
+        vm.warp(t0);
+        vm.startPrank(alice);
+        vm.expectRevert(abi.encodeWithSelector(WindowMarket.UnitsLocked.selector, id));
+        windows.safeTransferFrom(alice, bob, id, 1, "");
+        vm.expectRevert(abi.encodeWithSelector(WindowMarket.UnitsLocked.selector, id));
+        windows.list(id, 1, 1);
+        vm.stopPrank();
+    }
+
+    function test_unitsListedBeforeTheStartCanStillSell() public {
+        _buy(alice, id, 1);
+        vm.prank(alice);
+        uint256 listingId = windows.list(id, 1, 1_000_000);
+        vm.warp(t0 + 1);
+        vm.prank(bob);
+        windows.buyListing(listingId, 1, 1_000_000);
+        assertEq(windows.balanceOf(bob, id), 1);
+    }
+
+    function test_aListingPriceMustFit() public {
+        _buy(alice, id, 1);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(WindowMarket.PriceAboveMax.selector, uint256(type(uint64).max) + 1, type(uint64).max));
+        windows.list(id, 1, uint256(type(uint64).max) + 1);
+    }
+
+    function test_theMarketRefusesStrayTransfers() public {
+        _buy(alice, id, 1);
+        vm.prank(alice);
+        vm.expectRevert();
+        windows.safeTransferFrom(alice, address(windows), id, 1, "");
+    }
+
+    // Resale
+
+    function test_resaleFeeIsOnePercentPlusTenPercentOfMarkup() public {
+        _buy(alice, id, 2);
+        vm.prank(alice);
+        uint256 listingId = windows.list(id, 2, 2_000_000);
+        uint256 sale = 2 * 2_000_000;
+        uint256 markup = 2 * (2_000_000 - (START_PRICE + FEE));
+        uint256 fee = sale / 100 + markup / 10;
+        uint256 sellerBefore = usdg.balanceOf(alice);
+        uint256 splitterBefore = usdg.balanceOf(address(splitter));
+        vm.expectEmit(address(windows));
+        emit IWindowMarket.ListingFilled(listingId, bob, 2, fee);
+        vm.prank(bob);
+        windows.buyListing(listingId, 2, 2_000_000);
+        assertEq(usdg.balanceOf(alice) - sellerBefore, sale - fee);
+        assertEq(usdg.balanceOf(address(splitter)) - splitterBefore, fee);
+        assertEq(windows.balanceOf(bob, id), 2);
+        assertEq(windows.holderView(id, bob).costBasis, 2_000_000);
+        assertEq(windows.holdingState(id, bob).hostBasis, START_PRICE);
+    }
+
+    function test_noMarkupMeansOnlyTheOnePercent() public {
+        _buy(alice, id, 1);
+        vm.prank(alice);
+        uint256 listingId = windows.list(id, 1, 500_000);
+        vm.expectEmit(address(windows));
+        emit IWindowMarket.ListingFilled(listingId, bob, 1, 5_000);
+        vm.prank(bob);
+        windows.buyListing(listingId, 1, 500_000);
+    }
+
+    function test_partialFillsLeaveTheRest() public {
+        _buy(alice, id, 3);
+        vm.prank(alice);
+        uint256 listingId = windows.list(id, 3, 1_000_000);
+        vm.prank(bob);
+        windows.buyListing(listingId, 1, 1_000_000);
+        vm.prank(alice);
+        windows.delist(listingId);
+        assertEq(windows.balanceOf(alice, id), 2);
+        assertEq(windows.balanceOf(bob, id), 1);
+    }
+
+    function test_listingHoldsTheUnitsInTheMarket() public {
+        _buy(alice, id, 2);
+        vm.prank(alice);
+        windows.list(id, 2, 1_000_000);
+        assertEq(windows.balanceOf(alice, id), 0);
+        assertEq(windows.balanceOf(address(windows), id), 2);
+    }
+
+    function test_aUnitInUseCannotBeListed() public {
+        _buy(alice, id, 1);
+        vm.warp(t0);
+        _draw(id, alice, 1);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(WindowMarket.UnitsLocked.selector, id));
+        windows.list(id, 1, 1);
+    }
+
+    function test_cannotListAfterTheEnd() public {
+        _buy(alice, id, 1);
+        vm.warp(t1);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(WindowMarket.WindowEnded.selector, id));
+        windows.list(id, 1, 1);
+    }
+
+    function test_cannotBuyAListingAfterTheEnd() public {
+        _buy(alice, id, 1);
+        vm.prank(alice);
+        uint256 listingId = windows.list(id, 1, 1);
+        vm.warp(t1);
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(WindowMarket.WindowEnded.selector, id));
+        windows.buyListing(listingId, 1, 1);
+    }
+
+    function test_listingBounds() public {
+        _buy(alice, id, 1);
+        vm.prank(alice);
+        uint256 listingId = windows.list(id, 1, 7);
+        vm.startPrank(bob);
+        vm.expectRevert(WindowMarket.ZeroUnits.selector);
+        windows.buyListing(listingId, 0, 7);
+        vm.expectRevert(abi.encodeWithSelector(WindowMarket.InsufficientUnits.selector, 1, 2));
+        windows.buyListing(listingId, 2, 7);
+        vm.expectRevert(abi.encodeWithSelector(WindowMarket.PriceAboveMax.selector, 7, 6));
+        windows.buyListing(listingId, 1, 6);
+        vm.expectRevert(abi.encodeWithSelector(WindowMarket.NotSeller.selector, bob));
+        windows.delist(listingId);
+        vm.stopPrank();
+        vm.prank(alice);
+        windows.delist(listingId);
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(WindowMarket.ListingClosed.selector, listingId));
+        windows.buyListing(listingId, 1, 7);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(WindowMarket.ListingClosed.selector, listingId));
+        windows.delist(listingId);
+    }
+
+    // Draws
+
+    function test_drawsPayTheHostAndForwardTheFee() public {
+        _buy(alice, id, 2);
+        vm.warp(t0);
+        uint256 registryBefore = usdg.balanceOf(address(registry));
+        uint256 splitterBefore = usdg.balanceOf(address(splitter));
+        vm.expectEmit(address(windows));
+        emit IWindowMarket.Drawn(id, alice, 500_000, 0);
+        _draw(id, alice, 500_000);
+        assertEq(usdg.balanceOf(address(registry)) - registryBefore, START_PRICE / 2);
+        assertEq(usdg.balanceOf(address(splitter)) - splitterBefore, FEE / 2);
+        assertEq(windows.holderView(id, alice).drawnTokens, 500_000);
+    }
+
+    function test_crossingAWholeUnitBurnsIt() public {
+        _buy(alice, id, 2);
+        vm.warp(t0);
+        _draw(id, alice, 1_500_000);
+        assertEq(windows.balanceOf(alice, id), 1);
+        assertEq(windows.holderView(id, alice).drawnTokens, 500_000);
+    }
+
+    function test_onlyTheVaultApplies() public {
+        vm.expectRevert(abi.encodeWithSelector(WindowMarket.NotVault.selector, address(this)));
+        windows.applyDraws(1, new WindowDraw[](0));
+    }
+
+    function test_claimsWaitForTheWindowsHoursToSettle() public {
+        _buy(alice, id, 1);
+        vm.warp(t1);
+        _settleEmptyThrough(uint64(t1 / 3600) - 2);
+        _post(id, 3600, 0);
+        vm.warp(block.timestamp + 24 hours);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(WindowMarket.NotClaimable.selector, id));
+        windows.claimExpired(id);
+    }
+
+    function test_aLatePostCannotFollowTheFallback() public {
+        _buy(alice, id, 1);
+        vm.warp(uint256(t1) + 30 days);
+        vm.expectRevert(abi.encodeWithSelector(WindowMarket.PerformanceClosed.selector, id));
+        _post(id, 3600, 3600);
+    }
+
+    function test_onlyASettlerAnswersADispute() public {
+        _finish();
+        WindowPerformance memory p = WindowPerformance({windowId: id, measuredSeconds: 3600, belowMinSeconds: 0, evidenceRoot: bytes32(0)});
+        bytes memory sig = _thresholdSig(_windowsDigest(p));
+        windows.postPerformance(p, sig);
+        vm.prank(host);
+        windows.disputePerformance(id);
+        vm.expectRevert(abi.encodeWithSelector(WindowMarket.PerformanceClosed.selector, id));
+        windows.postPerformance(p, sig);
+        vm.prank(settlers[0]);
+        windows.postPerformance(p, sig);
+    }
+
+    function test_aFrozenHostCannotBlockTheLastClaim() public {
+        _buy(alice, id, 1);
+        _finalGood();
+        vm.mockCallRevert(address(usdg), abi.encodeWithSelector(usdg.transfer.selector, host, _collateral()), "frozen");
+        vm.prank(alice);
+        windows.claimExpired(id);
+        vm.clearMockedCalls();
+        assertEq(windows.owed(host), _collateral());
+        uint256 before = usdg.balanceOf(host);
+        vm.prank(host);
+        windows.claimOwed();
+        assertEq(usdg.balanceOf(host) - before, _collateral());
+    }
+
+    function test_theStartMustBeWithinAYear() public {
+        WindowParams memory p = _params();
+        p.t0 = uint64(block.timestamp / 3600 + 24 * 366) * 3600;
+        p.t1 = p.t0 + 3600;
+        p.auctionEnd = p.t0;
+        vm.prank(host);
+        vm.expectRevert(WindowMarket.BadTiming.selector);
+        windows.create(p, _collateral());
+    }
+
+    function test_aWindowNeedsAMinimumRate() public {
+        WindowParams memory p = _params();
+        p.minTps = 0;
+        vm.prank(host);
+        vm.expectRevert(WindowMarket.ZeroUnits.selector);
+        windows.create(p, _collateral());
+    }
+
+    function test_earlyAccessIsBounded() public {
+        vm.prank(owner);
+        vm.expectRevert(WindowMarket.BadTiming.selector);
+        windows.setEarlyAccessSeconds(7 days + 1);
+    }
+
+    function test_aDrawPastTheBalanceShrinksInsteadOfStallingTheHour() public {
+        _buy(alice, id, 1);
+        vm.warp(t0);
+        vm.expectEmit(address(windows));
+        emit IWindowMarket.Drawn(id, alice, 1_000_000, 1);
+        _draw(id, alice, 5_000_000);
+        assertEq(windows.balanceOf(alice, id), 0);
+        assertEq(windows.holderView(id, alice).drawnTokens, 0);
+    }
+
+    function test_aDrawOutsideTheWindowDoesNothing() public {
+        _buy(alice, id, 1);
+        vm.warp(t0 - 1);
+        vm.expectEmit(address(windows));
+        emit IWindowMarket.Drawn(id, alice, 0, 0);
+        _draw(id, alice, 1);
+        assertEq(windows.holderView(id, alice).drawnTokens, 0);
+        vm.warp(t1);
+        _draw(id, alice, 1);
+        assertEq(windows.holderView(id, alice).drawnTokens, 0);
+    }

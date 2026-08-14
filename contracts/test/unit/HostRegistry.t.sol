@@ -257,3 +257,301 @@ contract HostRegistryTest is VaultFixture {
         _accrue(host, 20_000e6);
         assertFalse(registry.routable(host));
         assertEq(registry.hostView(host).status, ACTIVE);
+
+        _fundHost(host, 2_000e6, 0);
+        vm.prank(host);
+        registry.topUpBond(2_000e6, 0);
+        assertTrue(registry.routable(host));
+    }
+
+    function test_topUpNeedsARegisteredHost() public {
+        vm.expectRevert(abi.encodeWithSelector(HostRegistry.NotRegistered.selector, address(this)));
+        registry.topUpBond(1, 0);
+    }
+
+    // Credits
+
+    function test_accrueCreditsIsVaultOrMarketOnly() public {
+        Credit[] memory credits = _credit(host, 1);
+        vm.expectRevert(abi.encodeWithSelector(HostRegistry.NotAuthorized.selector, address(this)));
+        registry.accrueCredits(1, credits);
+        usdg.mint(address(registry), 1);
+        vm.prank(address(windows));
+        registry.accrueCredits(1, credits);
+        assertEq(registry.hostView(host).pendingCredits, 1);
+    }
+
+    function test_zeroCreditsLeaveNoEntry() public {
+        vm.recordLogs();
+        vm.prank(address(vault));
+        registry.accrueCredits(1, _credit(host, 0));
+        assertEq(vm.getRecordedLogs().length, 0);
+    }
+
+    function test_creditsReleaseExactlyAfterTwentyFourHours() public {
+        _accrue(host, 100e6);
+        HostView memory v = registry.hostView(host);
+        assertEq(v.pendingCredits, 100e6);
+        assertEq(v.releasableCredits, 0);
+
+        vm.warp(START + 24 hours - 1);
+        vm.prank(host);
+        registry.withdrawCredits();
+        assertEq(usdg.balanceOf(host), 0, "nothing one second early");
+
+        vm.warp(START + 24 hours);
+        assertEq(registry.hostView(host).releasableCredits, 100e6);
+        vm.expectEmit(address(registry));
+        emit IHostRegistry.CreditsWithdrawn(host, 100e6);
+        vm.prank(host);
+        registry.withdrawCredits();
+        assertEq(usdg.balanceOf(host), 100e6);
+        assertEq(registry.hostView(host).releasableCredits, 0);
+    }
+
+    function test_withdrawTakesOnlyMatureEntries() public {
+        _accrue(host, 1e6);
+        vm.warp(START + 12 hours);
+        _accrue(host, 2e6);
+        vm.warp(START + 24 hours);
+        vm.prank(host);
+        registry.withdrawCredits();
+        assertEq(usdg.balanceOf(host), 1e6);
+        assertEq(registry.hostView(host).pendingCredits, 2e6);
+    }
+
+    function test_withdrawDrainsLongHistoriesInSteps() public {
+        for (uint256 i; i < 501; ++i) {
+            vm.warp(START + i * 1 hours);
+            _accrue(host, 1);
+        }
+        vm.warp(START + 525 hours);
+        vm.startPrank(host);
+        registry.withdrawCredits();
+        assertEq(usdg.balanceOf(host), 500);
+        registry.withdrawCredits();
+        assertEq(usdg.balanceOf(host), 501);
+    }
+
+    function test_withdrawIsBlockedByAnOpenChallenge() public {
+        _accrue(host, 1e6);
+        vm.prank(court);
+        registry.addChallenge(host);
+        vm.warp(START + 24 hours);
+        vm.expectRevert(abi.encodeWithSelector(HostRegistry.OpenChallenges.selector, host, uint32(1)));
+        vm.prank(host);
+        registry.withdrawCredits();
+
+        vm.prank(court);
+        registry.removeChallenge(host);
+        vm.prank(host);
+        registry.withdrawCredits();
+        assertEq(usdg.balanceOf(host), 1e6);
+    }
+
+    function test_withdrawIsBlockedWhileFrozen() public {
+        _activeHost(host);
+        vm.prank(court);
+        registry.freeze(host);
+        vm.expectRevert(abi.encodeWithSelector(HostRegistry.HostFrozen.selector, host));
+        vm.prank(host);
+        registry.withdrawCredits();
+    }
+
+    // Clawback
+
+    function test_clawBackFundsTheVaultReserve() public {
+        _accrue(host, 7e6);
+        vm.expectEmit(address(registry));
+        emit IHostRegistry.CreditsClawedBack(host, START_HOUR, 7e6, REASON);
+        vm.prank(court);
+        registry.clawBack(host, START_HOUR, REASON);
+
+        assertEq(vault.protocolReserve(), 7e6);
+        assertEq(usdg.balanceOf(address(vault)), 7e6);
+        assertEq(registry.hostView(host).pendingCredits, 0);
+        vm.warp(START + 24 hours);
+        vm.prank(host);
+        registry.withdrawCredits();
+        assertEq(usdg.balanceOf(host), 0, "a clawed entry never pays");
+    }
+
+    function test_guardianCanClawBackForAKeyIncident() public {
+        _accrue(host, 7e6);
+        vm.prank(guardian);
+        registry.clawBack(host, START_HOUR, REASON);
+        assertEq(vault.protocolReserve(), 7e6);
+    }
+
+    function test_clawBackIsCourtOrGuardianOnly() public {
+        vm.expectRevert(abi.encodeWithSelector(HostRegistry.NotAuthorized.selector, address(this)));
+        registry.clawBack(host, START_HOUR, REASON);
+    }
+
+    function test_clawBackStopsAtTwentyFourHours() public {
+        _accrue(host, 7e6);
+        vm.warp(START + 24 hours - 1);
+        vm.prank(court);
+        registry.clawBack(host, START_HOUR, REASON);
+        assertEq(vault.protocolReserve(), 7e6);
+
+        _accrue(host, 3e6);
+        vm.warp(block.timestamp + 24 hours);
+        vm.prank(court);
+        registry.clawBack(host, uint64((block.timestamp - 24 hours) / 3600), REASON);
+        assertEq(vault.protocolReserve(), 7e6, "a released entry cannot be clawed");
+        assertEq(registry.hostView(host).releasableCredits, 3e6);
+    }
+
+    function test_clawBackOnlyTouchesItsHour() public {
+        _accrue(host, 1e6);
+        vm.warp(block.timestamp + 2 hours);
+        _accrue(host, 2e6);
+        vm.prank(court);
+        registry.clawBack(host, START_HOUR, REASON);
+        assertEq(vault.protocolReserve(), 1e6);
+        assertEq(registry.hostView(host).pendingCredits, 2e6);
+    }
+
+    function test_clawingAnEmptyHourIsANoOp() public {
+        vm.recordLogs();
+        vm.prank(court);
+        registry.clawBack(host, START_HOUR, REASON);
+        assertEq(vm.getRecordedLogs().length, 0);
+    }
+
+    function test_guardianPowerDoesNotExtendToBonds() public {
+        _activeHost(host);
+        vm.startPrank(guardian);
+        vm.expectRevert(abi.encodeWithSelector(HostRegistry.NotAuthorized.selector, guardian));
+        registry.slash(host, 10_000, REASON);
+        vm.expectRevert(abi.encodeWithSelector(HostRegistry.NotAuthorized.selector, guardian));
+        registry.freeze(host);
+    }
+
+    // Freezing, challenges and slashing
+
+    function test_courtHooksAreCourtOnly() public {
+        vm.startPrank(makeAddr("stranger"));
+        bytes4 selector = HostRegistry.NotAuthorized.selector;
+        address stranger = makeAddr("stranger");
+        vm.expectRevert(abi.encodeWithSelector(selector, stranger));
+        registry.freeze(host);
+        vm.expectRevert(abi.encodeWithSelector(selector, stranger));
+        registry.unfreeze(host);
+        vm.expectRevert(abi.encodeWithSelector(selector, stranger));
+        registry.addChallenge(host);
+        vm.expectRevert(abi.encodeWithSelector(selector, stranger));
+        registry.removeChallenge(host);
+        vm.expectRevert(abi.encodeWithSelector(selector, stranger));
+        registry.slash(host, 1, REASON);
+        vm.expectRevert(abi.encodeWithSelector(selector, stranger));
+        registry.delist(host);
+    }
+
+    function test_freezeStopsRoutingAndUnfreezeRestoresThePriorStatus() public {
+        _activeHost(host);
+        vm.prank(court);
+        registry.freeze(host);
+        assertEq(registry.hostView(host).status, FROZEN);
+        assertFalse(registry.routable(host));
+
+        vm.prank(court);
+        registry.unfreeze(host);
+        assertEq(registry.hostView(host).status, ACTIVE);
+        assertTrue(registry.routable(host));
+    }
+
+    function test_freezeDuringProbationRestoresProbation() public {
+        _register(host, BOND, 0);
+        vm.startPrank(court);
+        registry.freeze(host);
+        registry.unfreeze(host);
+        assertEq(registry.hostView(host).status, PROBATION);
+    }
+
+    function test_twoFreezesNeedTwoUnfreezes() public {
+        _activeHost(host);
+        vm.startPrank(court);
+        registry.freeze(host);
+        registry.freeze(host);
+        registry.unfreeze(host);
+        assertEq(registry.hostView(host).status, FROZEN, "the second ruling still stands");
+        registry.unfreeze(host);
+        assertEq(registry.hostView(host).status, ACTIVE);
+    }
+
+    function test_freezingADelistedHostChangesNothing() public {
+        _activeHost(host);
+        vm.startPrank(court);
+        registry.delist(host);
+        registry.freeze(host);
+        assertEq(registry.hostView(host).status, DELISTED);
+        registry.unfreeze(host);
+        assertEq(registry.hostView(host).status, DELISTED);
+    }
+
+    function test_slashMovesUsdgToTheCourtAndOfpkToTheTreasury() public {
+        _register(host, 5_000e6, 10e18);
+        vm.expectEmit(address(registry));
+        emit IHostRegistry.HostSlashed(host, 2_000, 1_000e6, 2e18, REASON);
+        vm.prank(court);
+        (uint256 slashedUsdg, uint256 slashedOfpk) = registry.slash(host, 2_000, REASON);
+
+        assertEq(slashedUsdg, 1_000e6);
+        assertEq(slashedOfpk, 2e18);
+        assertEq(usdg.balanceOf(court), 1_000e6);
+        assertEq(ofpk.balanceOf(treasury), 2e18);
+        HostView memory v = registry.hostView(host);
+        assertEq(v.bondUsdg, 4_000e6);
+        assertEq(v.bondOfpk, 8e18);
+        assertEq(v.strikes, 1);
+    }
+
+    function test_slashCannotExceedTheBond() public {
+        vm.prank(court);
+        vm.expectRevert(abi.encodeWithSelector(HostRegistry.SlashTooLarge.selector, uint16(10_001)));
+        registry.slash(host, 10_001, REASON);
+    }
+
+    function test_slashWorksWithNoOfpkBond() public {
+        _register(host, BOND, 0);
+        vm.prank(court);
+        registry.slash(host, 10_000, REASON);
+        assertEq(registry.hostView(host).bondUsdg, 0);
+    }
+
+    // Exit
+
+    function test_exitReturnsBondsAfterSevenDays() public {
+        _register(host, BOND, 5e18);
+        vm.prank(host);
+        registry.exit();
+        assertEq(registry.hostView(host).status, EXITING);
+        assertFalse(registry.routable(host));
+
+        uint64 available = uint64(START + 7 days);
+        vm.warp(available - 1);
+        vm.expectRevert(abi.encodeWithSelector(HostRegistry.ExitNotAvailable.selector, available));
+        vm.prank(host);
+        registry.finalizeExit();
+
+        vm.warp(available);
+        vm.prank(host);
+        registry.finalizeExit();
+        assertEq(usdg.balanceOf(host), BOND);
+        assertEq(ofpk.balanceOf(host), 5e18);
+        assertEq(registry.hostView(host).status, NONE);
+    }
+
+    function test_oneHoursCreditsShareOneEntry() public {
+        _register(host, BOND, 0);
+        for (uint256 i; i < 501; ++i) {
+            _accrue(host, 1);
+        }
+        assertEq(registry.hostView(host).pendingCredits, 501);
+        vm.warp(block.timestamp + 24 hours);
+        vm.prank(host);
+        registry.withdrawCredits();
+        assertEq(usdg.balanceOf(host), 501, "501 credits in one hour fit in one withdrawal");
+    }
