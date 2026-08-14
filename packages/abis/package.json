@@ -1,0 +1,14 @@
+{
+  "name": "@offpeak/abis",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./deployments/local.json": "./deployments/local.json",
+    "./deployments/4663.json": "./deployments/4663.json"
+  },
+  "dependencies": {
+    "viem": "^2.38.0"
+  }
+}
