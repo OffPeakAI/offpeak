@@ -82,3 +82,81 @@ contract FeeSplitter is IFeeSplitter, Ownable2Step, ReentrancyGuardTransient {
         swapAdapter = adapter;
         emit SwapAdapterChanged(adapter);
     }
+
+    function setBurnKeeper(address keeper) external onlyOwner {
+        burnKeeper = keeper;
+        emit BurnKeeperChanged(keeper);
+    }
+
+    /// The caller has already transferred `amount` of USDG to this contract.
+    function notify(uint256 amount) external {
+        if (msg.sender != address(vault) && msg.sender != windowMarket) revert NotFeeSource(msg.sender);
+        undistributed += amount;
+        emit FeesNotified(amount);
+    }
+
+    /// With token hooks off, the burn share goes to the treasury. Rounding dust goes to the ops wallet.
+    function distribute() external nonReentrant {
+        uint256 amount = undistributed;
+        undistributed = 0;
+        uint256 rewards = amount * HOST_REWARDS_BPS / 10_000;
+        uint256 burn = tokenHooksEnabled ? amount * BURN_BPS / 10_000 : 0;
+        uint256 treasuryBps = tokenHooksEnabled ? TREASURY_BPS : TREASURY_BPS + BURN_BPS;
+        uint256 toTreasury = amount * treasuryBps / 10_000;
+        uint256 toOps = amount - rewards - burn - toTreasury;
+        hostRewardBucket += rewards;
+        burnBucket += burn;
+        emit FeesDistributed(toOps, toTreasury, rewards, burn);
+        if (toOps > 0) usdg.safeTransfer(opsWallet, toOps);
+        if (toTreasury > 0) usdg.safeTransfer(treasury, toTreasury);
+    }
+
+    function distributeRewards(RewardBatch calldata r, bytes calldata thresholdSig) external nonReentrant {
+        if (vault.settlesPaused()) revert SettlesPaused();
+        if (r.credits.length > MAX_CREDITS) revert BatchTooLarge(r.credits.length, MAX_CREDITS);
+        if (rewardWeekPaid[r.week]) revert RewardWeekPaid(r.week);
+        ThresholdSig.verify2of3(_settlers(), _rewardDigest(r), thresholdSig);
+
+        uint256 total;
+        address previous;
+        for (uint256 i; i < r.credits.length; ++i) {
+            if (r.credits[i].host <= previous) revert NotSorted();
+            previous = r.credits[i].host;
+            total += r.credits[i].amount;
+        }
+        if (total > hostRewardBucket) revert InsufficientRewardBucket(hostRewardBucket, total);
+        rewardWeekPaid[r.week] = true;
+        hostRewardBucket -= total;
+        emit RewardsDistributed(r.week, total);
+        if (total > 0) usdg.safeTransfer(address(registry), total);
+        registry.accrueRewards(r.week, r.credits);
+    }
+
+    function executeBurn(uint256 minOut) external nonReentrant {
+        if (!tokenHooksEnabled) revert TokenHooksDisabled();
+        if (msg.sender != burnKeeper) revert NotBurnKeeper(msg.sender);
+        address adapter = swapAdapter;
+        if (adapter == address(0)) revert NoSwapAdapter();
+        uint256 amount = burnBucket;
+        burnBucket = 0;
+        usdg.forceApprove(adapter, amount);
+        uint256 burned = ISwapAdapter(adapter).swap(amount, minOut, BURN_ADDRESS);
+        emit BurnExecuted(amount, burned);
+    }
+
+    function _settlers() private view returns (address[3] memory set) {
+        for (uint256 i; i < 3; ++i) {
+            set[i] = vault.settlers(i);
+        }
+    }
+
+    /// RewardBatch is signed in the OffpeakSettlement domain, whose verifying contract is the vault.
+    function _rewardDigest(RewardBatch calldata r) private view returns (bytes32) {
+        bytes32 separator = keccak256(
+            abi.encode(
+                DOMAIN_TYPEHASH, keccak256("OffpeakSettlement"), keccak256("1"), block.chainid, address(vault)
+            )
+        );
+        return keccak256(abi.encodePacked("\x19\x01", separator, Typehashes.hash(r)));
+    }
+}

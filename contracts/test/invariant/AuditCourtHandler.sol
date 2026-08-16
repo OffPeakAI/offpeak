@@ -109,3 +109,102 @@ contract AuditCourtHandler is CourtFixture {
         vm.prank(c.host);
         auditCourt.respond(id, keccak256("response"));
     }
+
+    function rule(uint256 idSeed, uint8 outcomeSeed) external {
+        (uint256 id, AuditCourt.Challenge memory c) = _pick(idSeed);
+        if (id == 0 || c.state != AuditCourt.State.Filed) return;
+        if (!c.responded && block.timestamp < c.filedAt + 24 hours) return;
+        uint8 outcome = outcomeSeed % 3;
+        if (outcome == 2 && c.kind != 0) outcome = 1;
+        if (outcome == 0) _dismiss(id, c.host);
+        else if (outcome == 1) _breach(id, c.host);
+        else {
+            _rule(id, 2, 10_000, bytes32(0));
+            ++panelReviews;
+        }
+    }
+
+    /// The ruling keys try to reach a full slash without the panel. It must never work.
+    function attackFullSlashByRuling(uint256 idSeed) external {
+        (uint256 id, AuditCourt.Challenge memory c) = _pick(idSeed);
+        if (id == 0 || c.state == AuditCourt.State.Filed) return;
+        try this.tryRule(id) {
+            attackAccepted = true;
+        } catch {}
+    }
+
+    function tryRule(uint256 id) external {
+        if (msg.sender != address(this)) return;
+        _rule(id, 2, 10_000, bytes32(0));
+    }
+
+    function decide(uint256 idSeed, uint8 decisionSeed) external {
+        (uint256 id, AuditCourt.Challenge memory c) = _pick(idSeed);
+        if (id == 0 || c.state != AuditCourt.State.PanelReview) return;
+        uint8 decision = decisionSeed % 3;
+        if (decision != PANEL_DISMISS && block.timestamp < c.reviewEndsAt) return;
+        uint16 bps = decision == CONFIRM ? 10_000 : decision == DOWNGRADE ? 2_000 : 0;
+        _decide(id, decision, bps, bytes32(0));
+    }
+
+    function finalize(uint256 idSeed) external {
+        (uint256 id, AuditCourt.Challenge memory c) = _pick(idSeed);
+        if (id == 0) return;
+        if (c.state == AuditCourt.State.Decided) {
+            _applyDecision(c);
+            auditCourt.finalize(id);
+        } else if (
+            (c.state == AuditCourt.State.Filed || c.state == AuditCourt.State.PanelReview)
+                && block.timestamp >= _timeoutAt(c)
+        ) {
+            auditCourt.finalize(id);
+            ++timeouts;
+        }
+    }
+
+    function _spawnHost() private {
+        address host = address(uint160(0xA000 + hosts.length));
+        hosts.push(host);
+        _activeHost(host);
+        mirroredBond[host] = BOND;
+    }
+
+    function _timeoutAt(AuditCourt.Challenge memory c) private pure returns (uint256) {
+        return c.reviewEndsAt > 0 ? uint256(c.reviewEndsAt) + 7 days : uint256(c.filedAt) + 14 days;
+    }
+
+    function _applyDecision(AuditCourt.Challenge memory c) private {
+        if (c.decision == CONFIRM) {
+            mirroredBond[c.host] = 0;
+            ++confirms[c.host];
+            ++fullSlashes;
+        } else if (c.decision == DOWNGRADE) {
+            _mirrorBreach(c.host);
+        }
+    }
+
+    /// A delisted host has taken its strikes, so a further Breach takes nothing.
+    function _mirrorBreach(address host) private {
+        (uint8 status,) = registry.standing(host);
+        if (status != DELISTED_NOW) mirroredBond[host] -= mirroredBond[host] * 2_000 / 10_000;
+    }
+
+    function _dismiss(uint256 id, address host) private {
+        uint256 before = usdg.balanceOf(host);
+        _rule(id, 0, 0, bytes32(0));
+        if (usdg.balanceOf(host) - before != CHALLENGE_BOND / 2) dismissalUnderpaid = true;
+        ++dismissals;
+    }
+
+    function _breach(uint256 id, address host) private {
+        _mirrorBreach(host);
+        _rule(id, 1, 2_000, bytes32(0));
+        ++breaches;
+    }
+
+    function _pick(uint256 seed) private view returns (uint256 id, AuditCourt.Challenge memory c) {
+        if (ids.length == 0) return (0, c);
+        id = ids[seed % ids.length];
+        c = auditCourt.challengeView(id);
+    }
+}
