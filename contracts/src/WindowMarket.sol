@@ -435,3 +435,205 @@ contract WindowMarket is IWindowMarket, ERC1155, EIP712, ReentrancyGuardTransien
         if (w.auctionStart >= w.auctionEnd || w.auctionEnd > w.t0) revert BadTiming();
         if (w.startPricePerUnit < w.endPricePerUnit || w.endPricePerUnit == 0) revert BadTiming();
     }
+
+    /// Hosts keep at least 30% of every hour out of Windows.
+    function _reserve(address host, WindowParams calldata w, uint32 maxTps) private {
+        uint256 hours_ = (w.t1 - w.t0) / 3600;
+        uint256 perHour = _ceilDiv(uint256(w.units) * UNIT_TOKENS, hours_);
+        uint256 limit = uint256(maxTps) * 3600 * MAX_SHARE_BPS / 10_000;
+        uint64 first = HourMath.hourOf(w.t0);
+        for (uint64 i; i < hours_; ++i) {
+            uint64 hour = first + i;
+            uint256 reserved = reservedTokensPerHour[host][hour] + perHour;
+            if (reserved > limit) revert MarketShareExceeded(hour);
+            reservedTokensPerHour[host][hour] = uint64(reserved);
+        }
+    }
+
+    function _hostPrice(Window storage w) private view returns (uint256) {
+        uint256 start = w.auctionStart;
+        uint256 end = w.auctionEnd;
+        if (block.timestamp <= start) return w.startPrice;
+        if (block.timestamp >= end) return w.endPrice;
+        uint256 drop = w.startPrice - w.endPrice;
+        return w.startPrice - drop * (block.timestamp - start) / (end - start);
+    }
+
+    function _feePerUnit(uint256 hostPrice, address buyer) private view returns (uint256) {
+        uint256 discount = _hooksOn() ? hooks.feeDiscountBps(buyer) : 0;
+        uint256 feeBps = FEE_BPS_DEFAULT > discount + FEE_BPS_MIN ? FEE_BPS_DEFAULT - discount : FEE_BPS_MIN;
+        return _ceilDiv(hostPrice * feeBps, 10_000);
+    }
+
+    function _hooksOn() private view returns (bool) {
+        return IFeeSplitter(feeSplitter).tokenHooksEnabled();
+    }
+
+    function _failed(Window storage w) private view returns (bool) {
+        if (w.sold == 0) return false;
+        return uint256(w.belowMinSeconds) * 10_000 > FAILURE_BELOW_BPS * uint256(w.measuredSeconds);
+    }
+
+    function _hoursSettled(Window storage w) private view returns (bool) {
+        return IOffpeakVault(vault).lastSettledHour() + 1 >= HourMath.hourOf(w.t1);
+    }
+
+    /// Claims can never wait on a person forever: past the fallback they open on whatever was posted.
+    function _claimable(Window storage w) private view returns (bool) {
+        if (block.timestamp >= uint256(w.t1) + CLAIM_FALLBACK_S) return true;
+        if (!_hoursSettled(w)) return false;
+        if (w.perfState == PERF_FINAL) return true;
+        if (w.perfState == PERF_POSTED) return block.timestamp >= w.perfFinalAt;
+        return w.sold == 0 && block.timestamp >= w.t1;
+    }
+
+    function _unusedValue(Window storage w, Holding storage h, uint256 balance)
+        private
+        view
+        returns (uint256 hostValue, uint256 feeValue)
+    {
+        uint256 unused = balance * UNIT_TOKENS - h.drawnPartial;
+        hostValue = _min(unused * h.hostBasis / UNIT_TOKENS, w.escrowHost);
+        feeValue = _min(unused * h.feeBasis / UNIT_TOKENS, w.escrowFees);
+    }
+
+    function _draw(WindowDraw calldata d, uint64 hour)
+        private
+        returns (uint64 tokens, uint256 units, uint256 hostShare, uint256 feeShare)
+    {
+        Window storage w = _windows[d.windowId];
+        if (hour < HourMath.hourOf(w.t0) || hour >= HourMath.hourOf(w.t1)) return (0, 0, 0, 0);
+        Holding storage h = _holdings[d.windowId][d.holder];
+        uint256 total = balanceOf(d.holder, d.windowId) * UNIT_TOKENS;
+        if (total <= h.drawnPartial) return (0, 0, 0, 0);
+        tokens = uint64(_min(d.tokens, total - h.drawnPartial));
+        if (tokens == 0) return (0, 0, 0, 0);
+        _snapshot(d.windowId, d.holder);
+        hostShare = _min(uint256(tokens) * h.hostBasis / UNIT_TOKENS, w.escrowHost);
+        feeShare = _min(uint256(tokens) * h.feeBasis / UNIT_TOKENS, w.escrowFees);
+        w.escrowHost -= hostShare;
+        w.escrowFees -= feeShare;
+        uint256 drawn = uint256(h.drawnPartial) + tokens;
+        units = drawn / UNIT_TOKENS;
+        h.drawnPartial = uint64(drawn % UNIT_TOKENS);
+        if (units > 0) _burn(d.holder, d.windowId, units);
+    }
+
+    function _addCredit(Credit[] memory credits, uint256 hosts, address host, uint256 amount) private pure returns (uint256) {
+        for (uint256 i; i < hosts; ++i) {
+            if (credits[i].host == host) {
+                credits[i].amount += uint128(amount);
+                return hosts;
+            }
+        }
+        credits[hosts] = Credit({host: host, amount: uint128(amount)});
+        return hosts + 1;
+    }
+
+    function _creditHost(address host, uint256 amount) private {
+        if (amount == 0) return;
+        Credit[] memory credits = new Credit[](1);
+        credits[0] = Credit({host: host, amount: uint128(amount)});
+        usdg.safeTransfer(address(registry), amount);
+        registry.accrueCredits(HourMath.hourOf(uint64(block.timestamp)), credits);
+    }
+
+    function _sendFees(uint256 amount) private {
+        if (amount == 0) return;
+        usdg.safeTransfer(feeSplitter, amount);
+        IFeeSplitter(feeSplitter).notify(amount);
+    }
+
+    /// Once nothing is left to claim, collateral and rounding dust leave. Past the fallback, a good window's
+    /// collateral leaves anyway, so a holder who never claims cannot trap it.
+    function _closeOut(Window storage w) private {
+        bool failed = _failed(w);
+        bool finished = w.live == 0 && (!failed || w.sharedUnits == w.sold);
+        if (!failed && !w.collateralSettled && (finished || block.timestamp >= uint256(w.t1) + CLAIM_FALLBACK_S)) {
+            w.collateralSettled = true;
+            if (!usdg.trySafeTransfer(w.host, w.collateral)) owed[w.host] += w.collateral;
+        }
+        if (!finished) return;
+        uint256 dustHost = w.escrowHost;
+        uint256 dustFees = w.escrowFees;
+        w.escrowHost = 0;
+        w.escrowFees = 0;
+        if (failed && !w.collateralSettled) {
+            w.collateralSettled = true;
+            dustFees += w.collateral - w.collateralPaid;
+        }
+        _creditHost(w.host, dustHost);
+        _sendFees(dustFees);
+    }
+
+    function _snapshot(uint256 id, address who) private {
+        Holding storage h = _holdings[id][who];
+        if (h.snapped || block.timestamp < _windows[id].t0) return;
+        h.snapped = true;
+        h.unitsAtStart = uint64(balanceOf(who, id)) + h.listed;
+    }
+
+    /// Weighted over unused tokens. Call it before the new units reach the balance.
+    function _merge(uint256 id, address who, uint256 units, uint64 hostBasis, uint64 costBasis, uint64 feeBasis) private {
+        Holding storage h = _holdings[id][who];
+        uint256 held = balanceOf(who, id) * UNIT_TOKENS - h.drawnPartial;
+        uint256 incoming = units * UNIT_TOKENS;
+        uint256 total = held + incoming;
+        h.hostBasis = uint64((held * h.hostBasis + incoming * hostBasis) / total);
+        h.costBasis = uint64((held * h.costBasis + incoming * costBasis) / total);
+        h.feeBasis = uint64((held * h.feeBasis + incoming * feeBasis) / total);
+    }
+
+    /// Market escrow moves go straight through `_update`, so the market needs no receiver hook and refuses stray transfers.
+    function _move(address from, address to, uint256 id, uint256 units) private {
+        uint256[] memory ids = new uint256[](1);
+        uint256[] memory values = new uint256[](1);
+        ids[0] = id;
+        values[0] = units;
+        _update(from, to, ids, values);
+    }
+
+    /// Batches are off: the same id twice in one would slip past every per-transfer check below.
+    function _update(address from, address to, uint256[] memory ids, uint256[] memory values) internal override {
+        if (ids.length != 1) revert BatchTransfersOff();
+        _beforeMove(from, to, ids[0], values[0]);
+        super._update(from, to, ids, values);
+    }
+
+    function _beforeMove(address from, address to, uint256 id, uint256 units) private {
+        Window storage w = _windows[id];
+        if (from == address(0)) {
+            w.live += uint64(units);
+            return;
+        }
+        if (to == address(0)) {
+            _snapshot(id, from);
+            w.live -= uint64(units);
+            return;
+        }
+        if (from == address(this)) return;
+        // Tokens used this hour settle later, so a holder must not move the units that will pay for them.
+        if (block.timestamp >= w.t0 && !_hoursSettled(w)) revert UnitsLocked(id);
+        Holding storage sender = _holdings[id][from];
+        uint256 balance = balanceOf(from, id);
+        if (sender.drawnPartial > 0 && units >= balance) revert InsufficientUnits(balance - 1, units);
+        _snapshot(id, from);
+        if (to == address(this)) return;
+        _snapshot(id, to);
+        _merge(id, to, units, sender.hostBasis, sender.costBasis, sender.feeBasis);
+    }
+
+    function _settlers() private view returns (address[3] memory set) {
+        for (uint256 i; i < 3; ++i) {
+            set[i] = IOffpeakVault(vault).settlers(i);
+        }
+    }
+
+    function _min(uint256 a, uint256 b) private pure returns (uint256) {
+        return a < b ? a : b;
+    }
+
+    function _ceilDiv(uint256 a, uint256 b) private pure returns (uint256) {
+        return a == 0 ? 0 : (a - 1) / b + 1;
+    }
+}

@@ -88,3 +88,83 @@ abstract contract CourtFixture is VaultFixture {
         vm.warp(block.timestamp + 72 hours);
         registry.activate(operator);
     }
+
+    function _evidence(address host, uint8 kind) internal pure returns (Evidence memory) {
+        return Evidence({
+            host: host,
+            kind: kind,
+            modelDigest: MODEL,
+            samplesRoot: keccak256("samples"),
+            sampleCount: 200,
+            testId: TEST_ID,
+            statistic: 9e6,
+            threshold: 5e6,
+            uri: "offpeak://evidence/sample"
+        });
+    }
+
+    function _file(address host, uint8 kind) internal returns (uint256 id) {
+        usdg.mint(challenger, CHALLENGE_BOND);
+        vm.startPrank(challenger);
+        usdg.approve(address(auditCourt), CHALLENGE_BOND);
+        id = auditCourt.challenge(_evidence(host, kind));
+        vm.stopPrank();
+    }
+
+    function _auditDigest(bytes32 structHash) internal view returns (bytes32) {
+        bytes32 domain = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256("OffpeakAudit"),
+                keccak256("1"),
+                block.chainid,
+                address(auditCourt)
+            )
+        );
+        return keccak256(abi.encodePacked("\x19\x01", domain, structHash));
+    }
+
+    function _rulingSig(Ruling memory r) internal view returns (bytes memory) {
+        bytes32 digest = _auditDigest(Typehashes.hash(r));
+        return bytes.concat(_sig(rulerKeys[0], digest), _sig(rulerKeys[1], digest));
+    }
+
+    function _ruling(uint256 id, uint8 outcome, uint16 slashBps, bytes32 refundRoot) internal pure returns (Ruling memory) {
+        return Ruling({
+            challengeId: id,
+            outcome: outcome,
+            slashBps: slashBps,
+            refundRoot: refundRoot,
+            reasonHash: keccak256("reason")
+        });
+    }
+
+    function _rule(uint256 id, uint8 outcome, uint16 slashBps, bytes32 refundRoot) internal {
+        Ruling memory r = _ruling(id, outcome, slashBps, refundRoot);
+        auditCourt.postRuling(r, _rulingSig(r));
+    }
+
+    function _decision(uint256 id, uint8 decision, uint16 bps, bytes32 refundRoot) internal pure returns (PanelDecision memory) {
+        return PanelDecision({
+            challengeId: id,
+            decision: decision,
+            finalSlashBps: bps,
+            refundRoot: refundRoot,
+            reasonHash: keccak256("panel")
+        });
+    }
+
+    function _decide(uint256 id, uint8 decision, uint16 bps, bytes32 refundRoot) internal {
+        PanelDecision memory d = _decision(id, decision, bps, refundRoot);
+        panel.approve(_auditDigest(Typehashes.hash(d)));
+        auditCourt.postPanelDecision(d, "");
+    }
+
+    function _accrue(address host, uint128 amount) internal {
+        Credit[] memory credits = new Credit[](1);
+        credits[0] = Credit({host: host, amount: amount});
+        usdg.mint(address(registry), amount);
+        vm.prank(address(vault));
+        registry.accrueCredits(uint64(block.timestamp / 3600), credits);
+    }
+}
