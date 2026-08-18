@@ -111,3 +111,125 @@ abstract contract VaultFixture is Test {
             }
         }
     }
+
+    function _fund(address buyer, uint256 amount) internal {
+        usdg.mint(buyer, amount);
+        vm.startPrank(buyer);
+        usdg.approve(address(vault), amount);
+        vault.deposit(amount);
+        vm.stopPrank();
+    }
+
+    function _fundWithCaps(address buyer, uint256 amount, uint128 hourlyCap) internal {
+        _fund(buyer, amount);
+        vm.prank(buyer);
+        vault.setCaps(hourlyCap, 0);
+    }
+
+    function _fundReserve(uint256 amount) internal {
+        usdg.mint(address(this), amount);
+        usdg.approve(address(vault), amount);
+        vault.fundReserve(amount);
+    }
+
+    function _fundAgentPool(uint256 amount) internal {
+        usdg.mint(address(vault), amount);
+        bytes32 paymentId = keccak256(abi.encode("agent", amount, vault.agentPool()));
+        vm.prank(escrow);
+        vault.creditAgentPool(amount, paymentId);
+    }
+
+    function _nextHour() internal view returns (uint64) {
+        return vault.lastSettledHour() + 1;
+    }
+
+    function _emptyBatch(uint64 hour) internal view returns (SettleBatch memory b, RootTotals memory t) {
+        b.chainId = CHAIN_ID;
+        b.vault = address(vault);
+        b.hour = hour;
+        b.totalsHash = Typehashes.hash(t);
+        b.agentPaymentsHash = Typehashes.agentPaymentsHash(new bytes32[](0));
+    }
+
+    /// A batch whose credits go to hostA and whose fees are whatever the debits leave after `credit`.
+    function _batch(uint64 hour, Debit[] memory debits, uint128 credit)
+        internal
+        view
+        returns (SettleBatch memory b, RootTotals memory t)
+    {
+        (b, t) = _emptyBatch(hour);
+        uint128 total;
+        for (uint256 i; i < debits.length; ++i) {
+            total += debits[i].amount;
+        }
+        b.debits = debits;
+        b.fees = total - credit;
+        if (credit > 0) {
+            b.credits = new Credit[](1);
+            b.credits[0] = Credit({host: hostA, amount: credit});
+        }
+        t.records = 1;
+        t.prepaidDebit = total;
+        t.hostCredit = credit;
+        t.fees = b.fees;
+        _seal(b, t);
+    }
+
+    function _seal(SettleBatch memory b, RootTotals memory t) internal pure {
+        b.root = t.records == 0 ? bytes32(0) : keccak256(abi.encode("root", b.hour));
+        b.totalsHash = Typehashes.hash(t);
+    }
+
+    function _oneDebit(address buyer, uint128 amount, uint64 lastTs) internal pure returns (Debit[] memory debits) {
+        debits = new Debit[](1);
+        debits[0] = Debit({buyer: buyer, amount: amount, lastTs: lastTs});
+    }
+
+    function _settlementDigest(bytes32 structHash) internal view returns (bytes32) {
+        bytes32 domain = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256("OffpeakSettlement"),
+                keccak256("1"),
+                block.chainid,
+                address(vault)
+            )
+        );
+        return keccak256(abi.encodePacked("\x19\x01", domain, structHash));
+    }
+
+    function _thresholdSig(bytes32 digest) internal view returns (bytes memory) {
+        return bytes.concat(_sig(settlerKeys[0], digest), _sig(settlerKeys[1], digest));
+    }
+
+    function _sig(uint256 key, bytes32 digest) internal pure returns (bytes memory) {
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(key, digest);
+        return abi.encodePacked(r, s, v);
+    }
+
+    function _signBatch(SettleBatch memory b) internal view returns (bytes memory) {
+        return _thresholdSig(_settlementDigest(Typehashes.hash(b)));
+    }
+
+    function _warpPast(uint64 hour) internal {
+        uint256 ready = HourMath.hourEnd(hour) + vault.HOUR_CLOSE_GRACE();
+        if (block.timestamp < ready) vm.warp(ready);
+    }
+
+    function _settle(SettleBatch memory b, RootTotals memory t) internal {
+        _warpPast(b.hour);
+        vault.settle(b, t, _signBatch(b));
+    }
+
+    /// Settles empty hours up to and including `hour`.
+    function _settleEmptyThrough(uint64 hour) internal {
+        while (vault.lastSettledHour() < hour) {
+            (SettleBatch memory b, RootTotals memory t) = _emptyBatch(_nextHour());
+            _settle(b, t);
+        }
+    }
+
+    function _balance(address buyer) internal view returns (uint256) {
+        return vault.buyerState(buyer).balance;
+    }
+}
