@@ -636,3 +636,288 @@ contract OffpeakVaultTest is VaultFixture {
     }
 
     // settle: effects
+
+    function test_settleMovesEverythingAndPostsTheRoot() public {
+        uint64 next = _nextHour();
+        _fundWithCaps(buyer, 50e6, CAP);
+        _fundAgentPool(3e6);
+        _fundReserve(1e6);
+
+        (SettleBatch memory b, RootTotals memory t) = _batch(next, _oneDebit(buyer, 4e6, _inHour(next)), 4e6);
+        b.credits[0].amount = 7e6;
+        b.fees = 1e6;
+        b.agentPoolDraw = 3e6;
+        b.reserveDraw = 1e6;
+        _warpPast(next);
+        bytes memory sig = _signBatch(b);
+        vm.expectEmit(address(vault));
+        emit IOffpeakVault.Settled(next, b.root, b.totalsHash, 4e6, 7e6, 1e6);
+        vault.settle(b, t, sig);
+
+        assertEq(vault.lastSettledHour(), next);
+        assertEq(_balance(buyer), 46e6);
+        assertEq(vault.agentPool(), 0);
+        assertEq(vault.protocolReserve(), 0);
+        assertEq(usdg.balanceOf(address(registry)), 7e6);
+        assertEq(usdg.balanceOf(address(splitter)), 1e6);
+        assertEq(usdg.balanceOf(address(vault)), 46e6);
+        (bytes32 root, bytes32 totalsHash) = ledger.rootOf(next);
+        assertEq(root, b.root);
+        assertEq(totalsHash, b.totalsHash);
+    }
+
+    function test_everyDebitEmitsThePerBuyerResult() public {
+        uint64 next = _nextHour();
+        _fundWithCaps(buyer, 6e6, CAP);
+        (SettleBatch memory b, RootTotals memory t) = _batch(next, _oneDebit(buyer, 4e6, _inHour(next)), 4e6);
+        vm.expectEmit(address(vault));
+        emit IOffpeakVault.Debited(next, buyer, 4e6, 4e6, 2e6);
+        _settle(b, t);
+        (uint64 day, uint128 debited) = vault.dayDebit(buyer);
+        assertEq(day, next / 24);
+        assertEq(debited, 4e6);
+    }
+
+    function test_emptyHourStillSettles() public {
+        (SettleBatch memory b, RootTotals memory t) = _emptyBatch(_nextHour());
+        _settle(b, t);
+        assertEq(vault.lastSettledHour(), b.hour);
+    }
+
+    function test_windowDrawsReachTheMarket() public {
+        (SettleBatch memory b, RootTotals memory t) = _emptyBatch(_nextHour());
+        b.windowDraws = new WindowDraw[](1);
+        b.windowDraws[0] = WindowDraw({windowId: 9, holder: buyer, tokens: 42});
+        // No such Window exists, so the market draws nothing, and the hour still lands.
+        vm.expectEmit(address(windows));
+        emit IWindowMarket.Drawn(9, buyer, 0, 0);
+        _settle(b, t);
+    }
+
+    function test_shortfallBeyondFeesAndReserveReducesCreditsProRata() public {
+        uint64 hour = uint64(block.timestamp / 3600);
+        _fundWithCaps(buyer, 10e6, CAP);
+        _settleEmptyThrough(hour - 1);
+        vm.prank(buyer);
+        vault.requestWithdrawAll();
+        uint256 requestedAt = block.timestamp;
+        vm.warp(requestedAt + 7200);
+        vault.executeWithdrawAll(buyer);
+
+        _fundReserve(1e6);
+        (SettleBatch memory b, RootTotals memory t) = _batch(hour, _oneDebit(buyer, 10e6, uint64(requestedAt)), 9e6);
+        b.credits = new Credit[](2);
+        b.credits[0] = Credit({host: hostA, amount: 3e6});
+        b.credits[1] = Credit({host: hostB, amount: 6e6});
+        _warpPast(hour);
+        bytes memory sig = _signBatch(b);
+        vm.expectEmit(address(vault));
+        emit IOffpeakVault.CreditShortfall(hour, 8e6);
+        vm.expectEmit(address(registry));
+        emit IHostRegistry.CreditsAccrued(hostA, hour, 333_333, uint64(block.timestamp + 1 days));
+        vm.expectEmit(address(registry));
+        emit IHostRegistry.CreditsAccrued(hostB, hour, 666_666, uint64(block.timestamp + 1 days));
+        vault.settle(b, t, sig);
+        assertEq(usdg.balanceOf(address(registry)), 999_999);
+        assertEq(vault.protocolReserve(), 1, "dust stays in the reserve");
+        assertEq(usdg.balanceOf(address(vault)), 1);
+    }
+
+    // refund
+
+    function test_refundPaysFromTheReserveIntoAWithdrawableBalance() public {
+        _fundReserve(5e6);
+        RefundBatch memory r = _refund(other, 2e6, "r1");
+        vm.expectEmit(address(vault));
+        emit IOffpeakVault.Refunded(other, 2e6, keccak256("r1"));
+        vault.refund(r, _signRefund(r));
+        assertEq(_balance(other), 2e6);
+        assertEq(vault.protocolReserve(), 3e6);
+        vm.prank(other);
+        vault.withdraw(2e6);
+        assertEq(usdg.balanceOf(other), 2e6);
+    }
+
+    function test_refundIdsPayOnce() public {
+        _fundReserve(5e6);
+        RefundBatch memory r = _refund(other, 2e6, "r1");
+        bytes memory sig = _signRefund(r);
+        vault.refund(r, sig);
+        vm.expectRevert(abi.encodeWithSelector(OffpeakVault.RefundAlreadyPaid.selector, keccak256("r1")));
+        vault.refund(r, sig);
+    }
+
+    function test_refundCannotExceedTheReserve() public {
+        RefundBatch memory r = _refund(other, 1, "r1");
+        bytes memory sig = _signRefund(r);
+        vm.expectRevert(abi.encodeWithSelector(OffpeakVault.InsufficientProtocolReserve.selector, 0, uint256(1)));
+        vault.refund(r, sig);
+    }
+
+    function test_refundNeedsTwoSigners() public {
+        RefundBatch memory r = _refund(other, 1, "r1");
+        bytes memory one = _sig(settlerKeys[0], _settlementDigest(Typehashes.hash(r)));
+        vm.expectRevert(ThresholdSig.BadThresholdSig.selector);
+        vault.refund(r, one);
+    }
+
+    function test_refundStopsWhenSettlesArePaused() public {
+        _fundReserve(5e6);
+        vm.prank(guardian);
+        vault.setSettlesPaused(true);
+        RefundBatch memory r = _refund(other, 1, "r1");
+        bytes memory sig = _signRefund(r);
+        vm.expectRevert(OffpeakVault.SettlesPaused.selector);
+        vault.refund(r, sig);
+    }
+
+    function test_refundEnforcesTheBatchLimit() public {
+        RefundBatch memory r;
+        r.refunds = new Refund[](501);
+        vm.expectRevert(abi.encodeWithSelector(OffpeakVault.BatchTooLarge.selector, 501, 500));
+        vault.refund(r, "");
+    }
+
+    // Roles
+
+    function test_onlyPaymentContractsCreditTheAgentPool() public {
+        vm.expectRevert(abi.encodeWithSelector(OffpeakVault.NotAgentPayer.selector, address(this)));
+        vault.creditAgentPool(1, bytes32(0));
+        vm.prank(channels);
+        vm.expectEmit(address(vault));
+        emit IOffpeakVault.AgentPoolCredited(bytes32("id"), 1);
+        vault.creditAgentPool(1, bytes32("id"));
+        assertEq(vault.agentPool(), 1);
+    }
+
+    function test_onlyGuardianPauses() public {
+        vm.expectRevert(abi.encodeWithSelector(OffpeakVault.NotGuardian.selector, address(this)));
+        vault.setUsagePaused(true);
+        vm.expectRevert(abi.encodeWithSelector(OffpeakVault.NotGuardian.selector, owner));
+        vm.prank(owner);
+        vault.setSettlesPaused(true);
+
+        vm.expectEmit(address(vault));
+        emit IOffpeakVault.Paused(true, false);
+        vm.prank(guardian);
+        vault.setUsagePaused(true);
+        assertTrue(vault.buyerState(buyer).usagePaused);
+    }
+
+    function test_rotatedSignersReplaceTheOldSet() public {
+        address[3] memory next = [address(0x11), address(0x22), address(0x33)];
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
+        vault.setSettlers(next);
+        vm.prank(owner);
+        vault.setSettlers(next);
+
+        (SettleBatch memory b, RootTotals memory t) = _emptyBatch(_nextHour());
+        _warpPast(b.hour);
+        bytes memory sig = _signBatch(b);
+        vm.expectRevert(ThresholdSig.BadThresholdSig.selector);
+        vault.settle(b, t, sig);
+    }
+
+    function test_signerSetsMustBeSortedAndDistinct() public {
+        vm.startPrank(owner);
+        vm.expectRevert(OffpeakVault.UnsortedSigners.selector);
+        vault.setSettlers([address(0x22), address(0x11), address(0x33)]);
+        vm.expectRevert(OffpeakVault.UnsortedSigners.selector);
+        vault.setSettlers([address(0x11), address(0x11), address(0x33)]);
+        vm.expectRevert(OffpeakVault.UnsortedSigners.selector);
+        vault.setSettlers([address(0), address(0x11), address(0x33)]);
+    }
+
+    function test_constructorRejectsUnsortedSigners() public {
+        vm.expectRevert(OffpeakVault.UnsortedSigners.selector);
+        new OffpeakVault(
+            owner,
+            IERC20(address(usdg)),
+            ISignatureTransfer(PERMIT2),
+            IUsageLedger(address(ledger)),
+            IHostRegistry(address(registry)),
+            [address(0x22), address(0x11), address(0x33)],
+            guardian
+        );
+    }
+
+    function test_setPeersOnce() public {
+        vm.prank(owner);
+        vm.expectRevert(OffpeakVault.AlreadySet.selector);
+        vault.setPeers(address(1), address(2), address(3), address(4));
+    }
+
+    function test_peersArriveWithTheirLaunchPhase() public {
+        OffpeakVault fresh = new OffpeakVault(
+            owner,
+            IERC20(address(usdg)),
+            ISignatureTransfer(PERMIT2),
+            IUsageLedger(address(ledger)),
+            IHostRegistry(address(registry)),
+            settlers,
+            guardian
+        );
+        vm.startPrank(owner);
+        fresh.setPeers(address(0), address(2), address(0), address(0));
+        assertEq(address(fresh.feeSplitter()), address(2));
+        assertEq(fresh.x402Escrow(), address(0));
+
+        fresh.setPeers(address(0), address(0), address(3), address(4));
+        assertEq(fresh.x402Escrow(), address(3));
+        assertEq(fresh.channelManager(), address(4));
+        assertEq(address(fresh.feeSplitter()), address(2), "an empty slot in a later call changes nothing");
+
+        vm.expectRevert(OffpeakVault.AlreadySet.selector);
+        fresh.setPeers(address(0), address(9), address(0), address(0));
+    }
+
+    function test_setGuardianIsOwnerOnly() public {
+        address next = makeAddr("next-guardian");
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
+        vault.setGuardian(next);
+        vm.prank(owner);
+        vault.setGuardian(next);
+        assertEq(vault.guardian(), next);
+    }
+
+    function _inHour(uint64 hour) private pure returns (uint64) {
+        return uint64(uint256(hour) * 3600 + 5);
+    }
+
+    function _refund(address payer, uint128 amount, string memory id) private pure returns (RefundBatch memory r) {
+        r.batchId = 1;
+        r.refunds = new Refund[](1);
+        r.refunds[0] = Refund({payer: payer, amount: amount, refundId: keccak256(bytes(id))});
+    }
+
+    function _signRefund(RefundBatch memory r) private view returns (bytes memory) {
+        return _thresholdSig(_settlementDigest(Typehashes.hash(r)));
+    }
+
+    function _permit(address token, uint256 amount) private view returns (ISignatureTransfer.PermitTransferFrom memory) {
+        return ISignatureTransfer.PermitTransferFrom({
+            permitted: ISignatureTransfer.TokenPermissions({token: token, amount: amount}),
+            nonce: 1,
+            deadline: block.timestamp + 1 hours
+        });
+    }
+
+    function _permitSig(uint256 key, ISignatureTransfer.PermitTransferFrom memory p) private view returns (bytes memory) {
+        bytes32 tokenHash = keccak256(
+            abi.encode(keccak256("TokenPermissions(address token,uint256 amount)"), p.permitted.token, p.permitted.amount)
+        );
+        bytes32 structHash = keccak256(
+            abi.encode(
+                keccak256(
+                    "PermitTransferFrom(TokenPermissions permitted,address spender,uint256 nonce,uint256 deadline)TokenPermissions(address token,uint256 amount)"
+                ),
+                tokenHash,
+                address(vault),
+                p.nonce,
+                p.deadline
+            )
+        );
+        bytes32 separator = ISignatureTransfer(PERMIT2).DOMAIN_SEPARATOR();
+        return _sig(key, keccak256(abi.encodePacked("\x19\x01", separator, structHash)));
+    }
+}

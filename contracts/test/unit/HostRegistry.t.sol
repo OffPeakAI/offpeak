@@ -555,3 +555,321 @@ contract HostRegistryTest is VaultFixture {
         registry.withdrawCredits();
         assertEq(usdg.balanceOf(host), 501, "501 credits in one hour fit in one withdrawal");
     }
+
+    function test_aCreditAfterAClawbackKeepsItsOwnEntry() public {
+        _register(host, BOND, 0);
+        _accrue(host, 5);
+        vm.prank(guardian);
+        registry.clawBack(host, uint64(block.timestamp / 3600), keccak256("bad"));
+        _accrue(host, 7);
+        assertEq(registry.hostView(host).pendingCredits, 7);
+        vm.warp(block.timestamp + 24 hours);
+        vm.prank(host);
+        registry.withdrawCredits();
+        assertEq(usdg.balanceOf(host), 7);
+    }
+
+    function test_aMergedCreditKeepsTheFullDelay() public {
+        _register(host, BOND, 0);
+        uint256 hourStart = block.timestamp / 3600 * 3600;
+        vm.warp(hourStart + 1);
+        _accrue(host, 1);
+        vm.warp(hourStart + 1800);
+        _accrue(host, 2);
+        vm.warp(hourStart + 1 + 24 hours);
+        vm.prank(host);
+        registry.withdrawCredits();
+        assertEq(usdg.balanceOf(host), 0, "the late credit is still inside its 24 hours");
+        vm.warp(hourStart + 1800 + 24 hours);
+        vm.prank(host);
+        registry.withdrawCredits();
+        assertEq(usdg.balanceOf(host), 3);
+    }
+
+    function test_totalOwedFollowsBondsAndCreditsExactly() public {
+        _register(host, BOND, 0);
+        assertEq(registry.totalOwed(), BOND);
+        _accrue(host, 3e6);
+        assertEq(registry.totalOwed(), BOND + 3e6);
+        vm.warp(block.timestamp + 24 hours);
+        vm.prank(host);
+        registry.withdrawCredits();
+        assertEq(registry.totalOwed(), BOND);
+        vm.startPrank(host);
+        registry.exit();
+        vm.warp(block.timestamp + 7 days);
+        registry.finalizeExit();
+        vm.stopPrank();
+        assertEq(registry.totalOwed(), 0);
+        assertEq(usdg.balanceOf(address(registry)), 0);
+    }
+
+    function test_creditsStayWithdrawableAfterExit() public {
+        _register(host, BOND, 0);
+        _accrue(host, 3e6);
+        vm.prank(host);
+        registry.exit();
+        vm.warp(START + 7 days);
+        vm.startPrank(host);
+        registry.finalizeExit();
+        registry.withdrawCredits();
+        assertEq(usdg.balanceOf(host), BOND + 3e6);
+    }
+
+    function test_openChallengeBlocksExitAndFinalize() public {
+        _register(host, BOND, 0);
+        vm.prank(court);
+        registry.addChallenge(host);
+        vm.expectRevert(abi.encodeWithSelector(HostRegistry.OpenChallenges.selector, host, uint32(1)));
+        vm.prank(host);
+        registry.exit();
+
+        vm.prank(court);
+        registry.removeChallenge(host);
+        vm.prank(host);
+        registry.exit();
+        vm.prank(court);
+        registry.addChallenge(host);
+        vm.warp(START + 7 days);
+        vm.expectRevert(abi.encodeWithSelector(HostRegistry.OpenChallenges.selector, host, uint32(1)));
+        vm.prank(host);
+        registry.finalizeExit();
+    }
+
+    function test_frozenHostCannotExit() public {
+        _activeHost(host);
+        vm.prank(court);
+        registry.freeze(host);
+        vm.expectRevert(abi.encodeWithSelector(HostRegistry.WrongStatus.selector, host, HostRegistry.Status.Frozen));
+        vm.prank(host);
+        registry.exit();
+    }
+
+    function test_freezeDuringUnbondingRestoresExiting() public {
+        _register(host, BOND, 0);
+        vm.prank(host);
+        registry.exit();
+        vm.startPrank(court);
+        registry.freeze(host);
+        registry.unfreeze(host);
+        assertEq(registry.hostView(host).status, EXITING);
+    }
+
+    function test_finalizeNeedsAnExit() public {
+        _register(host, BOND, 0);
+        vm.expectRevert(abi.encodeWithSelector(HostRegistry.WrongStatus.selector, host, HostRegistry.Status.Probation));
+        vm.prank(host);
+        registry.finalizeExit();
+    }
+
+    function test_exitedHostCanRegisterAgainButKeepsItsStrikes() public {
+        _register(host, BOND, 0);
+        vm.prank(court);
+        registry.slash(host, 100, REASON);
+        vm.prank(host);
+        registry.exit();
+        vm.warp(START + 7 days);
+        vm.prank(host);
+        registry.finalizeExit();
+
+        _register(host, BOND, 0);
+        assertEq(registry.hostView(host).status, PROBATION);
+        assertEq(registry.hostView(host).strikes, 1);
+    }
+
+    function test_delistedHostGetsItsRemainingBondButStaysDelisted() public {
+        _activeHost(host);
+        vm.startPrank(court);
+        registry.slash(host, 2_000, REASON);
+        registry.delist(host);
+        vm.stopPrank();
+
+        vm.expectRevert(abi.encodeWithSelector(HostRegistry.WrongStatus.selector, host, HostRegistry.Status.Delisted));
+        vm.prank(host);
+        registry.finalizeExit();
+
+        vm.prank(host);
+        registry.exit();
+        vm.expectRevert(abi.encodeWithSelector(HostRegistry.WrongStatus.selector, host, HostRegistry.Status.Delisted));
+        vm.prank(host);
+        registry.exit();
+
+        vm.warp(block.timestamp + 7 days);
+        vm.prank(host);
+        registry.finalizeExit();
+        assertEq(usdg.balanceOf(host), BOND - 400e6);
+        assertEq(registry.hostView(host).status, DELISTED);
+
+        RegisterParams memory p = _params(BOND, 0);
+        vm.expectRevert(abi.encodeWithSelector(HostRegistry.AlreadyRegistered.selector, host));
+        vm.prank(host);
+        registry.register(p);
+    }
+
+    // Rewards
+
+    function test_accrueRewardsIsSplitterOnlyAndStaysOutOfTheBondRing() public {
+        vm.expectRevert(abi.encodeWithSelector(HostRegistry.NotAuthorized.selector, address(this)));
+        registry.accrueRewards(1, _credit(host, 1));
+
+        usdg.mint(address(registry), 50_000e6);
+        vm.expectEmit(address(registry));
+        emit IHostRegistry.RewardsAccrued(host, 7, 50_000e6, uint64(START + 24 hours));
+        vm.prank(address(splitter));
+        registry.accrueRewards(7, _credit(host, 50_000e6));
+        assertEq(registry.requiredBond(host), BOND);
+        assertEq(registry.hostView(host).pendingCredits, 50_000e6);
+
+        vm.warp(START + 24 hours);
+        vm.prank(host);
+        registry.withdrawCredits();
+        assertEq(usdg.balanceOf(host), 50_000e6);
+    }
+
+    // Price sheets
+
+    function test_priceSheetReproducesTheGoldenVector() public {
+        string memory json = vm.readFile("../packages/shared/fixtures/vectors.json");
+        address vectorRegistry = json.readAddress(".addresses.contracts.HostRegistry");
+        vm.etch(vectorRegistry, address(registry).code);
+
+        PriceSheet memory s = _sheet(json.readAddress(".priceSheet.host"), 200_000, 800_000);
+        s.modelDigest = json.readBytes32(".priceSheet.modelDigest");
+        s.floorIn = 100_000;
+        s.floorOut = 400_000;
+        s.validFrom = 1_700_000_000;
+        s.nonce = 1;
+        (bool ok, bytes32 hash) = HostRegistry(vectorRegistry).verifyPriceSheet(s, json.readBytes(".priceSheet.signature"));
+        assertTrue(ok);
+        assertEq(hash, json.readBytes32(".priceSheet.hash"));
+    }
+
+    function test_priceSheetRejectsTheWrongSigner() public {
+        (address operator,) = makeAddrAndKey("operator");
+        (, uint256 wrongKey) = makeAddrAndKey("wrong");
+        PriceSheet memory s = _sheet(operator, 1_000, 1_000);
+        (bool ok,) = registry.verifyPriceSheet(s, _signSheet(wrongKey, s));
+        assertFalse(ok);
+    }
+
+    function test_priceSheetFloorMayBeExactlySixtyPercentOfTheLowestHour() public {
+        (address operator, uint256 key) = makeAddrAndKey("operator");
+        PriceSheet memory s = _sheet(operator, 1_000, 1_000);
+        s.baseIn[100] = 500;
+        s.baseOut[7] = 500;
+        s.floorIn = 300;
+        s.floorOut = 300;
+        (bool ok,) = registry.verifyPriceSheet(s, _signSheet(key, s));
+        assertTrue(ok);
+    }
+
+    function test_priceSheetRejectsAFloorAboveTheRuleOnEitherSide() public {
+        (address operator, uint256 key) = makeAddrAndKey("operator");
+        PriceSheet memory s = _sheet(operator, 1_000, 1_000);
+        s.baseIn[100] = 500;
+        s.floorIn = 301;
+        (bool ok,) = registry.verifyPriceSheet(s, _signSheet(key, s));
+        assertFalse(ok);
+
+        s = _sheet(operator, 1_000, 1_000);
+        s.baseOut[167] = 500;
+        s.floorOut = 301;
+        (ok,) = registry.verifyPriceSheet(s, _signSheet(key, s));
+        assertFalse(ok);
+    }
+
+    function test_priceSheetAcceptsContractWallets() public {
+        ContractWallet wallet = new ContractWallet();
+        PriceSheet memory s = _sheet(address(wallet), 1_000, 1_000);
+        (, bytes32 hash) = registry.verifyPriceSheet(s, "");
+        wallet.approve(hash);
+        (bool ok,) = registry.verifyPriceSheet(s, "");
+        assertTrue(ok);
+    }
+
+    function test_setPeersOnce() public {
+        vm.prank(owner);
+        vm.expectRevert(HostRegistry.AlreadySet.selector);
+        registry.setPeers(address(1), address(2), address(3), address(4));
+    }
+
+    // Helpers
+
+    function _digests(bytes32 digest) private pure returns (bytes32[] memory digests) {
+        digests = new bytes32[](1);
+        digests[0] = digest;
+    }
+
+    function _tps(uint32 value) private pure returns (uint32[] memory tps) {
+        tps = new uint32[](1);
+        tps[0] = value;
+    }
+
+    function _params(uint256 bondUsdg, uint256 bondOfpk) private pure returns (RegisterParams memory p) {
+        p.modelDigests = _digests(MODEL);
+        p.maxTps = _tps(100);
+        p.imageDigest = IMAGE;
+        p.gpuClass = GPU;
+        p.endpointHash = ENDPOINT;
+        p.attestationRef = ATTESTATION;
+        p.bondUsdg = bondUsdg;
+        p.bondOfpk = bondOfpk;
+    }
+
+    function _fundHost(address operator, uint256 usdgAmount, uint256 ofpkAmount) private {
+        usdg.mint(operator, usdgAmount);
+        ofpk.mint(operator, ofpkAmount);
+        vm.startPrank(operator);
+        usdg.approve(address(registry), type(uint256).max);
+        ofpk.approve(address(registry), type(uint256).max);
+        vm.stopPrank();
+    }
+
+    function _register(address operator, uint256 bondUsdg, uint256 bondOfpk) private {
+        _fundHost(operator, bondUsdg, bondOfpk);
+        RegisterParams memory p = _params(bondUsdg, bondOfpk);
+        vm.prank(operator);
+        registry.register(p);
+    }
+
+    function _activeHost(address operator) private {
+        _register(operator, BOND, 0);
+        vm.warp(block.timestamp + 72 hours);
+        registry.activate(operator);
+    }
+
+    function _credit(address operator, uint128 amount) private pure returns (Credit[] memory credits) {
+        credits = new Credit[](1);
+        credits[0] = Credit({host: operator, amount: amount});
+    }
+
+    function _accrue(address operator, uint128 amount) private {
+        usdg.mint(address(registry), amount);
+        vm.prank(address(vault));
+        registry.accrueCredits(uint64(block.timestamp / 3600), _credit(operator, amount));
+    }
+
+    function _sheet(address operator, uint64 baseIn, uint64 baseOut) private pure returns (PriceSheet memory s) {
+        s.host = operator;
+        s.modelDigest = MODEL;
+        for (uint64 i; i < 168; ++i) {
+            s.baseIn[i] = baseIn + (baseIn >= 200_000 ? i * 100 : 0);
+            s.baseOut[i] = baseOut + (baseOut >= 200_000 ? i * 100 : 0);
+        }
+    }
+
+    function _signSheet(uint256 key, PriceSheet memory s) private view returns (bytes memory) {
+        (, bytes32 hash) = registry.verifyPriceSheet(s, "");
+        return _sig(key, hash);
+    }
+
+    function test_noPeerCanRecordACreditItDidNotFund() public {
+        Credit[] memory credits = new Credit[](1);
+        credits[0] = Credit({host: address(0xBAD), amount: 1});
+        bytes memory refused =
+            abi.encodeWithSelector(HostRegistry.UnbackedCredits.selector, usdg.balanceOf(address(registry)), registry.totalOwed() + 1);
+        vm.prank(address(vault));
+        vm.expectRevert(refused);
+        registry.accrueCredits(1, credits);
+    }
+}
