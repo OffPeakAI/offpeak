@@ -91,3 +91,94 @@ contract ReserveHandler is VaultFixture {
         unsettled[actor] += served;
         servedTotal += served;
     }
+
+    function withdrawEverythingAllowed(uint256 actorSeed) external {
+        address actor = _actor(actorSeed);
+        BuyerView memory v = vault.buyerState(actor);
+        uint256 available = v.balance - v.reserve;
+        vm.prank(actor);
+        vault.withdraw(available);
+        if (available > 0 && v.reserve > 0) ++fullCapWithdrawals;
+    }
+
+    function requestExit(uint256 actorSeed) external {
+        address actor = _actor(actorSeed);
+        if (vault.buyerState(actor).withdrawRequestedAt != 0) return;
+        vm.prank(actor);
+        vault.requestWithdrawAll();
+    }
+
+    function cancelExit(uint256 actorSeed) external {
+        address actor = _actor(actorSeed);
+        if (vault.buyerState(actor).withdrawRequestedAt == 0) return;
+        vm.prank(actor);
+        vault.cancelWithdrawAll();
+    }
+
+    function executeExit(uint256 actorSeed) external {
+        address actor = _actor(actorSeed);
+        BuyerView memory v = vault.buyerState(actor);
+        if (v.withdrawRequestedAt == 0) return;
+        bool settled = vault.lastSettledHour() >= HourMath.hourOf(v.withdrawRequestedAt);
+        if (!settled && block.timestamp < v.withdrawDueAt) return;
+        if (!settled) exitedLate[actor] = true;
+        vault.executeWithdrawAll(actor);
+    }
+
+    function warp(uint256 secondsAhead) external {
+        uint256 before = block.timestamp / 1 days;
+        vm.warp(block.timestamp + bound(secondsAhead, 1, 2 hours));
+        if (block.timestamp / 1 days != before) ++midnightCrossings;
+    }
+
+    function settleNext(uint256 feeShare) external {
+        uint64 hour = _nextHour();
+        if (block.timestamp < HourMath.hourEnd(hour) + vault.HOUR_CLOSE_GRACE()) return;
+        Debit[] memory debits = _debitsFor(hour);
+        uint256 total;
+        for (uint256 i; i < debits.length; ++i) {
+            total += debits[i].amount;
+            address actor = debits[i].buyer;
+            if (debits[i].amount > vault.buyerState(actor).balance && !exitedLate[actor]) unexpectedClamp = true;
+            unsettled[actor] -= debits[i].amount;
+        }
+        (SettleBatch memory b, RootTotals memory t) = _batch(hour, debits, uint128(total * (100 - feeShare % 100) / 100));
+        if (debits.length == 0) {
+            t.records = 0;
+            _seal(b, t);
+        }
+        _settle(b, t);
+        ++settleCount;
+    }
+
+    function _debitsFor(uint64 hour) private view returns (Debit[] memory debits) {
+        Debit[] memory all = new Debit[](ACTORS);
+        uint256 count;
+        for (uint256 i; i < ACTORS; ++i) {
+            address actor = actors[i];
+            uint128 amount = _hourSpend[actor][hour];
+            if (amount == 0) continue;
+            all[count++] = Debit({buyer: actor, amount: amount, lastTs: _hourLastTs[actor][hour]});
+        }
+        debits = new Debit[](count);
+        for (uint256 i; i < count; ++i) {
+            debits[i] = all[i];
+        }
+    }
+
+    function _room(uint128 cap, uint128 spent) private pure returns (uint256) {
+        return cap > spent ? cap - spent : 0;
+    }
+
+    function _lesser(uint128 a, uint128 b) private pure returns (uint128) {
+        return a < b ? a : b;
+    }
+
+    function _lesser256(uint256 a, uint256 b) private pure returns (uint256) {
+        return a < b ? a : b;
+    }
+
+    function _actor(uint256 seed) private view returns (address) {
+        return actors[seed % ACTORS];
+    }
+}

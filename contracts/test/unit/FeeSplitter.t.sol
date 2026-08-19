@@ -116,3 +116,135 @@ contract FeeSplitterTest is VaultFixture {
         vm.expectRevert(abi.encodeWithSelector(FeeSplitter.RewardWeekPaid.selector, uint64(2811)));
         splitter.distributeRewards(r, sig);
     }
+
+    function test_rewardsCannotExceedTheBucket() public {
+        _bucket(1e6);
+        RewardBatch memory r = _rewards(1, 1e6, 1);
+        bytes memory sig = _sign(r);
+        vm.expectRevert(abi.encodeWithSelector(FeeSplitter.InsufficientRewardBucket.selector, 1e6, 1e6 + 1));
+        splitter.distributeRewards(r, sig);
+    }
+
+    function test_rewardsNeedTwoSettlers() public {
+        _bucket(1e6);
+        RewardBatch memory r = _rewards(1, 1, 1);
+        bytes memory one = _sig(settlerKeys[0], _settlementDigest(Typehashes.hash(r)));
+        vm.expectRevert(ThresholdSig.BadThresholdSig.selector);
+        splitter.distributeRewards(r, one);
+    }
+
+    function test_rewardsFollowRotatedSigners() public {
+        _bucket(1e6);
+        RewardBatch memory r = _rewards(1, 1, 1);
+        bytes memory sig = _sign(r);
+        vm.prank(owner);
+        vault.setSettlers([address(0x11), address(0x22), address(0x33)]);
+        vm.expectRevert(ThresholdSig.BadThresholdSig.selector);
+        splitter.distributeRewards(r, sig);
+    }
+
+    function test_rewardsRequireSortedHosts() public {
+        _bucket(1e6);
+        RewardBatch memory r = _rewards(1, 1, 1);
+        r.credits[0].host = hostB;
+        r.credits[1].host = hostA;
+        bytes memory sig = _sign(r);
+        vm.expectRevert(FeeSplitter.NotSorted.selector);
+        splitter.distributeRewards(r, sig);
+    }
+
+    function test_rewardsStopWhenSettlesArePaused() public {
+        _bucket(1e6);
+        vm.prank(guardian);
+        vault.setSettlesPaused(true);
+        RewardBatch memory r = _rewards(1, 1, 1);
+        bytes memory sig = _sign(r);
+        vm.expectRevert(FeeSplitter.SettlesPaused.selector);
+        splitter.distributeRewards(r, sig);
+    }
+
+    function test_rewardsEnforceTheBatchLimit() public {
+        RewardBatch memory r;
+        r.credits = new Credit[](501);
+        vm.expectRevert(abi.encodeWithSelector(FeeSplitter.BatchTooLarge.selector, 501, 500));
+        splitter.distributeRewards(r, "");
+    }
+
+    function test_burnIsOffByDefault() public view {
+        assertFalse(splitter.tokenHooksEnabled());
+    }
+
+    function test_burnRevertsWhileHooksAreOff() public {
+        vm.expectRevert(FeeSplitter.TokenHooksDisabled.selector);
+        splitter.executeBurn(0);
+    }
+
+    function test_burnNeedsAnAdapter() public {
+        vm.startPrank(owner);
+        splitter.setTokenHooksEnabled(true);
+        splitter.setBurnKeeper(address(this));
+        vm.stopPrank();
+        vm.expectRevert(FeeSplitter.NoSwapAdapter.selector);
+        splitter.executeBurn(0);
+    }
+
+    function test_onlyTheBurnKeeperPicksTheFloor() public {
+        vm.prank(owner);
+        splitter.setTokenHooksEnabled(true);
+        vm.expectRevert(abi.encodeWithSelector(FeeSplitter.NotBurnKeeper.selector, address(this)));
+        splitter.executeBurn(0);
+    }
+
+    function test_settingTheBurnKeeperIsOwnerOnly() public {
+        vm.expectRevert();
+        splitter.setBurnKeeper(address(this));
+    }
+
+    function test_burnSwapsTheBucketToTheDeadAddress() public {
+        MockSwapAdapter adapter = new MockSwapAdapter(IERC20(address(usdg)), ofpk);
+        vm.startPrank(owner);
+        splitter.setTokenHooksEnabled(true);
+        splitter.setSwapAdapter(address(adapter));
+        splitter.setBurnKeeper(address(this));
+        vm.stopPrank();
+        _feed(1_000e6);
+        splitter.distribute();
+
+        vm.expectRevert(abi.encodeWithSelector(MockSwapAdapter.InsufficientOutput.selector, 50e6, 50e6 + 1));
+        splitter.executeBurn(50e6 + 1);
+
+        vm.expectEmit(address(splitter));
+        emit IFeeSplitter.BurnExecuted(50e6, 50e6);
+        splitter.executeBurn(50e6);
+        assertEq(ofpk.balanceOf(DEAD), 50e6);
+        assertEq(splitter.burnBucket(), 0);
+    }
+
+    function test_settingsAreOwnerOnly() public {
+        bytes memory denied = abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this));
+        vm.expectRevert(denied);
+        splitter.setTokenHooksEnabled(true);
+        vm.expectRevert(denied);
+        splitter.setSwapAdapter(address(1));
+        vm.expectRevert(denied);
+        splitter.setPeers(address(1), address(2));
+    }
+
+    function test_setPeersOnce() public {
+        vm.prank(owner);
+        vm.expectRevert(FeeSplitter.AlreadySet.selector);
+        splitter.setPeers(address(1), address(2));
+    }
+
+    function testFuzz_distributeAccountsForEveryUnit(uint128 amount, bool hooksOn) public {
+        amount = uint128(bound(amount, 0, 1e15));
+        vm.prank(owner);
+        splitter.setTokenHooksEnabled(hooksOn);
+        _feed(amount);
+        splitter.distribute();
+        uint256 kept = splitter.hostRewardBucket() + splitter.burnBucket();
+        assertEq(usdg.balanceOf(address(splitter)), kept);
+        assertEq(usdg.balanceOf(ops) + usdg.balanceOf(treasury) + kept, amount);
+        assertLe(usdg.balanceOf(ops), uint256(amount) * 8_000 / 10_000 + 3);
+    }
+}
