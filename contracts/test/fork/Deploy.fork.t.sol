@@ -242,3 +242,168 @@ contract DeployForkTest is Test {
         x402.settleExact(p, sig, buyer, w);
         assertEq(d.vault.agentPool(), 40_000);
     }
+
+    function test_aChannelOpensThroughTheRealPermit2() public {
+        (, ChannelManager manager) = _agentContracts();
+        deal(c.usdg, buyer, 5e6, true);
+        vm.prank(buyer);
+        usdg.approve(c.permit2, type(uint256).max);
+        ChannelOpenWitness memory w =
+            ChannelOpenWitness({channelSalt: keccak256("fork-open"), payee: c.channelPayee, expiry: uint64(block.timestamp + 1 days)});
+        ISignatureTransfer.PermitTransferFrom memory p = ISignatureTransfer.PermitTransferFrom({
+            permitted: ISignatureTransfer.TokenPermissions({token: c.usdg, amount: 5e6}),
+            nonce: uint256(keccak256("fork-open-nonce")),
+            deadline: block.timestamp + 1 hours
+        });
+        bytes memory sig = _permit2Digest(address(manager), p, Typehashes.hash(w), Typehashes.CHANNEL_WITNESS_TYPESTRING);
+        bytes32 id = manager.openWithPermit2(p, sig, buyer, w);
+        assertEq(manager.channelView(id).deposit, 5e6);
+        assertEq(usdg.balanceOf(address(manager)), 5e6);
+    }
+
+    function test_uptoAuthorizesAndCapturesThroughTheRealPermit2() public {
+        (X402Escrow x402,) = _agentContracts();
+        deal(c.usdg, buyer, 10e6, true);
+        vm.prank(buyer);
+        usdg.approve(c.permit2, type(uint256).max);
+
+        UptoWitness memory w = UptoWitness({
+            reqId: keccak256("fork-upto"),
+            payee: address(d.vault),
+            maxAmount: 2e6,
+            validBefore: uint64(block.timestamp + 600),
+            resourceHash: keccak256("resource")
+        });
+        ISignatureTransfer.PermitTransferFrom memory p = ISignatureTransfer.PermitTransferFrom({
+            permitted: ISignatureTransfer.TokenPermissions({token: c.usdg, amount: 2e6}),
+            nonce: uint256(keccak256("fork-upto-nonce")),
+            deadline: block.timestamp + 1 hours
+        });
+        bytes32 structHash = keccak256(
+            abi.encode(
+                keccak256(
+                    abi.encodePacked(
+                        "PermitWitnessTransferFrom(TokenPermissions permitted,address spender,uint256 nonce,uint256 deadline,",
+                        Typehashes.UPTO_WITNESS_TYPESTRING
+                    )
+                ),
+                keccak256(abi.encode(keccak256("TokenPermissions(address token,uint256 amount)"), c.usdg, uint256(2e6))),
+                address(x402),
+                p.nonce,
+                p.deadline,
+                Typehashes.hash(w)
+            )
+        );
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", ISignatureTransfer(c.permit2).DOMAIN_SEPARATOR(), structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(buyerKey, digest);
+
+        vm.prank(c.relay);
+        x402.authorize(p, abi.encodePacked(r, s, v), buyer, w);
+        assertEq(usdg.balanceOf(address(x402)), 2e6);
+
+        vm.prank(c.capturer);
+        x402.capture(w.reqId, 5e5);
+        assertEq(d.vault.agentPool(), 5e5);
+        assertEq(usdg.balanceOf(buyer), 10e6 - 5e5);
+        assertEq(usdg.balanceOf(address(x402)), 0);
+    }
+
+    function test_aChannelPaysAndClosesWithRealUsdg() public {
+        (, ChannelManager manager) = _agentContracts();
+        deal(c.usdg, buyer, 10e6, true);
+        vm.startPrank(buyer);
+        usdg.approve(address(manager), 10e6);
+        bytes32 id = manager.open(10e6, uint64(block.timestamp + 1 days), keccak256("fork-channel"));
+        vm.stopPrank();
+
+        Voucher memory voucher = Voucher({channelId: id, seq: 1, cumulative: 3e6});
+        bytes32 channelDomain = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256("OffpeakChannel"),
+                keccak256("1"),
+                block.chainid,
+                address(manager)
+            )
+        );
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(buyerKey, keccak256(abi.encodePacked("\x19\x01", channelDomain, Typehashes.hash(voucher))));
+        vm.prank(c.keeper);
+        manager.settleChannel(id, voucher, abi.encodePacked(r, s, v));
+        assertEq(d.vault.agentPool(), 3e6);
+
+        vm.prank(buyer);
+        manager.requestClose(id);
+        vm.warp(block.timestamp + 2 hours);
+        manager.finalizeClose(id);
+        assertEq(usdg.balanceOf(buyer), 7e6);
+    }
+
+    function test_aWindowRunsOnTheRealChain() public {
+        DeployCore.Markets memory m = harness.deployMarkets(c, d, address(timelock));
+        DeployCore.Proposal memory proposal = harness.marketsProposal(d, m);
+        vm.startPrank(c.multisig);
+        timelock.scheduleBatch(proposal.targets, proposal.values, proposal.payloads, bytes32(0), bytes32("p3"), 48 hours);
+        vm.warp(block.timestamp + 48 hours);
+        timelock.executeBatch(proposal.targets, proposal.values, proposal.payloads, bytes32(0), bytes32("p3"));
+        vm.stopPrank();
+        harness.verifyMarkets(d, m, c, timelock);
+
+        address host = makeAddr("fork-host");
+        bytes32[] memory models = new bytes32[](1);
+        models[0] = keccak256("model");
+        uint32[] memory tps = new uint32[](1);
+        tps[0] = 50_000;
+        deal(c.usdg, host, 3_000e6, true);
+        deal(c.usdg, buyer, 10e6, true);
+        vm.startPrank(host);
+        usdg.approve(address(d.registry), type(uint256).max);
+        usdg.approve(address(m.windows), type(uint256).max);
+        d.registry.register(
+            RegisterParams({
+                modelDigests: models,
+                maxTps: tps,
+                imageDigest: keccak256("image"),
+                gpuClass: keccak256("h100-80g-sxm"),
+                endpointHash: keccak256("endpoint"),
+                attestationRef: bytes32(0),
+                bondUsdg: 2_000e6,
+                bondOfpk: 0
+            })
+        );
+        vm.warp(block.timestamp + 72 hours);
+        d.registry.activate(host);
+        uint64 t0 = uint64((block.timestamp / 3600 + 2) * 3600);
+        uint256 id = m.windows.create(
+            WindowParams({
+                modelDigest: models[0],
+                t0: t0,
+                t1: t0 + 3600,
+                minTps: 1,
+                units: 2,
+                startPricePerUnit: 1e6,
+                endPricePerUnit: 1e6,
+                auctionStart: uint64(block.timestamp),
+                auctionEnd: t0
+            }),
+            2e6
+        );
+        vm.stopPrank();
+
+        vm.startPrank(buyer);
+        usdg.approve(address(m.windows), type(uint256).max);
+        m.windows.buy(id, 1, type(uint256).max);
+        m.windows.cancel(id, 1);
+        vm.stopPrank();
+        assertEq(usdg.balanceOf(buyer), 10e6 - 1e6 + 950_000);
+    }
+
+    function test_theBetaCapHoldsOnTheRealToken() public {
+        deal(c.usdg, buyer, 501e6, true);
+        vm.startPrank(buyer);
+        usdg.approve(address(d.vault), 501e6);
+        vm.expectRevert();
+        d.vault.deposit(501e6);
+        d.vault.deposit(500e6);
+        vm.stopPrank();
+    }
+}

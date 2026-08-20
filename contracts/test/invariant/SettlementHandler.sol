@@ -81,3 +81,84 @@ contract SettlementHandler is VaultHandler {
         if (expected > 0) ++clawsInWindow;
         else ++clawsAfterWindow;
     }
+
+    /// Short runs would otherwise never see an entry age past its 24 hours.
+    function jumpPastCreditDelay() external {
+        vm.warp(block.timestamp + 24 hours + 1);
+    }
+
+    function attemptOverHourlyCap(uint256 actorSeed) external {
+        address actor = actors[actorSeed % actors.length];
+        uint64 hour = _ready();
+        if (hour == 0) return;
+        (uint128 hourlyCap,) = vault.effectiveCaps(actor, hour);
+        _expectRefused(_debitBatch(actor, hourlyCap + 1, hour));
+    }
+
+    function attemptOverDailyCap(uint256 actorSeed) external {
+        address actor = actors[actorSeed % actors.length];
+        uint64 hour = _ready();
+        if (hour == 0) return;
+        (uint128 hourlyCap, uint128 dailyCap) = vault.effectiveCaps(actor, hour);
+        uint128 spent = _debitedOnDay[actor][HourMath.dayOf(hour)];
+        if (dailyCap < spent || hourlyCap <= dailyCap - spent) return;
+        _expectRefused(_debitBatch(actor, dailyCap - spent + 1, hour));
+    }
+
+    function attemptSkippedHour() external {
+        uint64 hour = _ready();
+        if (hour == 0) return;
+        _warpPast(hour + 1);
+        (SettleBatch memory b, RootTotals memory t) = _emptyBatch(hour + 1);
+        _expectRefused(Attempt(b, t));
+    }
+
+    function attemptReplay() external {
+        if (settlesHalted || settleCount == 0) return;
+        (SettleBatch memory b, RootTotals memory t) = _emptyBatch(vault.lastSettledHour());
+        _expectRefused(Attempt(b, t));
+    }
+
+    function attemptDebitsAboveTotals(uint256 actorSeed) external {
+        uint64 hour = _ready();
+        if (hour == 0) return;
+        Attempt memory a = _debitBatch(actors[actorSeed % actors.length], 1, hour);
+        a.t.prepaidDebit += 1;
+        a.t.hostCredit += 1;
+        a.b.fees += 1;
+        _seal(a.b, a.t);
+        _expectRefused(a);
+    }
+
+    function attemptUnbalancedBatch(uint256 actorSeed) external {
+        uint64 hour = _ready();
+        if (hour == 0) return;
+        Attempt memory a = _debitBatch(actors[actorSeed % actors.length], 1, hour);
+        a.b.fees += 1;
+        _expectRefused(a);
+    }
+
+    struct Attempt {
+        SettleBatch b;
+        RootTotals t;
+    }
+
+    function _ready() private returns (uint64 hour) {
+        if (settlesHalted) return 0;
+        hour = _nextHour();
+        _warpPast(hour);
+    }
+
+    function _debitBatch(address actor, uint128 amount, uint64 hour) private view returns (Attempt memory a) {
+        (a.b, a.t) = _batch(hour, _oneDebit(actor, amount, uint64(uint256(hour) * 3600)), 0);
+    }
+
+    function _expectRefused(Attempt memory a) private {
+        bytes memory sig = _signBatch(a.b);
+        try vault.settle(a.b, a.t, sig) {
+            badBatchAccepted = true;
+        } catch {
+            ++refusedBatches;
+        }
+    }
+}

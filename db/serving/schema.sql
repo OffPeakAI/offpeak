@@ -149,3 +149,163 @@ BEGIN
   END IF;
 END
 $$;
+
+CREATE TABLE IF NOT EXISTS serving.jobs (
+  id text PRIMARY KEY,
+  account_id text NOT NULL,
+  wallet text NOT NULL,
+  model text NOT NULL,
+  model_digest text NOT NULL,
+  status text NOT NULL CHECK (status IN ('in_progress','completed','failed','expired','cancelled')),
+  deadline bigint NOT NULL,
+  last_hour bigint NOT NULL,
+  locked_price_in bigint NOT NULL,
+  locked_price_out bigint NOT NULL,
+  fee_bps integer NOT NULL,
+  cap_locked boolean NOT NULL DEFAULT false,
+  estimated_max_micro bigint NOT NULL,
+  actual_micro bigint NOT NULL DEFAULT 0,
+  input_file_id text NOT NULL,
+  output_file_id text NOT NULL,
+  output_bytes bigint NOT NULL DEFAULT 0,
+  output_lines integer NOT NULL DEFAULT 0,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS jobs_account_idx ON serving.jobs (account_id, status);
+
+CREATE TABLE IF NOT EXISTS serving.job_lines (
+  job_id text NOT NULL,
+  line_no integer NOT NULL,
+  custom_id text NOT NULL,
+  tokens_in integer NOT NULL,
+  max_tokens_out integer NOT NULL,
+  hour bigint NOT NULL,
+  status text NOT NULL CHECK (status IN ('queued','running','done','failed','cancelled','expired')),
+  attempt integer NOT NULL DEFAULT 0,
+  claimed_at bigint,
+  req_id text,
+  actual_micro bigint NOT NULL DEFAULT 0,
+  output_offset bigint,
+  output_bytes integer,
+  PRIMARY KEY (job_id, line_no)
+);
+CREATE INDEX IF NOT EXISTS job_lines_due_idx ON serving.job_lines (status, hour);
+
+CREATE TABLE IF NOT EXISTS serving.job_slots (
+  job_id text NOT NULL,
+  hour bigint NOT NULL,
+  line_nos integer[] NOT NULL,
+  tokens bigint NOT NULL,
+  est_micro bigint NOT NULL,
+  hold_id text,
+  PRIMARY KEY (job_id, hour)
+);
+CREATE INDEX IF NOT EXISTS job_slots_hour_idx ON serving.job_slots (hour);
+
+CREATE TABLE IF NOT EXISTS serving.files (
+  id text PRIMARY KEY,
+  account_id text NOT NULL,
+  purpose text NOT NULL,
+  bytes bigint NOT NULL,
+  sha256 text NOT NULL,
+  storage_key text NOT NULL,
+  expires_at timestamptz
+);
+
+CREATE TABLE IF NOT EXISTS serving.file_chunks (
+  storage_key text NOT NULL,
+  seq integer NOT NULL,
+  content bytea NOT NULL,
+  PRIMARY KEY (storage_key, seq)
+);
+
+CREATE TABLE IF NOT EXISTS serving.audit_samples (
+  req_id text PRIMARY KEY,
+  host text NOT NULL,
+  model_digest text NOT NULL,
+  enc_body text NOT NULL,
+  day_key_id text NOT NULL,
+  expires_at timestamptz NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS serving.canary_accounts (
+  wallet text PRIMARY KEY,
+  label text NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS serving.canary_runs (
+  id text PRIMARY KEY,
+  host text NOT NULL,
+  expected jsonb NOT NULL,
+  output text,
+  passed boolean
+);
+
+CREATE TABLE IF NOT EXISTS serving.audit_scores (
+  req_id text PRIMARY KEY,
+  host text NOT NULL,
+  model_digest text NOT NULL,
+  bucket text NOT NULL,
+  ll_mean double precision NOT NULL,
+  z double precision NOT NULL,
+  ref_host text NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS serving.audit_baselines (
+  model_digest text NOT NULL,
+  gpu_class text NOT NULL,
+  image_digest text NOT NULL,
+  temp_bucket text NOT NULL,
+  len_bucket text NOT NULL,
+  mu double precision NOT NULL,
+  sigma double precision NOT NULL,
+  n integer NOT NULL,
+  version text NOT NULL,
+  PRIMARY KEY (model_digest, gpu_class, image_digest, temp_bucket, len_bucket, version)
+);
+
+CREATE TABLE IF NOT EXISTS serving.audit_runs (
+  host text NOT NULL,
+  model_digest text NOT NULL,
+  week integer NOT NULL,
+  n integer NOT NULL,
+  llr double precision NOT NULL,
+  threshold double precision NOT NULL,
+  flagged boolean NOT NULL,
+  filed_challenge_id text,
+  PRIMARY KEY (host, model_digest, week)
+);
+
+CREATE TABLE IF NOT EXISTS serving.disputes (
+  id text PRIMARY KEY,
+  wallet text NOT NULL,
+  req_ids text[] NOT NULL,
+  reason text NOT NULL,
+  submitted_material_hash text,
+  status text NOT NULL,
+  outcome text,
+  refund_id text,
+  refund_micro bigint NOT NULL DEFAULT 0,
+  checks jsonb NOT NULL DEFAULT '[]',
+  created_at bigint NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS disputes_wallet_idx ON serving.disputes (wallet);
+
+CREATE TABLE IF NOT EXISTS serving.hour_locks (
+  hour bigint PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS serving.sealed_attestations (
+  host text PRIMARY KEY,
+  attestation_ref text NOT NULL,
+  verified_at timestamptz NOT NULL,
+  tcb_status text NOT NULL,
+  transcript jsonb NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS serving.sheet_counts (
+  host text NOT NULL,
+  week integer NOT NULL,
+  n integer NOT NULL,
+  PRIMARY KEY (host, week)
+);
