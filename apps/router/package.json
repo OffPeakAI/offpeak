@@ -1,0 +1,23 @@
+{
+  "name": "@offpeak/router",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun run src/main.ts"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.3.0",
+    "@hono/trpc-server": "^0.4.0",
+    "@offpeak/abis": "workspace:*",
+    "@offpeak/audit-tests": "workspace:*",
+    "@offpeak/common": "workspace:*",
+    "@offpeak/shared": "workspace:*",
+    "@trpc/server": "^11.0.0",
+    "bullmq": "5",
+    "hono": "^4.7.0",
+    "ioredis": "5",
+    "viem": "^2.38.0",
+    "zod": "^4.0.0"
+  }
+}
