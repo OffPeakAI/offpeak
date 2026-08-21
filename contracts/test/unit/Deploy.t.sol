@@ -106,3 +106,93 @@ contract DeployTest is Test {
         vm.expectRevert(abi.encodeWithSelector(DeployCore.WiringMismatch.selector, "beta cap matches the config"));
         harness.verify(d, c, timelock);
     }
+
+    function test_verificationCatchesARotatedSigner() public {
+        (DeployCore.Core memory d, TimelockController timelock) = _deployed();
+        c.settlers[0] = address(0x99);
+        vm.expectRevert(abi.encodeWithSelector(DeployCore.WiringMismatch.selector, "vault.settlers"));
+        harness.verify(d, c, timelock);
+    }
+
+    function test_verificationRequiresTheTimelockOwnsEverything() public {
+        DeployCore.Core memory d = harness.deploy(c);
+        TimelockController wrong = new TimelockController(0, new address[](0), new address[](0), address(this));
+        vm.expectRevert(abi.encodeWithSelector(DeployCore.WiringMismatch.selector, "owner is the timelock"));
+        harness.verify(d, c, wrong);
+    }
+
+    function test_preflightRejectsTheWrongChain() public {
+        vm.chainId(1);
+        vm.expectRevert(abi.encodeWithSelector(DeployCore.BadChain.selector, 1));
+        harness.preflight(c);
+    }
+
+    function test_preflightRejectsUsdgThatIsNotAContract() public {
+        c.usdg = address(0x1234);
+        vm.expectRevert(abi.encodeWithSelector(DeployCore.BadUsdg.selector, "no code"));
+        harness.preflight(c);
+    }
+
+    function test_preflightChecksDecimalsAndSymbol() public {
+        c.usdg = c.ofpk;
+        vm.expectRevert(abi.encodeWithSelector(DeployCore.BadUsdg.selector, "decimals"));
+        harness.preflight(c);
+
+        c.usdg = address(usdg);
+        c.usdgSymbol = "USDC";
+        vm.expectRevert(abi.encodeWithSelector(DeployCore.BadUsdg.selector, "symbol"));
+        harness.preflight(c);
+    }
+
+    function test_preflightChecksThePermit2CodeHash() public {
+        bytes32 actual = c.permit2CodeHash;
+        c.permit2CodeHash = keccak256("other chain");
+        vm.expectRevert(abi.encodeWithSelector(DeployCore.BadPermit2CodeHash.selector, actual, c.permit2CodeHash));
+        harness.preflight(c);
+    }
+
+    function test_preflightRejectsAnEmptyRole() public {
+        c.keeper = address(0);
+        vm.expectRevert();
+        harness.preflight(c);
+    }
+
+    function test_preflightRejectsAKeyShared() public {
+        c.relay = c.capturer;
+        vm.expectRevert(abi.encodeWithSelector(DeployCore.RolesNotDistinct.selector, c.capturer));
+        harness.preflight(c);
+
+        c.relay = makeAddr("relay");
+        c.opsWallet = c.treasury;
+        vm.expectRevert(abi.encodeWithSelector(DeployCore.RolesNotDistinct.selector, c.treasury));
+        harness.preflight(c);
+    }
+
+    function test_preflightRejectsAPanelThatIsNotAMultisig() public {
+        c.panel = makeAddr("just-a-wallet");
+        vm.expectRevert(abi.encodeWithSelector(DeployCore.PanelNotASafe.selector, c.panel));
+        harness.preflight(c);
+
+        c.panel = address(usdg);
+        vm.expectRevert(abi.encodeWithSelector(DeployCore.PanelNotASafe.selector, address(usdg)));
+        harness.preflight(c);
+    }
+
+    function test_noPanelReviewerCanHoldAnOperationalKey() public {
+        address[6] memory operational = [c.settlers[1], c.rulers[2], c.relay, c.capturer, c.keeper, c.routerSigner];
+        for (uint256 i; i < operational.length; ++i) {
+            address[] memory owners = new address[](2);
+            owners[0] = panelOwner;
+            owners[1] = operational[i];
+            c.panel = address(new MockSafe(owners));
+            vm.expectRevert(abi.encodeWithSelector(DeployCore.PanelOverlap.selector, operational[i]));
+            harness.preflight(c);
+        }
+    }
+
+    function test_theUsdgProbeReportsWhatItFinds() public view {
+        (bool eip2612, bool eip3009) = harness.probe(address(usdg));
+        assertFalse(eip2612);
+        assertFalse(eip3009);
+    }
+}
