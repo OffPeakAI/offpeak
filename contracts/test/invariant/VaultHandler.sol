@@ -94,3 +94,119 @@ contract VaultHandler is VaultFixture {
     function warp(uint256 secondsAhead) external {
         vm.warp(block.timestamp + bound(secondsAhead, 1, 3 hours));
     }
+
+    function toggleSettleHalt() external {
+        settlesHalted = !settlesHalted;
+        vm.prank(guardian);
+        vault.setSettlesPaused(settlesHalted);
+    }
+
+    function fundReserve(uint256 amount) external {
+        _fundReserve(bound(amount, 0, 100e6));
+    }
+
+    function fundAgentPool(uint256 amount) external {
+        _fundAgentPool(bound(amount, 0, 100e6));
+    }
+
+    function refundFromReserve(uint256 actorSeed, uint256 amount) external {
+        if (settlesHalted) return;
+        RefundBatch memory r;
+        r.batchId = uint64(settleCount);
+        r.refunds = new Refund[](1);
+        r.refunds[0] = Refund({
+            payer: _actor(actorSeed),
+            amount: uint128(bound(amount, 0, vault.protocolReserve())),
+            refundId: keccak256(abi.encode("refund", ++refundCount))
+        });
+        vault.refund(r, _thresholdSig(_settlementDigest(Typehashes.hash(r))));
+    }
+
+    /// Settles the next hour with debits a router obeying caps and exits would produce.
+    function settleNext(uint256 seed, uint256 poolDraw, uint256 reserveDraw, uint256 feeShare) external {
+        if (settlesHalted) return;
+        uint64 hour = _nextHour();
+        _warpPast(hour);
+        Debit[] memory debits = _honestDebits(hour, seed);
+        (SettleBatch memory b, RootTotals memory t) = _batch(hour, debits, 0);
+        b.agentPoolDraw = uint128(bound(poolDraw, 0, vault.agentPool()));
+        b.reserveDraw = uint128(bound(reserveDraw, 0, vault.protocolReserve()));
+        uint256 total = uint256(t.prepaidDebit) + b.agentPoolDraw + b.reserveDraw;
+        b.fees = uint128(total * bound(feeShare, 0, 100) / 100);
+        uint256 credit = total - b.fees;
+        if (credit > 0) {
+            b.credits = new Credit[](2);
+            b.credits[0] = Credit({host: hostA, amount: uint128(credit / 3)});
+            b.credits[1] = Credit({host: hostB, amount: uint128(credit - credit / 3)});
+        }
+        if (debits.length == 0 && total == 0) {
+            t.records = 0;
+            _seal(b, t);
+        }
+        vm.recordLogs();
+        _settle(b, t);
+        _onSettled(vm.getRecordedLogs());
+        ghostLastSettled = hour;
+        ++settleCount;
+    }
+
+    function _onSettled(Vm.Log[] memory logs) internal virtual {}
+
+    /// A debit dated after a pending exit must never be accepted, whatever else the batch gets right.
+    function attemptBadDebit(uint256 actorSeed, uint256 offset) external {
+        address actor = _actor(actorSeed);
+        BuyerView memory v = vault.buyerState(actor);
+        if (settlesHalted || v.withdrawRequestedAt == 0) return;
+        uint64 hour = _nextHour();
+        _warpPast(hour);
+        uint256 hourStart = uint256(hour) * 3600;
+        uint256 earliest = v.withdrawRequestedAt + 1 > hourStart ? v.withdrawRequestedAt + 1 : hourStart;
+        if (earliest >= hourStart + 3600) return;
+        uint64 lastTs = uint64(bound(offset, earliest, hourStart + 3599));
+        (uint128 hourlyCap,) = vault.effectiveCaps(actor, hour);
+        if (hourlyCap == 0) return;
+        (SettleBatch memory b, RootTotals memory t) = _batch(hour, _oneDebit(actor, 1, lastTs), 0);
+        bytes memory sig = _signBatch(b);
+        try vault.settle(b, t, sig) {
+            badDebitAccepted = true;
+        } catch {}
+    }
+
+    function _honestDebits(uint64 hour, uint256 seed) private returns (Debit[] memory debits) {
+        Debit[] memory all = new Debit[](ACTORS);
+        uint256 count;
+        uint64 day = HourMath.dayOf(hour);
+        for (uint256 i; i < ACTORS; ++i) {
+            address actor = _sorted(i);
+            BuyerView memory v = vault.buyerState(actor);
+            uint256 hourStart = uint256(hour) * 3600;
+            if (v.withdrawRequestedAt != 0 && v.withdrawRequestedAt < hourStart) continue;
+            (uint128 hourlyCap, uint128 dailyCap) = vault.effectiveCaps(actor, hour);
+            uint128 room = dailyCap - _lesser(dailyCap, _debitedOnDay[actor][day]);
+            uint128 limit = _lesser(hourlyCap, room);
+            if (limit == 0) continue;
+            uint128 amount = uint128(uint256(keccak256(abi.encode(seed, i))) % (uint256(limit) + 1));
+            if (amount == 0) continue;
+            if (amount > v.balance) ++clampCount;
+            _debitedOnDay[actor][day] += amount;
+            all[count++] = Debit({buyer: actor, amount: amount, lastTs: uint64(hourStart)});
+        }
+        debits = new Debit[](count);
+        for (uint256 i; i < count; ++i) {
+            debits[i] = all[i];
+        }
+    }
+
+    function _lesser(uint128 a, uint128 b) private pure returns (uint128) {
+        return a < b ? a : b;
+    }
+
+    function _actor(uint256 seed) private view returns (address) {
+        return actors[seed % ACTORS];
+    }
+
+    /// `actors` is declared in ascending order, which batches require.
+    function _sorted(uint256 i) private view returns (address) {
+        return actors[i];
+    }
+}

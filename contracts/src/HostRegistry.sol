@@ -359,3 +359,166 @@ contract HostRegistry is IHostRegistry, EIP712, Ownable2Step, ReentrancyGuardTra
         usdg.forceApprove(vault, total);
         IOffpeakVault(vault).fundReserve(total);
     }
+
+    /// Moves every unreleased credit to the court, which holds it until the outcome is known.
+    function seizePendingCredits(address host, bytes32 reason) external onlyAuditCourt nonReentrant returns (uint256 total) {
+        CreditEntry[] storage entries = _credits[host];
+        uint256 head = _creditHead[host];
+        for (uint256 i = entries.length; i > head; --i) {
+            CreditEntry storage entry = entries[i - 1];
+            if (entry.releasableAt <= block.timestamp) break;
+            if (entry.clawed) continue;
+            entry.clawed = true;
+            total += entry.amount;
+            emit CreditsClawedBack(host, entry.hour, entry.amount, reason);
+        }
+        totalOwed -= total;
+        if (total > 0) usdg.safeTransfer(auditCourt, total);
+    }
+
+    function freeze(address host) external onlyAuditCourt {
+        Host storage h = _hosts[host];
+        if (h.status == Status.None || h.status == Status.Delisted) return;
+        if (h.freezes++ > 0) return;
+        h.frozenFrom = h.status;
+        h.status = Status.Frozen;
+        emit HostStatusChanged(host, uint8(Status.Frozen));
+    }
+
+    function unfreeze(address host) external onlyAuditCourt {
+        Host storage h = _hosts[host];
+        if (h.freezes == 0 || --h.freezes > 0 || h.status != Status.Frozen) return;
+        h.status = h.frozenFrom;
+        emit HostStatusChanged(host, uint8(h.status));
+    }
+
+    function addChallenge(address host) external onlyAuditCourt {
+        Host storage h = _hosts[host];
+        emit ChallengesChanged(host, ++h.openChallenges);
+    }
+
+    function removeChallenge(address host) external onlyAuditCourt {
+        Host storage h = _hosts[host];
+        emit ChallengesChanged(host, --h.openChallenges);
+    }
+
+    function slash(address host, uint16 bps, bytes32 evidence)
+        external
+        onlyAuditCourt
+        nonReentrant
+        returns (uint256 slashedUsdg, uint256 slashedOfpk)
+    {
+        if (bps > 10_000) revert SlashTooLarge(bps);
+        Host storage h = _hosts[host];
+        // Without this a stack of Breach rulings could take nearly the whole bond and skip the panel.
+        if (bps < 10_000 && h.status == Status.Delisted) return (0, 0);
+        slashedUsdg = h.bondUsdg * bps / 10_000;
+        slashedOfpk = h.bondOfpk * bps / 10_000;
+        h.bondUsdg -= slashedUsdg;
+        h.bondOfpk -= slashedOfpk;
+        totalOwed -= slashedUsdg;
+        if (bps == 10_000) h.forfeited = true;
+        emit HostSlashed(host, bps, slashedUsdg, slashedOfpk, evidence);
+        emit HostStruck(host, ++h.strikes);
+        emit BondChanged(host, h.bondUsdg, h.bondOfpk);
+        if (slashedUsdg > 0) usdg.safeTransfer(auditCourt, slashedUsdg);
+        if (slashedOfpk > 0) ofpk.safeTransfer(treasury, slashedOfpk);
+    }
+
+    function delist(address host) external onlyAuditCourt {
+        Host storage h = _hosts[host];
+        h.status = Status.Delisted;
+        h.freezes = 0;
+        h.exitAvailableAt = 0;
+        emit HostStatusChanged(host, uint8(Status.Delisted));
+    }
+
+    function hostView(address host) external view returns (HostView memory v) {
+        Host storage h = _hosts[host];
+        v.operator = h.operator;
+        v.status = uint8(h.status);
+        v.bondUsdg = h.bondUsdg;
+        v.bondOfpk = h.bondOfpk;
+        v.requiredBond = requiredBond(host);
+        v.imageDigest = h.imageDigest;
+        v.gpuClass = h.gpuClass;
+        v.attestationRef = h.attestationRef;
+        v.probationEnds = h.probationEnds;
+        v.strikes = h.strikes;
+        v.openChallenges = h.openChallenges;
+        CreditEntry[] storage entries = _credits[host];
+        for (uint256 i = _creditHead[host]; i < entries.length; ++i) {
+            CreditEntry storage entry = entries[i];
+            if (entry.clawed) continue;
+            if (entry.releasableAt <= block.timestamp) v.releasableCredits += entry.amount;
+            else v.pendingCredits += entry.amount;
+        }
+    }
+
+    function standing(address host) external view returns (uint8 status, uint8 strikes) {
+        Host storage h = _hosts[host];
+        return (uint8(h.status), h.strikes);
+    }
+
+    function modelsOf(address host) external view returns (bytes32[] memory) {
+        return _models[host];
+    }
+
+    function requiredBond(address host) public view returns (uint256) {
+        Host storage h = _hosts[host];
+        uint256 today = block.timestamp / 1 days;
+        uint256 age = today - h.lastCreditDay;
+        uint256 total;
+        for (uint256 back = 0; back + age < RING_DAYS; ++back) {
+            total += h.dailyCredits[(h.lastCreditDay - back) % RING_DAYS];
+        }
+        uint256 required = total * REQUIRED_BOND_BPS / 10_000;
+        return required > MIN_BOND ? required : MIN_BOND;
+    }
+
+    function routable(address host) external view returns (bool) {
+        Host storage h = _hosts[host];
+        return h.status == Status.Active && h.bondUsdg >= requiredBond(host);
+    }
+
+    function _setModels(address host, bytes32[] calldata modelDigests, uint32[] calldata maxTps) private {
+        if (modelDigests.length == 0 || modelDigests.length != maxTps.length) revert InvalidModels();
+        bytes32[] storage current = _models[host];
+        for (uint256 i; i < current.length; ++i) {
+            delete maxTpsOf[host][current[i]];
+        }
+        delete _models[host];
+        for (uint256 i; i < modelDigests.length; ++i) {
+            if (maxTps[i] == 0) revert InvalidModels();
+            maxTpsOf[host][modelDigests[i]] = maxTps[i];
+            current.push(modelDigests[i]);
+        }
+    }
+
+    function _addToRing(Host storage h, uint128 amount) private {
+        uint64 today = uint64(block.timestamp / 1 days);
+        uint64 last = h.lastCreditDay;
+        if (today != last) {
+            uint256 stale = today - last;
+            if (stale > RING_DAYS) stale = RING_DAYS;
+            for (uint256 back; back < stale; ++back) {
+                delete h.dailyCredits[(today - back) % RING_DAYS];
+            }
+            h.lastCreditDay = today;
+        }
+        h.dailyCredits[today % RING_DAYS] += amount;
+    }
+
+    function _pullBonds(uint256 usdgAmount, uint256 ofpkAmount) private {
+        if (usdgAmount > 0) usdg.safeTransferFrom(msg.sender, address(this), usdgAmount);
+        if (ofpkAmount > 0) ofpk.safeTransferFrom(msg.sender, address(this), ofpkAmount);
+    }
+
+    function _floorHolds(uint64 floor, uint64[168] calldata base) private pure returns (bool) {
+        uint64 lowest = base[0];
+        for (uint256 i = 1; i < 168; ++i) {
+            if (base[i] < lowest) lowest = base[i];
+        }
+        return uint256(floor) * 10_000 <= FLOOR_MAX_RATIO_BPS * uint256(lowest);
+    }
+}

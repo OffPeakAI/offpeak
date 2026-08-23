@@ -569,3 +569,312 @@ contract WindowMarketTest is WindowFixture {
         _draw(id, alice, 1);
         assertEq(windows.holderView(id, alice).drawnTokens, 0);
     }
+
+    // Performance
+
+    function test_performancePostsAfterTheEndAndWaitsADay() public {
+        vm.expectRevert(abi.encodeWithSelector(WindowMarket.WindowNotEnded.selector, id));
+        _post(id, 3600, 0);
+        _finish();
+        vm.expectEmit(address(windows));
+        emit IWindowMarket.PerformancePosted(id, 3600, 720, false, uint64(block.timestamp + 24 hours));
+        _post(id, 3600, 720);
+        assertFalse(windows.windowView(id).failed);
+    }
+
+    function test_justOverTwentyPercentFails() public {
+        _buy(alice, id, 1);
+        _finish();
+        _post(id, 3600, 721);
+        assertTrue(windows.windowView(id).failed);
+    }
+
+    function test_aBadSignatureIsRefused() public {
+        _finish();
+        WindowPerformance memory p = WindowPerformance({windowId: id, measuredSeconds: 1, belowMinSeconds: 0, evidenceRoot: bytes32(0)});
+        bytes32 wrong = keccak256("wrong");
+        vm.expectRevert();
+        windows.postPerformance(p, _thresholdSig(wrong));
+    }
+
+    function test_settlementCannotPostTwiceWithoutADispute() public {
+        _finish();
+        _post(id, 3600, 0);
+        vm.expectRevert(abi.encodeWithSelector(WindowMarket.PerformanceClosed.selector, id));
+        _post(id, 3600, 0);
+    }
+
+    function test_aDisputeReopensAndTheRepostIsFinal() public {
+        _buy(alice, id, 1);
+        _finish();
+        _post(id, 3600, 3600);
+        vm.prank(host);
+        windows.disputePerformance(id);
+        _post(id, 3600, 0);
+        vm.warp(block.timestamp + 1);
+        assertFalse(windows.windowView(id).failed);
+        vm.prank(alice);
+        windows.claimExpired(id);
+        vm.prank(host);
+        vm.expectRevert(abi.encodeWithSelector(WindowMarket.PerformanceClosed.selector, id));
+        windows.disputePerformance(id);
+    }
+
+    function test_onlyTheHostDisputesAndOnlyInTime() public {
+        _finish();
+        _post(id, 3600, 0);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(WindowMarket.NotHost.selector, alice));
+        windows.disputePerformance(id);
+        vm.warp(block.timestamp + 24 hours);
+        vm.prank(host);
+        vm.expectRevert(abi.encodeWithSelector(WindowMarket.PerformanceClosed.selector, id));
+        windows.disputePerformance(id);
+    }
+
+    function test_aPauseHoldsPerformance() public {
+        _finish();
+        vm.prank(guardian);
+        vault.setSettlesPaused(true);
+        WindowPerformance memory p = WindowPerformance({windowId: id, measuredSeconds: 1, belowMinSeconds: 0, evidenceRoot: bytes32(0)});
+        vm.expectRevert(WindowMarket.SettlesPaused.selector);
+        windows.postPerformance(p, "");
+    }
+
+    // Claims
+
+    function test_expiredHalfRefundsUnusedAndPaysTheHostHalf() public {
+        _buy(alice, id, 2);
+        vm.warp(t0);
+        _draw(id, alice, 500_000);
+        _finalGood();
+        uint256 unusedHost = uint256(START_PRICE) * 3 / 2;
+        uint256 unusedFee = FEE * 3 / 2;
+        uint256 before = usdg.balanceOf(alice);
+        uint256 registryBefore = usdg.balanceOf(address(registry));
+        vm.expectEmit(address(windows));
+        emit IWindowMarket.Claimed(id, alice, 0, unusedHost / 2 + unusedFee);
+        vm.prank(alice);
+        windows.claimExpired(id);
+        assertEq(usdg.balanceOf(alice) - before, unusedHost / 2 + unusedFee);
+        assertEq(usdg.balanceOf(address(registry)) - registryBefore, unusedHost - unusedHost / 2);
+        assertEq(windows.balanceOf(alice, id), 0);
+    }
+
+    function test_theLastClaimReturnsCollateralAndLeavesTheMarketEmpty() public {
+        _buy(alice, id, 1);
+        _buy(bob, id, 1);
+        _finalGood();
+        uint256 before = usdg.balanceOf(host);
+        vm.prank(alice);
+        windows.claimExpired(id);
+        assertEq(usdg.balanceOf(host), before);
+        vm.prank(bob);
+        windows.claimExpired(id);
+        assertEq(usdg.balanceOf(host) - before, _collateral());
+        assertEq(usdg.balanceOf(address(windows)), 0);
+    }
+
+    function test_collateralComesBackAfterThirtyDaysEvenIfSomeoneNeverClaims() public {
+        _buy(alice, id, 1);
+        _finalGood();
+        vm.warp(uint256(t1) + 30 days);
+        uint256 before = usdg.balanceOf(host);
+        vm.prank(host);
+        windows.claimExpired(id);
+        assertEq(usdg.balanceOf(host) - before, _collateral());
+        vm.prank(alice);
+        windows.claimExpired(id);
+        assertEq(usdg.balanceOf(host) - before, _collateral());
+        assertEq(usdg.balanceOf(address(windows)), 0);
+    }
+
+    function test_anUnsoldWindowReturnsCollateralAtTheEnd() public {
+        _finish();
+        uint256 before = usdg.balanceOf(host);
+        vm.prank(host);
+        windows.claimExpired(id);
+        assertEq(usdg.balanceOf(host) - before, _collateral());
+    }
+
+    function test_aHostCannotTakeCollateralBeforePerformance() public {
+        _buy(alice, id, 1);
+        vm.warp(t0);
+        _draw(id, alice, 1_000_000);
+        _finish();
+        vm.prank(host);
+        vm.expectRevert(abi.encodeWithSelector(WindowMarket.NotClaimable.selector, id));
+        windows.claimExpired(id);
+    }
+
+    function test_claimsWaitForTheDisputeDay() public {
+        _buy(alice, id, 1);
+        _finish();
+        _post(id, 3600, 0);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(WindowMarket.NotClaimable.selector, id));
+        windows.claimExpired(id);
+    }
+
+    function test_claimsOpenAfterThirtyDaysIfNothingWasPosted() public {
+        _buy(alice, id, 1);
+        vm.warp(uint256(t1) + 30 days);
+        vm.prank(alice);
+        windows.claimExpired(id);
+        assertEq(windows.balanceOf(alice, id), 0);
+    }
+
+    function test_aDisputeCannotTrapClaimsForever() public {
+        _buy(alice, id, 1);
+        _finish();
+        _post(id, 3600, 0);
+        vm.prank(host);
+        windows.disputePerformance(id);
+        vm.warp(uint256(t1) + 30 days);
+        vm.prank(alice);
+        windows.claimExpired(id);
+        assertEq(windows.balanceOf(alice, id), 0);
+    }
+
+    function test_claimExpiredRefusesAFailedWindow() public {
+        _buy(alice, id, 1);
+        _finalFailed();
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(WindowMarket.NotClaimable.selector, id));
+        windows.claimExpired(id);
+    }
+
+    function test_claimFailureRefusesAGoodWindow() public {
+        _buy(alice, id, 1);
+        _finalGood();
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(WindowMarket.NotClaimable.selector, id));
+        windows.claimFailure(id);
+    }
+
+    function test_failureRefundsUndrawnAndSharesAllTheCollateral() public {
+        _buy(alice, id, 3);
+        _buy(bob, id, 1);
+        vm.warp(t0);
+        _draw(id, alice, 1_000_000);
+        _finalFailed();
+        uint256 before = usdg.balanceOf(alice);
+        vm.prank(alice);
+        windows.claimFailure(id);
+        assertEq(usdg.balanceOf(alice) - before, 2 * (START_PRICE + FEE) + _collateral() * 3 / 4);
+        before = usdg.balanceOf(bob);
+        vm.prank(bob);
+        windows.claimFailure(id);
+        assertEq(usdg.balanceOf(bob) - before, START_PRICE + FEE + _collateral() / 4);
+        assertEq(usdg.balanceOf(address(windows)), 0);
+    }
+
+    function test_collateralFollowsUnitsHeldAtTheStartNotAfter() public {
+        _buy(alice, id, 3);
+        _buy(bob, id, 1);
+        _finish();
+        vm.prank(alice);
+        windows.safeTransferFrom(alice, bob, id, 3, "");
+        _post(id, 3600, 721);
+        vm.warp(block.timestamp + 24 hours);
+        uint256 before = usdg.balanceOf(alice);
+        vm.prank(alice);
+        windows.claimFailure(id);
+        assertEq(usdg.balanceOf(alice) - before, _collateral() * 3 / 4);
+        before = usdg.balanceOf(bob);
+        vm.prank(bob);
+        windows.claimFailure(id);
+        assertEq(usdg.balanceOf(bob) - before, 4 * (START_PRICE + FEE) + _collateral() / 4);
+    }
+
+    function test_listedUnitsCountAsHeldAtTheStart() public {
+        _buy(alice, id, 2);
+        vm.prank(alice);
+        uint256 listingId = windows.list(id, 2, 1_000_000);
+        _finalFailed();
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(WindowMarket.StillListed.selector, id, uint64(2)));
+        windows.claimFailure(id);
+        vm.startPrank(alice);
+        windows.delist(listingId);
+        uint256 before = usdg.balanceOf(alice);
+        windows.claimFailure(id);
+        vm.stopPrank();
+        assertEq(usdg.balanceOf(alice) - before, 2 * (START_PRICE + FEE) + _collateral());
+    }
+
+    function test_failureClaimsWaitForTheDisputeDay() public {
+        _buy(alice, id, 1);
+        _finish();
+        _post(id, 3600, 721);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(WindowMarket.NotClaimable.selector, id));
+        windows.claimFailure(id);
+    }
+
+    function test_theLastUnitBurningDoesNotCutOffAHolderStillOwedCollateral() public {
+        _buy(alice, id, 1);
+        _buy(bob, id, 1);
+        vm.warp(t0);
+        _draw(id, alice, 1_000_000);
+        _finalFailed();
+        vm.prank(bob);
+        windows.claimFailure(id);
+        assertEq(windows.windowState(id).live, 0);
+        uint256 before = usdg.balanceOf(alice);
+        vm.prank(alice);
+        windows.claimFailure(id);
+        assertEq(usdg.balanceOf(alice) - before, _collateral() / 2);
+        assertEq(usdg.balanceOf(address(windows)), 0);
+    }
+
+    function test_aFullyDrawnHolderStillGetsTheirCollateralShare() public {
+        _buy(alice, id, 1);
+        vm.warp(t0);
+        _draw(id, alice, 1_000_000);
+        _finalFailed();
+        uint256 before = usdg.balanceOf(alice);
+        vm.prank(alice);
+        windows.claimFailure(id);
+        assertEq(usdg.balanceOf(alice) - before, _collateral());
+    }
+
+    function test_aFailureClaimPaysOnce() public {
+        _buy(alice, id, 1);
+        _buy(bob, id, 1);
+        _finalFailed();
+        vm.startPrank(alice);
+        windows.claimFailure(id);
+        uint256 before = usdg.balanceOf(alice);
+        windows.claimFailure(id);
+        vm.stopPrank();
+        assertEq(usdg.balanceOf(alice), before);
+    }
+
+    function test_aStrangerGetsNothing() public {
+        _buy(alice, id, 1);
+        _finalFailed();
+        vm.prank(bob);
+        windows.claimFailure(id);
+        assertEq(windows.windowState(id).sharedUnits, 0);
+    }
+
+    function test_listedUnitsBlockAnExpiredClaim() public {
+        _buy(alice, id, 1);
+        vm.prank(alice);
+        windows.list(id, 1, 1);
+        _finalGood();
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(WindowMarket.StillListed.selector, id, uint64(1)));
+        windows.claimExpired(id);
+    }
+
+    function test_theOwnerCanSetEarlyAccessButNotMoveFunds() public {
+        vm.prank(alice);
+        vm.expectRevert();
+        windows.setEarlyAccessSeconds(0);
+        vm.prank(owner);
+        windows.setEarlyAccessSeconds(0);
+        assertEq(windows.earlyAccessSeconds(), 0);
+    }
+}
