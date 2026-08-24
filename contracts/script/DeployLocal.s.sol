@@ -116,3 +116,105 @@ contract DeployLocal is Script {
         d.registry = new HostRegistry(deployer, usdg, IERC20(address(d.ofpk)), r.guardian, r.treasury);
         d.ledger = new UsageLedger(deployer, r.router);
     }
+
+    /// Nonces 7 and 11 fall between the contracts' vector addresses, so a mock and a mint take those slots.
+    function _deployMarkets(Deployed memory d, address deployer, Roles memory r, Peers memory p) private {
+        IERC20 usdg = IERC20(address(d.usdg));
+        IHostRegistry registry = IHostRegistry(p.registry);
+        d.escrow = new X402Escrow(usdg, PERMIT2, p.vault, r.relay, r.capturer);
+        d.channels = new ChannelManager(usdg, PERMIT2, p.vault, r.channelPayee, r.keeper);
+        d.adapter = new MockSwapAdapter(usdg, d.ofpk);
+        d.windows = new WindowMarket(deployer, usdg, registry, IOfpkHooks(p.hooks), p.vault, p.splitter);
+        d.court = new AuditCourt(deployer, usdg, registry, IOffpeakVault(p.vault), r.rulers, r.panel, r.treasury);
+        d.splitter = new FeeSplitter(deployer, usdg, registry, r.opsWallet, r.treasury);
+        d.usdg.mint(r.buyer, 10_000e6);
+        d.hooks = new OfpkHooks(deployer, IERC20(address(d.ofpk)), registry, IFeeSplitter(p.splitter));
+    }
+
+    function _wire(Deployed memory d, Roles memory r) private {
+        d.vault.setPeers(address(d.windows), address(d.splitter), address(d.escrow), address(d.channels));
+        d.registry.setPeers(address(d.vault), address(d.windows), address(d.court), address(d.splitter));
+        d.ledger.setVault(address(d.vault));
+        d.splitter.setPeers(address(d.vault), address(d.windows));
+        for (uint256 i; i < GPU_CLASSES.length; ++i) {
+            d.registry.setGpuClass(keccak256(bytes(GPU_CLASSES[i])), true);
+        }
+        d.usdg.mint(r.host, 10_000e6);
+    }
+
+    function _write(Deployed memory d, Roles memory r) private {
+        string memory addresses = "contracts";
+        vm.serializeAddress(addresses, "MockUSDG", address(d.usdg));
+        vm.serializeAddress(addresses, "MockOFPK", address(d.ofpk));
+        vm.serializeAddress(addresses, "MockSwapAdapter", address(d.adapter));
+        vm.serializeAddress(addresses, "OffpeakVault", address(d.vault));
+        vm.serializeAddress(addresses, "HostRegistry", address(d.registry));
+        vm.serializeAddress(addresses, "UsageLedger", address(d.ledger));
+        vm.serializeAddress(addresses, "X402Escrow", address(d.escrow));
+        vm.serializeAddress(addresses, "ChannelManager", address(d.channels));
+        vm.serializeAddress(addresses, "WindowMarket", address(d.windows));
+        vm.serializeAddress(addresses, "AuditCourt", address(d.court));
+        vm.serializeAddress(addresses, "OfpkHooks", address(d.hooks));
+        vm.serializeAddress(addresses, "FeeSplitter", address(d.splitter));
+        string memory contractsJson = vm.serializeAddress(addresses, "Permit2", address(PERMIT2));
+
+        string memory people = "roles";
+        vm.serializeAddress(people, "router", r.router);
+        vm.serializeAddress(people, "host", r.host);
+        vm.serializeAddress(people, "buyer", r.buyer);
+        vm.serializeAddress(people, "settlers", _dynamic(r.settlers));
+        vm.serializeAddress(people, "rulers", _dynamic(r.rulers));
+        vm.serializeAddress(people, "guardian", r.guardian);
+        vm.serializeAddress(people, "relay", r.relay);
+        vm.serializeAddress(people, "capturer", r.capturer);
+        vm.serializeAddress(people, "keeper", r.keeper);
+        vm.serializeAddress(people, "channelPayee", r.channelPayee);
+        vm.serializeAddress(people, "panel", r.panel);
+        vm.serializeAddress(people, "treasury", r.treasury);
+        string memory rolesJson = vm.serializeAddress(people, "opsWallet", r.opsWallet);
+
+        string memory root = "deployment";
+        vm.serializeUint(root, "chainId", block.chainid);
+        vm.serializeString(root, "contracts", contractsJson);
+        vm.writeJson(vm.serializeString(root, "roles", rolesJson), OUTPUT);
+    }
+
+    /// Accounts 1-9 match the vector signers in packages/shared/src/test-keys.ts; 10-17 are the remaining roles.
+    function _roles() private pure returns (Roles memory r) {
+        r.router = _account(1);
+        r.host = _account(2);
+        r.buyer = _account(3);
+        r.settlers = _sorted(_account(4), _account(5), _account(6));
+        r.rulers = _sorted(_account(7), _account(8), _account(9));
+        r.guardian = _account(10);
+        r.relay = _account(11);
+        r.capturer = _account(12);
+        r.keeper = _account(13);
+        r.channelPayee = _account(14);
+        r.panel = _account(15);
+        r.treasury = _account(16);
+        r.opsWallet = _account(17);
+    }
+
+    function _account(uint32 index) private pure returns (address) {
+        return vm.addr(vm.deriveKey(MNEMONIC, index));
+    }
+
+    function _sorted(address a, address b, address c) private pure returns (address[3] memory set) {
+        if (a > b) (a, b) = (b, a);
+        if (b > c) (b, c) = (c, b);
+        if (a > b) (a, b) = (b, a);
+        set = [a, b, c];
+    }
+
+    function _dynamic(address[3] memory set) private pure returns (address[] memory out) {
+        out = new address[](3);
+        for (uint256 i; i < 3; ++i) {
+            out[i] = set[i];
+        }
+    }
+
+    function _expect(string memory name, address expected, address actual) private pure {
+        if (expected != actual) revert UnexpectedAddress(name, expected, actual);
+    }
+}

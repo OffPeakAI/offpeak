@@ -88,3 +88,80 @@ function pick(logits: Float64Array, temperature: number, draw: number) {
   }
   return MOCK_VOCAB - 1
 }
+
+/** How long a reply to this prompt runs before the token limit. */
+function naturalLength(prompt: number) {
+  return 12 + (mix(prompt, 0x1e46) % 340)
+}
+
+export function generateTokens(spec: MockLogits, prompt: number, run: number, temperature: number, maxTokens: number): number[] {
+  const rng = mulberry32(mix(prompt, run))
+  const length = Math.min(maxTokens, naturalLength(prompt))
+  const logits = new Float64Array(MOCK_VOCAB)
+  const tokens: number[] = []
+  let prev = -1
+  for (let pos = 0; pos < length; pos++) {
+    fillLogits(logits, spec, prompt, prev, pos)
+    prev = pick(logits, temperature, rng())
+    tokens.push(prev)
+  }
+  return tokens
+}
+
+/** log p(token | prefix) for each token, teacher forced. */
+export function scoreTokens(spec: MockLogits, prompt: number, tokens: readonly number[]): number[] {
+  const logits = new Float64Array(MOCK_VOCAB)
+  const out: number[] = []
+  let prev = -1
+  for (let pos = 0; pos < tokens.length; pos++) {
+    fillLogits(logits, spec, prompt, prev, pos)
+    const token = tokens[pos]!
+    out.push(logits[token]! - logNormaliser(logits, 1))
+    prev = token
+  }
+  return out
+}
+
+export function tokensToText(tokens: readonly number[]) {
+  return tokens.map((token) => WORDS[token]).join(" ")
+}
+
+/** Any text can be scored: a word outside the vocabulary lands on a fixed token. */
+export function textToTokens(text: string) {
+  const parts = text.split(/\s+/).filter(Boolean)
+  return parts.map((part) => WORD_INDEX.get(part) ?? seedOf(part) % MOCK_VOCAB)
+}
+
+export type MockServing = {
+  /** Share of responses served by the stand-in. */
+  swapRate?: number
+  swapModel?: MockVariant
+  gpuNoise?: number
+  gpuSeed?: number
+}
+
+export function serveTokens(serving: MockServing, prompt: number, run: number, temperature: number, maxTokens: number) {
+  const swapped = mix(run, 0x53a9) / 0xffffffff < (serving.swapRate ?? 0)
+  const spec: MockLogits = {
+    variant: swapped ? (serving.swapModel ?? "small") : "full",
+    gpuNoise: serving.gpuNoise ?? 0,
+    gpuSeed: serving.gpuSeed ?? 0,
+  }
+  return { tokens: generateTokens(spec, prompt, run, temperature, maxTokens), swapped }
+}
+
+/** `--swap-rate 0.1 --swap-model small --gpu-noise 0.05` for `--mock-engine`. */
+export function mockServingArgs(argv: readonly string[]): MockServing | undefined {
+  const value = (name: string) => {
+    const at = argv.indexOf(name)
+    return at >= 0 ? argv[at + 1] : undefined
+  }
+  const rate = value("--swap-rate")
+  const model = value("--swap-model")
+  const noise = value("--gpu-noise")
+  if (rate === undefined && model === undefined && noise === undefined) return undefined
+  const swapRate = Number(rate ?? 0)
+  if (!(swapRate >= 0 && swapRate <= 1)) throw new Error("--swap-rate must be between 0 and 1")
+  if (model !== undefined && !(model in CORRELATION)) throw new Error(`unknown --swap-model ${model}`)
+  return { swapRate, swapModel: (model ?? "small") as MockVariant, gpuNoise: Number(noise ?? 0) }
+}

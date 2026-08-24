@@ -95,3 +95,112 @@ export function createHostApp(opts: EngineOpts) {
       sealed: opts.sealed,
     })
   })
+
+  const serveDirect = async (body: Record<string, unknown>, headerValue: string | undefined) => {
+    const header = await verifyRouterReq(headerValue, opts.routerAddress)
+    if (!header) return Response.json({ error: { message: "router signature required", type: "auth", code: "bad_router_req" } }, { status: 401 })
+    if (opts.fail) return Response.json({ error: { message: "backend down", type: "engine", code: "engine_down" } }, { status: 503 })
+    const prompt = JSON.stringify(body.messages ?? body)
+    const tool = Array.isArray(body.tools) && prompt.includes("tool")
+    const long = prompt.includes("longform")
+    const limit = Number(body.max_tokens ?? 4096)
+    const text = opts.serving
+      ? servedText(opts.serving, prompt, header.reqId, body, limit)
+      : body.response_format
+        ? '{"ok":true}'
+        : long
+          ? "x".repeat(Math.min(800, Math.max(320, limit)))
+          : mockText(prompt, opts.swap).slice(0, limit)
+    const toolCalls = tool ? [{ id: "call_1", type: "function", function: { name: "lookup", arguments: '{"q":"1"}' } }] : undefined
+    const counted = body.stream ? null : meterChat(body, text, toolCalls)
+    served.set(header.reqId, {
+      tokensIn: counted?.tokensIn ?? -1,
+      tokensOut: counted?.tokensOut ?? -1,
+      output: text,
+      body,
+      toolCalls,
+    })
+    if (opts.firstByteMs) await new Promise((r) => setTimeout(r, opts.firstByteMs))
+    if (!body.stream) {
+      return Response.json({
+        id: header.reqId,
+        object: "chat.completion",
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: text, tool_calls: toolCalls },
+            finish_reason: tool ? "tool_calls" : "stop",
+          },
+        ],
+        usage: { prompt_tokens: counted!.tokensIn, completion_tokens: counted!.tokensOut, total_tokens: counted!.tokensIn + counted!.tokensOut },
+      })
+    }
+    return streamChunks(header.reqId, text, toolCalls, tool ? "tool_calls" : "stop")
+  }
+  app.post("/offpeak/v1/chat/completions", async (c) => serveDirect(await c.req.json(), c.req.header("x-offpeak-req")))
+
+  app.post("/offpeak/v1/embeddings", async (c) => {
+    const header = await verifyRouterReq(c.req.header("x-offpeak-req"), opts.routerAddress)
+    if (!header) return c.json({ error: { message: "router signature required", type: "auth", code: "bad_router_req" } }, 401)
+    const body = await c.req.json()
+    const inputs = Array.isArray(body.input) ? body.input : [body.input]
+    const data = inputs.map((text: string, index: number) => ({
+      object: "embedding",
+      index,
+      embedding: [String(text).length, 1, 0, 0],
+    }))
+    const tokens = inputs.reduce((sum: number, text: string) => sum + countText(LAUNCH_TOKENIZER, String(text)), 0)
+    served.set(header.reqId, { tokensIn: tokens, tokensOut: 0, output: "" })
+    return c.json({ object: "list", data, model: opts.modelName, usage: { prompt_tokens: tokens, total_tokens: tokens } })
+  })
+
+  // Reference hosts only: per-token log-probabilities of an output under the claimed model.
+  app.post("/offpeak/v1/score", async (c) => {
+    const raw = await c.req.text()
+    if (opts.auditorAddress && !(await verifyAuditScore(c.req.header("x-offpeak-audit"), raw, opts.auditorAddress))) {
+      return c.json({ error: { message: "auditor signature required", type: "auth", code: "bad_auditor_req" } }, 401)
+    }
+    const body = JSON.parse(raw) as { messages?: unknown; output?: unknown }
+    const tokens = textToTokens(String(body.output ?? ""))
+    const spec = { ...CLAIMED, gpuNoise: opts.serving?.gpuNoise ?? 0, gpuSeed: opts.serving?.gpuSeed ?? 0 }
+    const scored = scoreTokens(spec, seedOf(JSON.stringify(body.messages ?? [])), tokens)
+    return c.json({ model: opts.modelName, modelDigest: opts.modelDigest, tokens: tokens.length, ll_mean: scored.reduce((sum, value) => sum + value, 0) / scored.length, logprobs: scored.map((logprob, i) => ({ id: tokens[i], logprob })) })
+  })
+
+  app.post("/offpeak/v1/sign", async (c) => {
+    const body = await c.req.json()
+    const record = parseRecord(body.record)
+    const local = served.get(record.reqId)
+    if (!local) return c.json({ error: "unknown_request" }, 404)
+    if (local.tokensIn < 0) {
+      const counts = meterChat(local.body ?? {}, local.output, local.toolCalls)
+      local.tokensIn = counts.tokensIn
+      local.tokensOut = counts.tokensOut
+    }
+    const hostCounts = { tokensIn: local.tokensIn, tokensOut: local.tokensOut }
+    if (record.modelDigest.toLowerCase() !== opts.modelDigest.toLowerCase()) return c.json({ refused: true, reason: "digest", hostCounts }, 409)
+    // A cut stream stops early on the router's side, so it may bill less output than the host produced, never more.
+    const countsOk = body.partial
+      ? bothCountsOk(record.tokensIn, 0, local.tokensIn, 0) && record.tokensOut <= local.tokensOut
+      : bothCountsOk(record.tokensIn, record.tokensOut, local.tokensIn, local.tokensOut)
+    if (!countsOk) return c.json({ refused: true, reason: "counts", hostCounts }, 409)
+    const sig = await signTyped(opts.operator, {
+      domain: domain("OffpeakUsage", opts.usageLedger),
+      types: usageTypes,
+      primaryType: "UsageRecord",
+      message: recordToMessage(record) as never,
+    })
+    return c.json({ hostSig: sig, hostCounts, leaf: leafFor(record, body.routerSig, sig) })
+  })
+
+  app.post("/offpeak/v1/sealed", async (c) => {
+    const enc = c.req.header("x-offpeak-enc") ?? ""
+    if (seenEnc.has(enc)) return c.json({ error: "replay" }, 409)
+    if (enc) seenEnc.add(enc)
+    const bytes = new Uint8Array(await c.req.arrayBuffer())
+    served.set(c.req.header("x-offpeak-reqid") ?? "sealed", { tokensIn: bytes.length, tokensOut: 4, output: "" })
+    return c.json({ ciphertext: Buffer.from(bytes).toString("base64"), tokensIn: Math.max(1, Math.floor(bytes.length / 4)), tokensOut: 4 })
+  })
+
+  return { app, served }
+}
