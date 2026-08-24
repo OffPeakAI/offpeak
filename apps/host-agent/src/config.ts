@@ -87,3 +87,81 @@ const hostEnvSchema = z.object({
   /** A container's own interface, for `deploy/host/compose.yaml`, which publishes the port on the host's loopback only. */
   OFFPEAK_AGENT_BIND: z.string().min(1).optional(),
 })
+
+export type HostEnv = z.infer<typeof hostEnvSchema>
+
+/** Both sides enforce this at boot: another role's key on this machine stops the agent. */
+export function readHostEnv(env: NodeJS.ProcessEnv): HostEnv {
+  const held = ROLE_KEYS.filter((name) => env[name] && env[name] !== "replace-me")
+  if (held.length > 0) throw new Error("refusing to start with another role key in the environment")
+  return hostEnvSchema.parse(env)
+}
+
+/** Boots fail on a digest nobody could have published, such as all zeros left in a template. */
+export function assertPinnedImage(image: string) {
+  if (!IMAGE.test(image)) throw new Error("image must be vllm/vllm-openai pinned by digest")
+  const digest = image.slice(image.indexOf("sha256:") + "sha256:".length)
+  if (new Set(digest).size < 4) throw new Error("image digest is a placeholder")
+}
+
+const INT_ARGS = ["tensor-parallel-size", "max-model-len"] as const
+
+type VllmArg = { name: keyof Recipe; value: number | string | boolean }
+
+function parseArg(arg: string): VllmArg | null {
+  if (arg === "--enable-prefix-caching") return { name: "enable-prefix-caching", value: true }
+  if (arg === "--no-enable-prefix-caching") return { name: "enable-prefix-caching", value: false }
+  const match = /^--([a-z-]+)=(.+)$/.exec(arg)
+  if (!match) return null
+  const [, name, value] = match
+  if ((INT_ARGS as readonly string[]).includes(name!)) return /^[1-9][0-9]*$/.test(value!) ? { name: name as VllmArg["name"], value: Number(value) } : null
+  if (name === "dtype") return (VLLM_DTYPES as readonly string[]).includes(value!) ? { name, value: value! } : null
+  return null
+}
+
+/** Only the four approved arguments, each once, each with a value the model's recipe allows. */
+export function assertRecipe(model: { vllmArgs: string[] }, recipe: Recipe = {}) {
+  const seen = new Set<string>()
+  for (const arg of model.vllmArgs) {
+    const parsed = parseArg(arg)
+    if (!parsed || seen.has(parsed.name)) throw new Error(`vllm arg not in the recipe: ${arg}`)
+    seen.add(parsed.name)
+    const allowed = recipe[parsed.name] as (number | string | boolean)[] | undefined
+    if (allowed && !allowed.includes(parsed.value)) throw new Error(`vllm arg not in the recipe: ${arg}`)
+  }
+}
+
+export function maxModelLen(model: { vllmArgs: string[] }): number | null {
+  for (const arg of model.vllmArgs) {
+    const parsed = parseArg(arg)
+    if (parsed?.name === "max-model-len") return parsed.value as number
+  }
+  return null
+}
+
+export type LoadedModel = HostModel & { recipeManifest: ModelManifest }
+
+export type HostConfig = Omit<HostYaml, "models"> & { models: LoadedModel[] }
+
+export function parseHostYaml(text: string): HostYaml {
+  return hostYamlSchema.parse(parse(text))
+}
+
+/** Reads and checks `host.yaml`. Every refusal here stops the boot. */
+export function loadHostConfig(path: string, env: HostEnv): HostConfig {
+  const file = parseHostYaml(readFileSync(path, "utf8"))
+  assertPinnedImage(file.image)
+  const local = env.OFFPEAK_ENV === "local"
+  if (file.gpuClass === DEV_ONLY_GPU_CLASS && !local) throw new Error(`${DEV_ONLY_GPU_CLASS} is not routable outside local`)
+  if (!local && !file.endpoint.startsWith("https://")) throw new Error("endpoint must be https outside local")
+  if (!local && !LOOPBACK.includes(file.listen.host)) throw new Error("listen.host must be loopback outside local: the agent speaks plain HTTP, so a TLS proxy goes in front of it")
+  if (env.OFFPEAK_HOST_ENDPOINT && env.OFFPEAK_HOST_ENDPOINT !== file.endpoint) throw new Error("OFFPEAK_HOST_ENDPOINT differs from host.yaml")
+  if (privateKeyToAddress(env.OFFPEAK_HOST_OPERATOR_KEY as Hex).toLowerCase() !== file.operator) throw new Error("operator key does not match host.yaml")
+  const models = file.models.map((model) => {
+    const recipeManifest = readManifest(model.manifest)
+    if (recipeManifest.name !== model.name) throw new Error(`manifest is for ${recipeManifest.name}, not ${model.name}`)
+    assertRecipe(model, recipeManifest.recipe)
+    return { ...model, recipeManifest }
+  })
+  return { ...file, models }
+}
