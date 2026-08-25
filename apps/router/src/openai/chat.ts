@@ -212,3 +212,178 @@ async function billSafely(ctx: Ctx, opened: Opened, priced: Priced, output: Asse
     return null
   }
 }
+
+const BILL_CONCURRENCY = 16
+const billingLanes = new Map<string, { running: number; waiting: Array<() => void> }>()
+
+/** Bills wait their turn per host, so a burst cannot starve first tokens and one stuck host cannot stop the rest. */
+async function inBillingTurn<T>(host: string, work: () => Promise<T>): Promise<T> {
+  await new Promise<void>((resolve) => setTimeout(resolve, 0))
+  const lane = billingLanes.get(host) ?? { running: 0, waiting: [] }
+  billingLanes.set(host, lane)
+  if (lane.running >= BILL_CONCURRENCY) await new Promise<void>((resolve) => lane.waiting.push(resolve))
+  lane.running += 1
+  try {
+    return await work()
+  } finally {
+    lane.running -= 1
+    lane.waiting.shift()?.()
+  }
+}
+
+const chunkBody = (reqId: Hex, modelName: string, created: number, delta: object, finish: string | null) => ({ id: reqId, object: "chat.completion.chunk", created, model: modelName, choices: [{ index: 0, delta, finish_reason: finish }] })
+
+function chunk(reqId: Hex, modelName: string, created: number, delta: object, finish: string | null) {
+  return `data: ${JSON.stringify(chunkBody(reqId, modelName, created, delta, finish))}\n\n`
+}
+
+/** Stock OpenAI readers parse every `data:` line as a chunk whatever its event name, so Offpeak's events are also empty chunks. */
+function offpeakEvent(name: string, reqId: Hex, modelName: string, created: number, finish: string, fields: object) {
+  return `event: ${name}\ndata: ${JSON.stringify({ ...chunkBody(reqId, modelName, created, {}, finish), ...fields })}\n\n`
+}
+
+const requestLimitMs = () => (MAX_REQUEST_S - BILLING_MARGIN_S) * 1000
+
+/** Counts a Window's output as it passes, so a long stream lands in the minutes it actually ran. */
+function meterWindow(ctx: Ctx, event: HostEvent, piece: string) {
+  if (ctx.flow && (piece || event.choices?.[0]?.delta?.tool_calls)) ctx.flow.tokens(countText(ctx.tokenizer, piece) || 1)
+}
+
+function streamResponse(ctx: Ctx, opened: Opened, priced: Priced, entered: number, headers: Record<string, string>) {
+  const { stack, reqId, started, modelName, pay, feeBps } = ctx
+  const output = emptyAssembly()
+  let cancelled = false
+  return new Response(
+    new ReadableStream({
+      async start(controller) {
+        const encoder = new TextEncoder()
+        const send = (line: string) => {
+          if (!cancelled) controller.enqueue(encoder.encode(line))
+        }
+        const close = () => {
+          if (!cancelled) controller.close()
+        }
+        const limit = setTimeout(() => opened.abort(), requestLimitMs())
+        let tokensOut = 0
+        let first = false
+        let gated = false
+        let failure: string | null = null
+        let cut = false
+        const gate = async () => {
+          gated = true
+          const answer = await waitAuthorized(stack, pay.payRef, stack.preconfirmTimeoutMs)
+          if (answer !== "ok") failure = "authorize_failed"
+        }
+        const relay = async (event: HostEvent) => {
+          const toolDeltas = event.choices?.[0]?.delta?.tool_calls
+          const piece = absorb(output, event)
+          if (!piece && !toolDeltas) return
+          meterWindow(ctx, event, piece)
+          const delta = toolDeltas ? { ...(piece ? { content: piece } : {}), tool_calls: toolDeltas } : { content: piece }
+          // OpenAI's stream helpers need the role on the first chunk to rebuild the message.
+          send(chunk(reqId, modelName, started, first ? delta : { role: "assistant", ...delta }, null))
+          if (stack.serverTtftMs && !first) stack.serverTtftMs.push(performance.now() - entered)
+          first = true
+          if (pay.kind === "upto" && !gated) {
+            tokensOut += countText(ctx.tokenizer, piece) || 1
+            const running = quoteCost({ tokensIn: ctx.tokensIn, tokensOut, priceIn: priced.price.in, priceOut: priced.price.out, feeBps })
+            if (preconfirmReached(tokensOut, running.totalMicro)) await gate()
+          }
+        }
+        try {
+          await relay(opened.first)
+          if (!failure) {
+            for await (const event of opened.events) {
+              if (cancelled) break
+              await relay(event)
+              if (failure) break
+            }
+          }
+        } catch {
+          cut = true
+        }
+        clearTimeout(limit)
+        // A buyer who walks away before a token says nothing about the host.
+        if (cancelled) ctx.flow?.drop()
+        else ctx.flow?.end()
+        stack.load.leave(opened.host, ctx.model.digest)
+        // A reply under the budget still needs its authorization before it can bill.
+        if (pay.kind === "upto" && !gated && !failure) await gate()
+        if (failure) {
+          opened.abort()
+          await release(stack, pay).catch(() => undefined)
+          send(`event: error\ndata: ${JSON.stringify({ error: { message: "Authorization did not arrive", code: failure } })}\n\n`)
+          close()
+          return
+        }
+        const partial = cut || cancelled
+        const billed = await inBillingTurn(opened.host, () => billSafely(ctx, opened, priced, output, opened.ttftMs, partial))
+        const jsonError = partial ? null : assertJsonOutput(output.text, ctx.body.response_format as never, output.finish ?? "stop")
+        if (!billed) send(`event: error\ndata: ${JSON.stringify({ error: { message: "Host did not sign", code: "unbilled" } })}\n\n`)
+        else {
+          if (jsonError) send(`event: error\ndata: ${JSON.stringify({ error: { message: jsonError, code: "bad_json" } })}\n\n`)
+          const finish = partial ? "length" : (output.finish ?? "stop")
+          const { tokensIn: prompt_tokens, tokensOut: completion_tokens } = billed.counts
+          send(chunk(reqId, modelName, started, {}, finish))
+          if (billed.channelOwed !== undefined) send(offpeakEvent("offpeak.channel", reqId, modelName, started, finish, { owed: billed.channelOwed.toString() }))
+          send(offpeakEvent("offpeak.usage", reqId, modelName, started, finish, { usage: { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens }, ...billed.envelope }))
+          send(`data: [DONE]\n\n`)
+        }
+        close()
+      },
+      cancel() {
+        cancelled = true
+        opened.abort()
+      },
+    }),
+    { headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", ...headers } },
+  )
+}
+
+async function jsonResponse(ctx: Ctx, opened: Opened, priced: Priced, headers: Record<string, string>) {
+  const { stack, reqId, started, modelName, pay } = ctx
+  const output = emptyAssembly()
+  meterWindow(ctx, opened.first, absorb(output, opened.first))
+  const limit = setTimeout(() => opened.abort(), requestLimitMs())
+  let cut = false
+  try {
+    for await (const event of opened.events) meterWindow(ctx, event, absorb(output, event))
+  } catch {
+    cut = true
+    output.finish = "length"
+  }
+  clearTimeout(limit)
+  ctx.flow?.end()
+  stack.load.leave(opened.host, ctx.model.digest)
+  if (pay.kind === "upto" && (await waitAuthorized(stack, pay.payRef, stack.preconfirmTimeoutMs)) !== "ok") {
+    await release(stack, pay).catch(() => undefined)
+    return oai(402, "Authorization did not arrive", "payment", "authorize_failed")
+  }
+  const jsonError = assertJsonOutput(output.text, ctx.body.response_format as never, output.finish ?? "stop")
+  if (jsonError) {
+    await release(stack, pay)
+    return oai(502, jsonError, "engine", "bad_json")
+  }
+  const billed = await billSafely(ctx, opened, priced, output, opened.ttftMs, cut)
+  if (!billed) return oai(502, "Host did not sign", "engine", "unbilled")
+  const { envelope, channelOwed, counts } = billed
+  const toolCalls = output.toolCalls.length > 0 ? output.toolCalls : undefined
+  return Response.json(
+    {
+      id: reqId,
+      object: "chat.completion",
+      created: started,
+      model: modelName,
+      choices: [{ index: 0, message: { role: "assistant", content: toolCalls && !output.text ? null : output.text, tool_calls: toolCalls }, finish_reason: output.finish ?? (toolCalls ? "tool_calls" : "stop") }],
+      usage: { prompt_tokens: counts.tokensIn, completion_tokens: counts.tokensOut, total_tokens: counts.tokensIn + counts.tokensOut },
+      offpeak_usage: envelope,
+    },
+    {
+      headers: {
+        "x-offpeak-usage": Buffer.from(JSON.stringify(envelope)).toString("base64url"),
+        ...headers,
+        ...(channelOwed !== undefined ? { "x-offpeak-channel-owed": channelOwed.toString() } : {}),
+      },
+    },
+  )
+}
