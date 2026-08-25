@@ -471,3 +471,223 @@ contract AuditCourtTest is CourtFixture {
         assertEq(v.pendingCredits, 8e6);
         assertEq(usdg.balanceOf(challenger), CHALLENGE_BOND);
     }
+
+    function test_aLateRulingStillGetsTheFullReviewAndConfirmWindow() public {
+        uint256 id = _file(host, SWAP);
+        vm.warp(block.timestamp + 13 days);
+        _rule(id, OUTCOME_SWAP, 10_000, NO_ROOT);
+        vm.warp(block.timestamp + 14 days - 1);
+        vm.expectRevert(abi.encodeWithSelector(AuditCourt.NotFinalizable.selector, id));
+        auditCourt.finalize(id);
+
+        vm.warp(block.timestamp + 1);
+        auditCourt.finalize(id);
+        assertEq(uint8(auditCourt.challengeView(id).state), uint8(AuditCourt.State.Finalized));
+    }
+
+    function test_aRulingAfterAWeekCanStillBeConfirmed() public {
+        uint256 id = _file(host, SWAP);
+        vm.warp(block.timestamp + 7 days);
+        _rule(id, OUTCOME_SWAP, 10_000, NO_ROOT);
+        _reviewDone(id);
+        vm.expectRevert(abi.encodeWithSelector(AuditCourt.NotFinalizable.selector, id));
+        auditCourt.finalize(id);
+        _decide(id, CONFIRM, 10_000, NO_ROOT);
+        auditCourt.finalize(id);
+        assertEq(registry.hostView(host).bondUsdg, 0);
+    }
+
+    function test_stackedBreachRulingsCannotPassTheSecondStrike() public {
+        uint256[] memory ids = new uint256[](5);
+        for (uint256 i; i < 5; ++i) {
+            ids[i] = _file(host, BREACH);
+        }
+        uint256 bond = registry.hostView(host).bondUsdg;
+        vm.warp(block.timestamp + 24 hours);
+        for (uint256 i; i < 5; ++i) {
+            _rule(ids[i], 1, 2_000, NO_ROOT);
+        }
+        assertEq(registry.hostView(host).bondUsdg, bond * 8 / 10 * 8 / 10);
+    }
+
+    function test_aFullSlashForfeitsCreditsReleasedDuringTheDispute() public {
+        _accrue(host, 1_000e6);
+        uint256 id = _file(host, SWAP);
+        vm.warp(block.timestamp + 25 hours);
+        _rule(id, OUTCOME_SWAP, 10_000, NO_ROOT);
+        _reviewDone(id);
+        _decide(id, CONFIRM, 10_000, NO_ROOT);
+        auditCourt.finalize(id);
+
+        vm.prank(host);
+        vm.expectRevert(abi.encodeWithSelector(HostRegistry.CreditsForfeited.selector, host));
+        registry.withdrawCredits();
+        uint256 reserve = vault.protocolReserve();
+        registry.sweepForfeitedCredits(host);
+        assertEq(vault.protocolReserve(), reserve + 1_000e6);
+    }
+
+    function test_onlyAForfeitedHostCanBeSwept() public {
+        vm.expectRevert(abi.encodeWithSelector(HostRegistry.NotForfeited.selector, host));
+        registry.sweepForfeitedCredits(host);
+    }
+
+    function test_aFrozenChallengerCannotLockTheHost() public {
+        uint256 id = _file(host, BREACH);
+        vm.warp(block.timestamp + 24 hours);
+        vm.mockCallRevert(address(usdg), abi.encodeWithSelector(usdg.transfer.selector, challenger, 50e6), "frozen");
+        _rule(id, 0, 0, NO_ROOT);
+        vm.clearMockedCalls();
+        assertEq(registry.hostView(host).openChallenges, 0);
+        assertEq(auditCourt.owed(challenger), 50e6);
+        uint256 before = usdg.balanceOf(challenger);
+        vm.prank(challenger);
+        auditCourt.claimOwed();
+        assertEq(usdg.balanceOf(challenger) - before, 50e6);
+    }
+
+    function test_aRefundTreeLargerThanTheSlashPaysWhatIsLeft() public {
+        (bytes32 root, bytes32[] memory proofA, bytes32[] memory proofB) = _refundTree(300e6, 300e6);
+        uint256 id = _file(host, BREACH);
+        vm.warp(block.timestamp + 24 hours);
+        _rule(id, 1, 2_000, root);
+        uint256 pool = auditCourt.challengeView(id).refundable;
+        assertLt(pool, 600e6);
+        auditCourt.claimRefund(id, buyerA, 300e6, proofA);
+        auditCourt.claimRefund(id, buyerB, 300e6, proofB);
+        assertEq(auditCourt.challengeView(id).refundable, 0);
+        assertEq(usdg.balanceOf(buyerB), pool - 300e6);
+    }
+    function test_aChallengeNobodyRuledOnAlsoTimesOut() public {
+        uint256 id = _file(host, CANARY);
+        vm.warp(block.timestamp + 14 days);
+        auditCourt.finalize(id);
+        assertEq(registry.hostView(host).openChallenges, 0);
+        assertEq(usdg.balanceOf(challenger), CHALLENGE_BOND);
+    }
+
+    function test_aDecisionCanStillLandAfterTheTimeoutUntilSomeoneFinalizes() public {
+        uint256 id = _inReview();
+        vm.warp(block.timestamp + 15 days);
+        _decide(id, CONFIRM, 10_000, NO_ROOT);
+        auditCourt.finalize(id);
+        assertEq(registry.hostView(host).bondUsdg, 0);
+    }
+
+    // Refunds
+
+    function test_buyersClaimFromTheSlash() public {
+        (bytes32 root, bytes32[] memory proofA, bytes32[] memory proofB) = _refundTree(300e6, 100e6);
+        uint256 id = _responded(CANARY);
+        _rule(id, BREACH, 2_000, root);
+
+        vm.expectEmit(address(auditCourt));
+        emit IAuditCourt.RefundClaimed(id, buyerA, 300e6);
+        vm.prank(makeAddr("anyone"));
+        auditCourt.claimRefund(id, buyerA, 300e6, proofA);
+        auditCourt.claimRefund(id, buyerB, 100e6, proofB);
+        assertEq(usdg.balanceOf(buyerA), 300e6);
+        assertEq(usdg.balanceOf(buyerB), 100e6);
+        assertEq(auditCourt.challengeView(id).refundable, 0);
+    }
+
+    function test_aRefundPaysOnce() public {
+        (bytes32 root, bytes32[] memory proofA,) = _refundTree(300e6, 100e6);
+        uint256 id = _responded(CANARY);
+        _rule(id, BREACH, 2_000, root);
+        auditCourt.claimRefund(id, buyerA, 300e6, proofA);
+        vm.expectRevert(abi.encodeWithSelector(AuditCourt.AlreadyClaimed.selector, id, buyerA));
+        auditCourt.claimRefund(id, buyerA, 300e6, proofA);
+    }
+
+    function test_aRefundNeedsAValidProof() public {
+        (bytes32 root, bytes32[] memory proofA,) = _refundTree(300e6, 100e6);
+        uint256 id = _responded(CANARY);
+        _rule(id, BREACH, 2_000, root);
+        vm.expectRevert(AuditCourt.BadRefundProof.selector);
+        auditCourt.claimRefund(id, buyerA, 300e6 + 1, proofA);
+    }
+
+    function test_aRefundNeverPaysMoreThanTheSlash() public {
+        (bytes32 root, bytes32[] memory proofA,) = _refundTree(400e6 + 1, 1);
+        uint256 id = _responded(CANARY);
+        _rule(id, BREACH, 2_000, root);
+        auditCourt.claimRefund(id, buyerA, 400e6 + 1, proofA);
+        assertEq(usdg.balanceOf(buyerA), 400e6);
+        assertEq(auditCourt.challengeView(id).refundable, 0);
+    }
+
+    function test_refundsWaitForTheChallengeToClose() public {
+        uint256 id = _inReview();
+        vm.expectRevert(abi.encodeWithSelector(AuditCourt.WrongState.selector, id, AuditCourt.State.PanelReview));
+        auditCourt.claimRefund(id, buyerA, 1, new bytes32[](0));
+    }
+
+    function test_unclaimedRefundsSweepToTheTreasuryAfterNinetyDays() public {
+        uint256 id = _responded(CANARY);
+        _rule(id, BREACH, 2_000, keccak256("root"));
+        uint64 availableAt = uint64(block.timestamp + 90 days);
+        vm.warp(availableAt - 1);
+        vm.expectRevert(abi.encodeWithSelector(AuditCourt.SweepTooEarly.selector, availableAt));
+        auditCourt.sweep(id);
+
+        vm.warp(availableAt);
+        auditCourt.sweep(id);
+        assertEq(usdg.balanceOf(treasury), 400e6);
+        assertEq(auditCourt.challengeView(id).refundable, 0);
+    }
+
+    function test_sweepNeedsAClosedChallenge() public {
+        uint256 id = _inReview();
+        vm.expectRevert(abi.encodeWithSelector(AuditCourt.WrongState.selector, id, AuditCourt.State.PanelReview));
+        auditCourt.sweep(id);
+    }
+
+    // Roles
+
+    function test_ownerSetsSignersAndPanelThroughChecks() public {
+        address[3] memory next = [address(0x11), address(0x22), address(0x33)];
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
+        auditCourt.proposeSigners(next, address(1));
+
+        vm.startPrank(owner);
+        vm.expectRevert(AuditCourt.UnsortedSigners.selector);
+        auditCourt.proposeSigners([address(0x22), address(0x11), address(0x33)], address(1));
+        auditCourt.proposeSigners(next, address(1));
+        vm.stopPrank();
+    }
+
+    function test_signerChangesOutlastTheHostUnbonding() public {
+        assertGt(auditCourt.SIGNER_DELAY(), registry.UNBONDING());
+        address[3] memory next = [address(0x11), address(0x22), address(0x33)];
+        vm.expectRevert(abi.encodeWithSelector(AuditCourt.SignersNotDue.selector, uint64(0)));
+        auditCourt.applySigners();
+        vm.prank(owner);
+        auditCourt.proposeSigners(next, address(1));
+        uint64 dueAt = auditCourt.signersDueAt();
+        vm.warp(dueAt - 1);
+        vm.expectRevert(abi.encodeWithSelector(AuditCourt.SignersNotDue.selector, dueAt));
+        auditCourt.applySigners();
+        vm.warp(dueAt);
+        vm.expectEmit(address(auditCourt));
+        emit IAuditCourt.SignersChanged(rulers, next);
+        auditCourt.applySigners();
+        assertEq(auditCourt.panel(), address(1));
+        assertEq(auditCourt.rulers(0), address(0x11));
+        vm.expectRevert(abi.encodeWithSelector(AuditCourt.SignersNotDue.selector, uint64(0)));
+        auditCourt.applySigners();
+    }
+
+    function test_constructorRejectsUnsortedRulers() public {
+        vm.expectRevert(AuditCourt.UnsortedSigners.selector);
+        new AuditCourt(
+            owner,
+            IERC20(address(usdg)),
+            IHostRegistry(address(registry)),
+            IOffpeakVault(address(vault)),
+            [address(0x22), address(0x11), address(0x33)],
+            address(panel),
+            treasury
+        );
+    }
+}
