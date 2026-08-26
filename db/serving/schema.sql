@@ -309,3 +309,203 @@ CREATE TABLE IF NOT EXISTS serving.sheet_counts (
   n integer NOT NULL,
   PRIMARY KEY (host, week)
 );
+
+CREATE TABLE IF NOT EXISTS serving.owed_boundaries (
+  channel_id text NOT NULL,
+  cumulative bigint NOT NULL,
+  req_ids text[] NOT NULL,
+  PRIMARY KEY (channel_id, cumulative)
+);
+
+CREATE TABLE IF NOT EXISTS serving.channel_reservations (
+  id text PRIMARY KEY,
+  channel_id text NOT NULL,
+  amount bigint NOT NULL,
+  expires_at bigint NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS channel_reservations_channel_idx ON serving.channel_reservations (channel_id);
+
+CREATE TABLE IF NOT EXISTS serving.pending_captures (
+  req_id text PRIMARY KEY,
+  kind text NOT NULL CHECK (kind IN ('prepaid', 'upto')),
+  wallet text NOT NULL,
+  hold_id text,
+  hour bigint NOT NULL,
+  amount bigint NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS serving.window_minutes (
+  window_id numeric(78,0) NOT NULL,
+  minute bigint NOT NULL,
+  tokens bigint NOT NULL DEFAULT 0,
+  busy_ms bigint NOT NULL DEFAULT 0,
+  demanded boolean NOT NULL DEFAULT false,
+  written boolean NOT NULL DEFAULT false,
+  PRIMARY KEY (window_id, minute)
+);
+CREATE INDEX IF NOT EXISTS window_minutes_unwritten_idx ON serving.window_minutes (minute) WHERE NOT written;
+
+-- Brings a database made before these columns existed up to date.
+ALTER TABLE serving.requests
+  ADD COLUMN IF NOT EXISTS host_counts jsonb;
+ALTER TABLE serving.channels_local
+  ADD COLUMN IF NOT EXISTS frozen_until bigint NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS close_final bigint,
+  ADD COLUMN IF NOT EXISTS close_deadline bigint,
+  ADD COLUMN IF NOT EXISTS close_payer_sig text,
+  ADD COLUMN IF NOT EXISTS close_router_sig text,
+  ADD COLUMN IF NOT EXISTS close_settled boolean NOT NULL DEFAULT false,
+  ADD COLUMN IF NOT EXISTS contract_voucher boolean NOT NULL DEFAULT false;
+ALTER TABLE serving.jobs
+  ADD COLUMN IF NOT EXISTS cap_locked boolean NOT NULL DEFAULT false;
+ALTER TABLE serving.x402_requests
+  ADD COLUMN IF NOT EXISTS valid_before bigint,
+  ADD COLUMN IF NOT EXISTS created_at bigint NOT NULL DEFAULT 0;
+ALTER TABLE serving.disputes
+  ADD COLUMN IF NOT EXISTS refund_micro bigint NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS checks jsonb NOT NULL DEFAULT '[]',
+  ADD COLUMN IF NOT EXISTS created_at bigint NOT NULL DEFAULT 0;
+
+-- Auditor. Columns added here, not above, so a database from an earlier step upgrades on boot.
+
+ALTER TABLE serving.audit_samples ADD COLUMN IF NOT EXISTS ts bigint NOT NULL DEFAULT 0;
+ALTER TABLE serving.audit_samples ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();
+ALTER TABLE serving.audit_samples ADD COLUMN IF NOT EXISTS scored_at timestamptz;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_constraint WHERE conname = 'audit_samples_within_72h') THEN
+    ALTER TABLE serving.audit_samples ADD CONSTRAINT audit_samples_within_72h CHECK (expires_at <= created_at + interval '72 hours');
+  END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS audit_samples_expiry_idx ON serving.audit_samples (expires_at);
+
+-- One row per UTC day. Deleting the row destroys that day's key.
+CREATE TABLE IF NOT EXISTS serving.audit_day_keys (
+  id         text PRIMARY KEY,
+  day        integer NOT NULL UNIQUE,
+  wrapped    text NOT NULL,
+  retire_at  timestamptz NOT NULL
+);
+
+ALTER TABLE serving.canary_accounts ADD COLUMN IF NOT EXISTS opened_at bigint NOT NULL DEFAULT 0;
+ALTER TABLE serving.canary_accounts ADD COLUMN IF NOT EXISTS active boolean NOT NULL DEFAULT true;
+
+-- Accepted answers for one deterministic prompt, as observed on reference hosts.
+CREATE TABLE IF NOT EXISTS serving.canary_expected (
+  prompt_id    text NOT NULL,
+  model_digest text NOT NULL,
+  body         jsonb NOT NULL,
+  accepted     jsonb NOT NULL,
+  gpu_classes  jsonb NOT NULL,
+  observed_at  bigint NOT NULL,
+  PRIMARY KEY (prompt_id, model_digest)
+);
+
+ALTER TABLE serving.canary_runs ADD COLUMN IF NOT EXISTS req_id text;
+ALTER TABLE serving.canary_runs ADD COLUMN IF NOT EXISTS model_digest text NOT NULL DEFAULT '';
+ALTER TABLE serving.canary_runs ADD COLUMN IF NOT EXISTS prompt_id text NOT NULL DEFAULT '';
+ALTER TABLE serving.canary_runs ADD COLUMN IF NOT EXISTS deterministic boolean NOT NULL DEFAULT false;
+ALTER TABLE serving.canary_runs ADD COLUMN IF NOT EXISTS body jsonb;
+ALTER TABLE serving.canary_runs ADD COLUMN IF NOT EXISTS tool_calls jsonb;
+ALTER TABLE serving.canary_runs ADD COLUMN IF NOT EXISTS wallet text NOT NULL DEFAULT '';
+ALTER TABLE serving.canary_runs ADD COLUMN IF NOT EXISTS tokens_out integer NOT NULL DEFAULT 0;
+ALTER TABLE serving.canary_runs ADD COLUMN IF NOT EXISTS ts bigint NOT NULL DEFAULT 0;
+ALTER TABLE serving.canary_runs ADD COLUMN IF NOT EXISTS scored_at timestamptz;
+
+CREATE UNIQUE INDEX IF NOT EXISTS canary_runs_req_idx ON serving.canary_runs (req_id);
+CREATE INDEX IF NOT EXISTS canary_runs_host_idx ON serving.canary_runs (host, model_digest, ts);
+
+-- The shape of live requests, never their content. Canary parameters are drawn from these counts.
+CREATE TABLE IF NOT EXISTS serving.audit_traffic (
+  model_digest text NOT NULL,
+  week         integer NOT NULL,
+  shape        text NOT NULL,
+  n            bigint NOT NULL,
+  PRIMARY KEY (model_digest, week, shape)
+);
+
+CREATE TABLE IF NOT EXISTS serving.audit_reference_hosts (
+  host         text NOT NULL,
+  model_digest text NOT NULL,
+  endpoint     text NOT NULL,
+  gpu_class    text NOT NULL,
+  image_digest text NOT NULL,
+  attested     boolean NOT NULL DEFAULT false,
+  PRIMARY KEY (host, model_digest)
+);
+
+ALTER TABLE serving.audit_scores ALTER COLUMN z DROP NOT NULL;
+ALTER TABLE serving.audit_scores ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'sample';
+ALTER TABLE serving.audit_scores ADD COLUMN IF NOT EXISTS ts bigint NOT NULL DEFAULT 0;
+ALTER TABLE serving.audit_scores ADD COLUMN IF NOT EXISTS gpu_class text NOT NULL DEFAULT '';
+ALTER TABLE serving.audit_scores ADD COLUMN IF NOT EXISTS image_digest text NOT NULL DEFAULT '';
+ALTER TABLE serving.audit_scores ADD COLUMN IF NOT EXISTS temp_bucket text NOT NULL DEFAULT '';
+ALTER TABLE serving.audit_scores ADD COLUMN IF NOT EXISTS len_bucket text NOT NULL DEFAULT '';
+ALTER TABLE serving.audit_scores ADD COLUMN IF NOT EXISTS baseline_version text;
+
+CREATE INDEX IF NOT EXISTS audit_scores_week_idx ON serving.audit_scores (host, model_digest, ts, req_id);
+
+-- A second reference host's score of the same response.
+CREATE TABLE IF NOT EXISTS serving.audit_replications (
+  req_id   text NOT NULL,
+  ref_host text NOT NULL,
+  ll_mean  double precision NOT NULL,
+  z        double precision,
+  PRIMARY KEY (req_id, ref_host)
+);
+
+ALTER TABLE serving.audit_runs ADD COLUMN IF NOT EXISTS stopped_at integer;
+ALTER TABLE serving.audit_runs ADD COLUMN IF NOT EXISTS stopped_ts bigint;
+ALTER TABLE serving.audit_runs ADD COLUMN IF NOT EXISTS boost_until bigint;
+ALTER TABLE serving.audit_runs ADD COLUMN IF NOT EXISTS state text NOT NULL DEFAULT 'open';
+
+CREATE TABLE IF NOT EXISTS serving.audit_calibrations (
+  id           text PRIMARY KEY,
+  model_digest text NOT NULL,
+  source       text NOT NULL CHECK (source IN ('hardware', 'live', 'simulation')),
+  ready        boolean NOT NULL,
+  report       jsonb NOT NULL,
+  created_at   timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS audit_calibrations_model_idx ON serving.audit_calibrations (model_digest, created_at DESC);
+
+-- Failed scoring tries, so one row that keeps failing cannot sit at the head of every pass.
+ALTER TABLE serving.audit_samples ADD COLUMN IF NOT EXISTS score_attempts integer NOT NULL DEFAULT 0;
+ALTER TABLE serving.audit_samples ADD COLUMN IF NOT EXISTS retry_at bigint NOT NULL DEFAULT 0;
+ALTER TABLE serving.canary_runs ADD COLUMN IF NOT EXISTS score_attempts integer NOT NULL DEFAULT 0;
+ALTER TABLE serving.canary_runs ADD COLUMN IF NOT EXISTS retry_at bigint NOT NULL DEFAULT 0;
+
+-- Written before a challenge goes out. The checks refuse a swap row without both signals, whatever
+-- the code above it does, and the key stops a crash or a rerun from filing the same case twice.
+CREATE TABLE IF NOT EXISTS serving.audit_filings (
+  id                 text PRIMARY KEY,
+  host               text NOT NULL,
+  model_digest       text NOT NULL,
+  week               integer NOT NULL,
+  kind               smallint NOT NULL CHECK (kind IN (0, 1, 2)),
+  samples_root       text NOT NULL,
+  evidence           jsonb NOT NULL,
+  signal_sequential  boolean NOT NULL DEFAULT false,
+  signal_canary      boolean NOT NULL DEFAULT false,
+  signal_replication boolean NOT NULL DEFAULT false,
+  status             text NOT NULL CHECK (status IN ('prepared', 'sent', 'filed', 'failed')),
+  tx_hash            text,
+  challenge_id       text,
+  outcome            text,
+  from_block         bigint NOT NULL,
+  error              text,
+  created_at         timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (host, model_digest, week, kind),
+  CONSTRAINT swap_needs_two_signals CHECK (kind <> 0 OR (signal_sequential AND (signal_canary OR signal_replication)))
+);
+
+-- The signed transaction, written before it is broadcast, so a resend can only ever be the same one.
+ALTER TABLE serving.audit_filings ADD COLUMN IF NOT EXISTS signed_tx text;
+
+-- A refused signature leaves no usage record, so the flag has to carry its own time.
+ALTER TABLE serving.metering_flags ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();

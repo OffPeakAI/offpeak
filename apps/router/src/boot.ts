@@ -125,3 +125,61 @@ export async function bootRouter(source: NodeJS.ProcessEnv = process.env) {
   watchChain(stack)
   const pushes = subscribePushes(env.OFFPEAK_REDIS_URL, chain)
   const app = createApp(stack)
+
+  const guarded = (name: string, work: () => Promise<unknown>) => () => {
+    work().catch((err) => console.error(JSON.stringify({ service: "router", event: `${name}_failed`, error: String(err) })))
+  }
+  const refresh = guarded("refresh", async () => {
+    stack.sheets = await loadSheets(db)
+    const next = await loadEndpoints(db)
+    endpoints.clear()
+    for (const [host, endpoint] of next) endpoints.set(host, endpoint)
+  })
+  const probe = guarded("probe", () => probeHosts(stack))
+  const sweep = guarded("capture_sweep", async () => {
+    await sweepCaptures(stack)
+    await sweepExact(stack)
+    await sweepCloses(db, stack.clock())
+  })
+  const windows = guarded("window_sweep", () => sweepWindows(stack))
+  const load = guarded("load_record", () => recordLoad(stack))
+  const stats = guarded("host_stats", () => writeHostStats(stack))
+  const retain = guarded("retention", async () => {
+    await sweepFiles(stack)
+    await trimLoad(stack)
+  })
+  const heal = guarded("spend_rebuild", () => rebuildSpend(db, redis, hourIndex(stack.clock()) - 48))
+  const attest = guarded("attest_sweep", () => sweepAttestations(stack))
+  const closeHours = guarded("hour_close", async () => {
+    const last = hourIndex(stack.clock() - HOUR_CLOSE_GRACE_S) - 1
+    await closeHour(db, last, stack.router, stack.usageLedger)
+  })
+  await probeHosts(stack).catch(() => undefined)
+  stats()
+  // In the background, because a fresh quote can take a minute. Sealed requests wait for it, nothing else does.
+  attest()
+  const timers = [
+    setInterval(refresh, REFRESH_EVERY_MS),
+    setInterval(probe, PROBE_EVERY_MS),
+    setInterval(closeHours, HOUR_CLOSE_EVERY_MS),
+    setInterval(sweep, SWEEP_EVERY_MS),
+    setInterval(heal, SWEEP_EVERY_MS),
+    setInterval(windows, WINDOW_EVERY_MS),
+    setInterval(load, LOAD_EVERY_MS),
+    setInterval(stats, STATS_EVERY_MS),
+    setInterval(attest, ATTEST_EVERY_MS),
+    setInterval(retain, RETENTION_EVERY_MS),
+  ]
+  const server = Bun.serve({ port: env.OFFPEAK_ROUTER_PORT, idleTimeout: 255, fetch: app.fetch })
+  return {
+    app,
+    stack,
+    server,
+    stop: async () => {
+      for (const timer of timers) clearInterval(timer)
+      server.stop(true)
+      pushes.disconnect()
+      redis.disconnect()
+    },
+  }
+}
