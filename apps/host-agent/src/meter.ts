@@ -93,3 +93,113 @@ export class EngineOutput {
 export class SseReader {
   private readonly decoder = new TextDecoder()
   private buffer = ""
+
+  push(bytes: Uint8Array): unknown[] {
+    this.buffer += this.decoder.decode(bytes, { stream: true }).replaceAll("\r\n", "\n")
+    const events: unknown[] = []
+    for (let cut = this.buffer.indexOf("\n\n"); cut >= 0; cut = this.buffer.indexOf("\n\n")) {
+      const block = this.buffer.slice(0, cut)
+      this.buffer = this.buffer.slice(cut + 2)
+      for (const line of block.split("\n")) {
+        if (!line.startsWith("data:")) continue
+        const data = line.slice(5).trim()
+        if (data === "[DONE]") continue
+        try {
+          events.push(JSON.parse(data))
+        } catch {
+          /* A line vLLM never meant as JSON is forwarded as it came and counts for nothing. */
+        }
+      }
+    }
+    return events
+  }
+}
+
+export type ServedRequest = {
+  reqId: Hex
+  ts: number
+  modelDigest: Hex
+  /** Resolves once the stream has ended and the counts below are final. */
+  settled: Promise<void>
+  counts: Counts | null
+  usage: EngineUsage | null
+  outputHash: Hex | null
+  /** The one record this host will ever sign for this request. */
+  signing: { message: string; reply: Promise<SignReply> } | null
+  /** Set for a sealed request: what the record's hashes must be, over the ciphertext this agent handled. */
+  sealed?: { promptHash: Hex; outputHash: Hex | null }
+}
+
+export type SignReply = { status: number; body: Record<string, unknown> }
+
+const KEEP_S = MAX_REQUEST_S + 600
+
+/** Deeper than any real tool schema, and shallow enough for every template and serializer on the way. */
+const MAX_JSON_DEPTH = 64
+
+/** Walks level by level, so the check cannot run out of stack the way a count can. */
+export function withinDepth(value: unknown, limit = MAX_JSON_DEPTH) {
+  let level = [value]
+  for (let depth = 0; level.length > 0; depth += 1) {
+    if (depth > limit) return false
+    level = level.flatMap((row) => (typeof row === "object" && row !== null ? Object.values(row) : []))
+  }
+  return true
+}
+
+/** The input's count, or `null` for a body the tokenizer cannot read. */
+export function countInput(tokenizer: AgentTokenizer, body: ChatBody) {
+  try {
+    return tokenizer.countChat(body)
+  } catch {
+    return null
+  }
+}
+
+/** Requests this host served, kept long enough for the router to ask for a signature. No prompt or output stays here. */
+export class ServedBook {
+  private readonly rows = new Map<string, { expiresAt: number; request: ServedRequest | null }>()
+
+  /** False for a `reqId` already seen, so a captured request cannot be sent again. */
+  claim(reqId: string, now: number): boolean {
+    for (const [id, row] of this.rows) {
+      if (row.expiresAt >= now) break
+      this.rows.delete(id)
+    }
+    if (this.rows.has(reqId)) return false
+    this.rows.set(reqId, { expiresAt: now + KEEP_S, request: null })
+    return true
+  }
+
+  /** Called once the engine has taken the request. Until then the id is claimed but nothing can be signed for it. */
+  begin(input: { reqId: Hex; ts: number; modelDigest: Hex }) {
+    let finish = () => {}
+    const settled = new Promise<void>((resolve) => {
+      finish = resolve
+    })
+    const request: ServedRequest = { ...input, settled, counts: null, usage: null, outputHash: null, signing: null }
+    this.rows.get(input.reqId)!.request = request
+    return { request, finish }
+  }
+
+  get(reqId: string): ServedRequest | null {
+    return this.rows.get(reqId)?.request ?? null
+  }
+}
+
+/** Counts one chat once its output is complete. A failure leaves the counts empty, and the host then refuses to sign. Pass `tokensIn` if the input was counted up front. */
+export function settleChat(row: ServedRequest, tokenizer: AgentTokenizer, body: ChatBody, output: EngineOutput, tokensIn?: number) {
+  row.usage = output.usage
+  const toolCalls = output.toolCalls.length > 0 ? output.toolCalls : undefined
+  row.outputHash = outputHashOf(output.text, toolCalls ?? [])
+  try {
+    row.counts = { tokensIn: tokensIn ?? tokenizer.countChat(body), tokensOut: tokenizer.countOutput(output.text, toolCalls, output.finish) }
+  } catch (err) {
+    console.error(JSON.stringify({ service: "host-agent", event: "count_failed", reqId: row.reqId, error: err instanceof Error ? err.name : "unknown" }))
+  }
+}
+
+export function settleEmbeddings(row: ServedRequest, tokenizer: AgentTokenizer, inputs: string[], usage: EngineUsage | null) {
+  row.usage = usage
+  row.counts = { tokensIn: tokenizer.countInputs(inputs), tokensOut: 0 }
+}
