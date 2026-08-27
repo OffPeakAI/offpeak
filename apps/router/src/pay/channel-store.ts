@@ -117,3 +117,98 @@ export async function reserveChannel(db: Db, channel: ChannelChain, channelId: H
     return { ...decision, reservationId }
   })
 }
+
+export async function releaseChannel(db: Db, reservationId: string) {
+  const gone = await db.query<{ channel_id: string }>("DELETE FROM serving.channel_reservations WHERE id = $1 RETURNING channel_id", [reservationId])
+  const channelId = gone.rows[0]?.channel_id
+  if (channelId) await settleIfClosing(db, channelId)
+}
+
+/** Inside the record's transaction: swaps a reservation for the real cost and records what the client may sign. */
+export async function noteChannel(tx: Db, payer: string, channelId: Hex, reservationId: string, actual: bigint, reqId: string) {
+  const local = await lock(tx, channelId, payer)
+  await tx.query("DELETE FROM serving.channel_reservations WHERE id = $1", [reservationId])
+  const unvouchered = local.unvouchered + actual
+  const owed = local.cumulative + unvouchered
+  await tx.query("UPDATE serving.channels_local SET unvouchered_micro = $2, last_owed = $3 WHERE channel_id = $1", [channelId, unvouchered.toString(), owed.toString()])
+  await tx.query(
+    `INSERT INTO serving.owed_boundaries (channel_id, cumulative, req_ids) VALUES ($1,$2,ARRAY[$3]::text[])
+     ON CONFLICT (channel_id, cumulative) DO UPDATE SET req_ids = serving.owed_boundaries.req_ids || EXCLUDED.req_ids`,
+    [channelId, owed.toString(), reqId],
+  )
+  if (local.closeFinal !== null) await settleClose(tx, channelId)
+  return owed
+}
+
+/** Writes a signed close's payment row once nothing is in flight, so the row names every record it paid for. */
+async function settleClose(tx: Db, channelId: string) {
+  const local = await tx.query<{ payer: string; close_final: string | null; close_settled: boolean }>("SELECT payer, close_final, close_settled FROM serving.channels_local WHERE channel_id = $1 FOR UPDATE", [channelId])
+  const row = local.rows[0]
+  if (!row || row.close_final === null || row.close_settled) return
+  if ((await tx.query("SELECT 1 FROM serving.channel_reservations WHERE channel_id = $1 LIMIT 1", [channelId])).rows.length > 0) return
+  const paid = await tx.query<{ req_ids: string[] }>("DELETE FROM serving.owed_boundaries WHERE channel_id = $1 RETURNING req_ids", [channelId])
+  const state = await tx.query<{ latest_seq: string; cumulative: string }>("SELECT latest_seq, cumulative FROM shared.channel_state WHERE channel_id = $1", [channelId])
+  const amount = big(row.close_final) - big(state.rows[0]?.cumulative)
+  if (amount > 0n) {
+    // `voucher_seq` only orders the channel's rows here. The chain's own sequence for a close does not fit a bigint.
+    await tx.query(
+      `INSERT INTO shared.agent_payments (payment_id, kind, payer, amount_micro, req_ids, channel_id, voucher_seq)
+       VALUES ($1,'channel',$2,$3,$4,$5,$6) ON CONFLICT (payment_id) DO NOTHING`,
+      [channelPaymentId(channelId, COOPERATIVE_SEQ), row.payer, amount.toString(), paid.rows.flatMap((r) => r.req_ids), channelId, (big(state.rows[0]?.latest_seq) + 1n).toString()],
+    )
+  }
+  await tx.query("UPDATE serving.channels_local SET close_settled = true WHERE channel_id = $1", [channelId])
+}
+
+async function settleIfClosing(db: Db, channelId: string) {
+  const waiting = await db.query("SELECT 1 FROM serving.channels_local WHERE channel_id = $1 AND close_final IS NOT NULL AND NOT close_settled", [channelId])
+  if (waiting.rows.length > 0) await db.transaction((tx) => settleClose(tx, channelId))
+}
+
+/** A router that died mid-request leaves a reservation. It expires here, so the close can finish. */
+export async function sweepCloses(db: Db, now: number) {
+  const rows = await db.query<{ channel_id: string }>("SELECT channel_id FROM serving.channels_local WHERE close_final IS NOT NULL AND NOT close_settled LIMIT 200")
+  for (const { channel_id } of rows.rows) {
+    await db.query("DELETE FROM serving.channel_reservations WHERE channel_id = $1 AND expires_at <= $2", [channel_id, now])
+    await settleIfClosing(db, channel_id)
+  }
+}
+
+export type CloseRequest = { finalCumulative: bigint; deadline: bigint; payerSig: Hex }
+export type CloseDecision = { ok: true } | { ok: false; error: "close_below_owed" | "close_already_signed"; owed: bigint; inFlight: bigint; required: bigint }
+
+/**
+ * Stops new requests first, in the transaction that decides, so what is owed cannot grow past the
+ * figure checked here. A request already in flight still bills afterwards, and `inFlight` holds its limit.
+ * A close that is signed stays final: the channel never serves again, and its amount cannot change.
+ */
+export async function freezeForClose(db: Db, channel: ChannelChain, channelId: Hex, close: CloseRequest, now: number): Promise<CloseDecision> {
+  return db.transaction(async (tx) => {
+    const local = await lock(tx, channelId, channel.payer)
+    await tx.query("DELETE FROM serving.channel_reservations WHERE channel_id = $1 AND expires_at <= $2", [channelId, now])
+    const held = await tx.query<{ total: string | null }>("SELECT SUM(amount) AS total FROM serving.channel_reservations WHERE channel_id = $1", [channelId])
+    const inFlight = big(held.rows[0]?.total)
+    const owed = local.cumulative + local.unvouchered
+    if (local.closeFinal !== null) {
+      if (close.finalCumulative !== local.closeFinal) return { ok: false, error: "close_already_signed", owed, inFlight, required: local.closeFinal }
+      await tx.query("UPDATE serving.channels_local SET close_deadline = $2, close_payer_sig = $3 WHERE channel_id = $1", [channelId, close.deadline.toString(), close.payerSig])
+      return { ok: true }
+    }
+    await tx.query("UPDATE serving.channels_local SET frozen_until = GREATEST(frozen_until, $2) WHERE channel_id = $1", [channelId, now + CLOSE_FREEZE_S])
+    const covered = owed + inFlight
+    const required = covered > channel.claimed ? covered : channel.claimed
+    if (close.finalCumulative < required) return { ok: false, error: "close_below_owed", owed, inFlight, required }
+    await tx.query("UPDATE serving.channels_local SET close_final = $2, close_deadline = $3, close_payer_sig = $4 WHERE channel_id = $1", [
+      channelId,
+      close.finalCumulative.toString(),
+      close.deadline.toString(),
+      close.payerSig,
+    ])
+    await settleClose(tx, channelId)
+    return { ok: true }
+  })
+}
+
+export async function keepRouterSig(db: Db, channelId: Hex, routerSig: Hex) {
+  await db.query("UPDATE serving.channels_local SET close_router_sig = $2 WHERE channel_id = $1", [channelId, routerSig])
+}
