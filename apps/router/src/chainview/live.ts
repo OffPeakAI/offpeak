@@ -157,3 +157,167 @@ export class LiveChain implements ChainReader {
   private fresh<T>(slot: Slot<T> | null | undefined, ttlMs: number) {
     return slot && performance.now() - slot.at < ttlMs ? slot : null
   }
+
+  async buyer(addr: string, now: number) {
+    const key = addr.toLowerCase()
+    const cached = this.fresh(this.buyers.get(key), this.opts.buyerTtlMs ?? 2_000)
+    if (cached) return this.applyBuyer(key, cached.value)
+    const generation = this.generation
+    const value = parseBuyer((await this.get<Fields>(`/idx/v1/buyers/${key}`)) ?? {}, now)
+    if (generation === this.generation) remember(this.buyers, key, { value, at: performance.now() })
+    return this.applyBuyer(key, value)
+  }
+
+  private async loadHosts() {
+    const generation = this.generation
+    const rows = (await this.get<Fields[]>("/idx/v1/hosts")) ?? []
+    const value = rows.map((row) => {
+      const stored = this.opts.endpointOf(String(row.operator)) ?? ""
+      // The chain holds the endpoint's hash. A stored endpoint that disagrees with it is never used.
+      return parseHost(row, stored && keccak256(toBytes(stored)) === row.endpointHash ? stored : "")
+    })
+    if (generation === this.generation) this.hosts = { value, at: performance.now() }
+    return value
+  }
+
+  async hostList() {
+    const cached = this.fresh(this.hosts, this.opts.hostTtlMs ?? 5_000)
+    const rows =
+      cached?.value ??
+      (await (this.hostsLoading ??= this.loadHosts().finally(() => {
+        this.hostsLoading = null
+      })))
+    if (this.frozen.size === 0) return rows
+    return rows.map((row) => {
+      const held = this.frozen.get(row.operator.toLowerCase())
+      return !held || !this.live(held.at) ? row : { ...row, status: held.status as HostChain["status"], routable: false }
+    })
+  }
+
+  async host(addr: string) {
+    const key = addr.toLowerCase()
+    return (await this.hostList()).find((row) => row.operator.toLowerCase() === key) ?? null
+  }
+
+  async channel(id: string) {
+    const key = id.toLowerCase()
+    const cached = this.fresh(this.channels.get(key), this.opts.channelTtlMs ?? 2_000)
+    const generation = this.generation
+    const value = cached ? cached.value : await this.get<Fields>(`/idx/v1/channels/${key}`).then((row) => (row ? parseChannel(row) : null))
+    if (!cached && generation === this.generation) remember(this.channels, key, { value, at: performance.now() })
+    const closing = this.closing.get(key)
+    return value && closing && this.live(closing.at) ? { ...value, closeRequested: true } : value
+  }
+
+  async escrow(reqId: string): Promise<EscrowChain | null> {
+    const row = await this.get<Fields>(`/idx/v1/escrows/${reqId}`)
+    if (!row) return null
+    return { status: row.status as EscrowChain["status"], maxAmount: big(row.maxAmount), captured: big(row.captured), txHash: (row.txHash as string) ?? null }
+  }
+
+  async window(id: string) {
+    const row = await this.get<Fields>(`/idx/v1/windows/${id}`)
+    return row ? parseWindow(row) : null
+  }
+
+  async windowList() {
+    return ((await this.get<Fields[]>("/idx/v1/windows")) ?? []).map(parseWindow)
+  }
+
+  async holder(id: string, addr: string) {
+    const row = await this.get<Fields>(`/idx/v1/windows/${id}/holders/${addr.toLowerCase()}`)
+    return row ? (parseWindow(row) as unknown as HolderView) : null
+  }
+
+  async ofpkOf(addr: string) {
+    const key = addr.toLowerCase()
+    const cached = this.fresh(this.ofpks.get(key), 60_000)
+    if (cached) return cached.value
+    const value = await this.get<OfpkChain>(`/idx/v1/ofpk/${key}`)
+    remember(this.ofpks, key, { value, at: performance.now() })
+    return value
+  }
+
+  proof(reqId: string) {
+    return this.get<ProofChain>(`/idx/v1/usage/${reqId}/proof`)
+  }
+
+  async challengesOf(host: string): Promise<ChallengeChain[]> {
+    const rows = (await this.get<Fields[]>(`/idx/v1/challenges?host=${host.toLowerCase()}`)) ?? []
+    return rows.map((row) => ({
+      id: String(row.id),
+      host: String(row.host),
+      kind: Number(row.kind),
+      state: Number(row.state),
+      slashBps: Number(row.slash_bps ?? 0),
+      filedAt: Number(row.filed_at ?? 0),
+      reviewEndsAt: Number(row.review_ends_at ?? 0),
+    }))
+  }
+
+  subscribe(fn: (msg: ChainPush) => void) {
+    this.listeners.add(fn)
+    return () => this.listeners.delete(fn)
+  }
+
+  /** Feeds one push from Redis. Cached views drop first, so listeners read fresh state. */
+  push(msg: ChainPush) {
+    this.generation += 1
+    const buyer = typeof msg.buyer === "string" ? msg.buyer.toLowerCase() : null
+    const channel = typeof msg.channelId === "string" ? msg.channelId.toLowerCase() : null
+    const host = typeof msg.host === "string" ? msg.host.toLowerCase() : null
+    const at = performance.now()
+    if (buyer) this.buyers.delete(buyer)
+    if (channel) this.channels.delete(channel)
+    if (host) this.hosts = null
+    if (msg.type === "Settled") this.buyers.clear()
+    // A confirmed event can arrive long after a newer fast-lane one. Only a later block may undo a tightening.
+    const block = Number(msg.block ?? Number.MAX_SAFE_INTEGER)
+    const undoes = (row: { block: number } | undefined) => !row || block >= row.block
+    if (buyer && msg.type === "WithdrawAllRequested") this.withdrawing.set(buyer, { requestedAt: big(msg.requestedAt), dueAt: big(msg.dueAt), at, block })
+    if (buyer && (msg.type === "WithdrawAllCancelled" || msg.type === "WithdrawAllExecuted") && undoes(this.withdrawing.get(buyer))) this.withdrawing.delete(buyer)
+    if (buyer && msg.type === "CapsChangeRequested") {
+      const held = this.lowered.get(buyer)
+      const hourly = big(msg.hourlyCap)
+      const daily = big(msg.dailyCap)
+      this.lowered.set(buyer, {
+        hourly: held && held.hourly < hourly ? held.hourly : hourly,
+        daily: held && held.daily < daily ? held.daily : daily,
+        after: big(msg.effectiveAfterHour),
+        at,
+        block,
+      })
+    }
+    if (buyer && msg.type === "CapsChanged" && undoes(this.lowered.get(buyer))) this.lowered.delete(buyer)
+    if (channel && msg.type === "CloseRequested") this.closing.set(channel, { at, block })
+    if (host && msg.type === "HostStatusChanged") {
+      if (FROZEN_OR_DELISTED.has(Number(msg.status))) this.frozen.set(host, { status: Number(msg.status), at, block })
+      else if (undoes(this.frozen.get(host))) this.frozen.delete(host)
+    }
+    if (msg.type === "Paused" && (!this.paused || block >= this.paused.block)) {
+      this.paused = { value: Boolean(msg.usagePaused), at, block }
+      this.buyers.clear()
+    }
+    if (msg.type === "Reorg") {
+      this.dropAbove(Number(msg.fromBlock ?? 0))
+      this.resync()
+    }
+    for (const fn of this.listeners) fn(msg)
+  }
+
+  /** Tightenings above the fork may be gone. Survivors come back through the rewound indexer. */
+  private dropAbove(fork: number) {
+    for (const overlay of [this.withdrawing, this.lowered, this.closing, this.frozen] as Map<string, { block: number }>[]) {
+      for (const [key, row] of overlay) if (row.block > fork) overlay.delete(key)
+    }
+    if (this.paused && this.paused.block > fork) this.paused = null
+  }
+
+  /** Called when the push connection comes back, since messages sent while it was down are lost. */
+  resync() {
+    this.generation += 1
+    this.buyers.clear()
+    this.channels.clear()
+    this.hosts = null
+  }
+}

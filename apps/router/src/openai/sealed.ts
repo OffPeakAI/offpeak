@@ -189,3 +189,125 @@ async function bill(ctx: Ctx, outputHash: Hex, responseBytes: number, cut: boole
   await afterCommit(ctx, counts).catch((err) => console.error(JSON.stringify({ service: "router", event: "after_commit_failed", reqId, error: String(err) })))
   return { ...committed, counts: counted }
 }
+
+async function afterCommit(ctx: Ctx, counts: { tokensIn: number; tokensOut: number }) {
+  const { stack, reqId, pay } = ctx
+  if (pay.kind === "prepaid" || pay.kind === "upto") await flushCapture(stack, reqId)
+  if (pay.kind === "window") {
+    await stack.counters.add(pay.pendingKey, BigInt(counts.tokensIn + counts.tokensOut) - pay.reservedTokens, 3 * 86_400)
+    await noteWindowMinute(stack, pay.windowId)
+  }
+}
+
+async function billSafely(ctx: Ctx, outputHash: Hex, responseBytes: number, cut: boolean) {
+  try {
+    return await bill(ctx, outputHash, responseBytes, cut)
+  } catch (err) {
+    console.error(JSON.stringify({ service: "router", event: "bill_failed", reqId: ctx.reqId, error: String(err) }))
+    // As in chat: the record may have committed, so the hold stands until it expires.
+    await flagMetering(ctx.stack, ctx.reqId, ctx.host.host, {}, {}, "bill_failed").catch(() => undefined)
+    return null
+  }
+}
+
+function closing(billed: Awaited<ReturnType<typeof billSafely>>): Trailer {
+  if (!billed) return { error: { message: "Host did not sign", code: "unbilled" } }
+  return { usage: billed.envelope, counts: billed.counts, ...(billed.channelOwed !== undefined ? { channelOwed: billed.channelOwed.toString() } : {}) }
+}
+
+/**
+ * Relays the host's bytes frame by frame. The router reads only the frame headers, which are clear,
+ * and bills once the stream ends. The hash covers what was relayed, so the closing frame stays out of it.
+ */
+function relay(ctx: Ctx, res: Response, control: AbortController, first: Uint8Array, headers: Record<string, string>) {
+  const { stack, reqId, pay, feeBps, priced } = ctx
+  const reader = res.body!.getReader()
+  const splitter = new FrameSplitter()
+  const sent: Uint8Array[] = []
+  let size = 0
+  let frames = 0
+  let cancelled = false
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const send = (bytes: Uint8Array) => {
+          sent.push(bytes)
+          size += bytes.length
+          if (!cancelled) controller.enqueue(bytes)
+        }
+        // A client reads the closing frame only after a salt, so a stream that never got one sends an empty one.
+        const finish = (trailer: Trailer) => {
+          if (!cancelled && size === 0) controller.enqueue(new Uint8Array(RESPONSE_SALT_BYTES))
+          if (!cancelled) controller.enqueue(encodeTrailer(trailer))
+          if (!cancelled) controller.close()
+        }
+        // The rate counts time output was flowing, and this is where it starts. The rest arrives with the counts.
+        ctx.flow?.tokens(1)
+        const limit = setTimeout(() => control.abort(), (MAX_REQUEST_S - BILLING_MARGIN_S) * 1000)
+        const budget = pay.kind === "upto" ? preconfirmBytes(priced, feeBps) : Infinity
+        let gated = pay.kind !== "upto"
+        let failure: string | null = null
+        let broken = false
+        let cut = false
+        const gate = async () => {
+          gated = true
+          if ((await waitAuthorized(stack, pay.payRef, stack.preconfirmTimeoutMs)) !== "ok") failure = "authorize_failed"
+        }
+        /** False once the relay must stop: the host broke the framing, or the payment failed. */
+        const take = async (chunk: Uint8Array) => {
+          let incoming: Frame[]
+          try {
+            incoming = splitter.push(chunk)
+          } catch {
+            broken = true
+            return false
+          }
+          if (size === 0 && splitter.responseSalt) send(splitter.responseSalt)
+          for (const frame of incoming) {
+            if (frame.flag === FLAG_TRAILER || size + frame.raw.length > RELAY_MAX_BYTES) {
+              broken = true
+              return false
+            }
+            if (!gated && frames > 0 && size + frame.raw.length > budget) await gate()
+            if (failure) return false
+            send(frame.raw)
+            frames += 1
+          }
+          return true
+        }
+        try {
+          let more = await take(first)
+          while (more && !cancelled) {
+            const { done, value } = await reader.read()
+            if (done) break
+            more = await take(value)
+          }
+        } catch {
+          cut = true
+        }
+        clearTimeout(limit)
+        await reader.cancel().catch(() => undefined)
+        // A reply under the budget still needs its authorization before it can bill.
+        if (!gated && !failure && !broken) await gate()
+        if (failure || broken) {
+          control.abort()
+          ctx.flow?.end()
+          await release(stack, pay).catch(() => undefined)
+          if (broken) await flagMetering(stack, reqId, ctx.host.host, {}, {}, "sealed_bad_stream").catch(() => undefined)
+          finish({ error: broken ? { message: "Host broke the stream format", code: "sealed_bad_stream" } : { message: "Authorization did not arrive", code: failure! } })
+          return
+        }
+        const partial = cut || cancelled || !splitter.lastSeen
+        const billed = await billSafely(ctx, keccak256(concatBytes(...sent)), size, partial)
+        ctx.flow?.end()
+        finish(closing(billed))
+      },
+      cancel() {
+        cancelled = true
+        control.abort()
+        void reader.cancel().catch(() => undefined)
+      },
+    }),
+    { headers: { "content-type": HPKE_STREAM_CONTENT_TYPE, "cache-control": "no-cache", "x-offpeak-request": reqId, ...headers } },
+  )
+}
