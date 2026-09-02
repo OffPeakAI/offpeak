@@ -387,3 +387,219 @@ async function jsonResponse(ctx: Ctx, opened: Opened, priced: Priced, headers: R
     },
   )
 }
+
+/** A night job's line: runs as the account at the locked price, with no API key involved. */
+export type NightLine = { lockedPrice: PriceLock; actor: Payer; reqId: Hex; fromHold?: string }
+
+const flexTime = z.iso.datetime({ offset: true })
+
+const tokenLimit = z.int().positive().nullish()
+/** Both names, because the audit shape reads the one that loses. `z.int` keeps out values like 1e308. */
+export const tokenLimits = z.looseObject({ max_tokens: tokenLimit, max_completion_tokens: tokenLimit })
+
+/** Seconds, `undefined` with no header, or `null` when the header cannot be read. */
+function parseFlex(header: string | null) {
+  if (header === null) return undefined
+  const parsed = flexTime.safeParse(header.trim())
+  return parsed.success ? Math.floor(Date.parse(parsed.data) / 1000) : null
+}
+
+export async function serveChat(stack: Stack, req: Request, night?: NightLine): Promise<Response> {
+  const entered = performance.now()
+  const started = stack.clock()
+  if (isSealed(req)) return serveSealed(stack, req)
+  const flexDeadline = night ? undefined : parseFlex(req.headers.get("x-offpeak-flex"))
+  if (flexDeadline === null) return oai(400, "X-Offpeak-Flex cannot be read", "invalid_request", "bad_flex")
+  if (flexDeadline !== undefined && !stack.flags.night_jobs) return featureOff("Night jobs")
+  const raw = await req.text()
+  if (raw.length > 4 * 1024 * 1024) return oai(413, "Body too large", "invalid_request", "body_too_large")
+  let body: Record<string, any>
+  try {
+    body = JSON.parse(raw)
+    if (typeof body !== "object" || body === null || Array.isArray(body)) throw new Error("not an object")
+  } catch {
+    return oai(400, "Body is not valid JSON", "invalid_request", "bad_json")
+  }
+  if (body.n && body.n > 1) return oai(400, "Only n = 1 is supported", "invalid_request", "n_unsupported")
+  const authed = night ? night.actor : await auth(stack, req)
+  const unpaid = authed instanceof Response && authed.status === 402 && ((await authed.clone().json()) as { error: { code: string } }).error.code === "payment_required"
+  if (authed instanceof Response && !unpaid) return authed
+  const modelName = String(body.model ?? "")
+  const model = stack.models.find((row) => row.name === modelName && row.kind === "chat")
+  if (!model) return oai(404, "Unknown model", "invalid_request", "model_not_found")
+  if (!unpaid && (authed as Payer).mode === 2) return oai(400, "exact is for fixed-cost calls such as embeddings", "invalid_request", "exact_not_allowed")
+  if (!messagesOk(body.messages)) return oai(400, "Messages need text content", "invalid_request", "bad_messages")
+  const tokensIn = Buffer.byteLength(raw) + 64
+  if (!tokenLimits.safeParse(body).success) return oai(400, "max_tokens must be a positive integer", "invalid_request", "bad_max_tokens")
+  const asked = askedTokens(body) as number | null | undefined
+  const room = roomLeft(model, tokensIn, body)
+  if (room === null) return oai(400, "Messages do not fit the model's chat template", "invalid_request", "bad_messages")
+  if (room < 1) return oai(400, "Input is longer than the model's context", "invalid_request", "context_length_exceeded")
+  const maxTokens = outputLimit(asked, room)
+  let cap: ReturnType<typeof parseMaxPrice>
+  try {
+    cap = parseMaxPrice(req.headers.get("x-offpeak-max-price") ?? undefined)
+  } catch {
+    return oai(400, "X-Offpeak-Max-Price cannot be read", "invalid_request", "bad_max_price")
+  }
+  if (authed instanceof Response) {
+    const unpaidRoute = await chooseRoute(stack, { cap, model, modelName, feeBps: FEE_BPS_DEFAULT, started, tokensIn, maxTokens, unattended: false })
+    return unpaidRoute instanceof Response ? unpaidRoute : paymentRequiredResponse(stack, ceilDiv(unpaidRoute.quote * QUOTE_MARGIN_BPS, 10_000n), false)
+  }
+  const sent = hostChatBody(body, maxTokens)
+  const metered = meterable(model, body, sent)
+  if (!metered) return oai(400, "Body cannot be billed. Numbers must be finite and messages must fit the model's chat template", "invalid_request", "bad_body")
+  const { payload, promptHash, tokensIn: inputTokens } = metered
+  const reqId = night?.reqId ?? (`0x${randomBytes(32).toString("hex")}` as Hex)
+  const headerP = signRouterBody(stack.router, { reqId, ts: started, payload })
+  const resolved = await resolveWindow(stack, authed, req, tokensIn, maxTokens, model.digest)
+  if (resolved instanceof Response) return resolved
+  const windowRun = "reservedTokens" in resolved ? resolved : undefined
+  const payer = windowRun ? windowRun.payer : (resolved as Payer)
+  const feeBps = payer.mode === 4 ? 0 : payer.feeBps
+  const dropWindow = async () => {
+    if (windowRun) await stack.counters.add(windowRun.pendingKey, -windowRun.reservedTokens, 3 * 86_400)
+  }
+  if (flexDeadline !== undefined && (payer.mode === 1 || payer.mode === 2 || payer.mode === 3)) return oai(400, "Night jobs are prepaid", "invalid_request", "prepaid_only")
+  const flow = payer.mode === 4 ? stack.windowPerf.begin(payer.windowId) : undefined
+  /** A holder who was turned away is still demand, and it goes on record. */
+  const endFlow = async () => {
+    flow?.end()
+    if (payer.mode === 4) await noteWindowMinute(stack, payer.windowId).catch(() => undefined)
+  }
+  const flex = flexDeadline !== undefined && payer.mode === 0 ? { deadline: flexDeadline, payer, body } : undefined
+  // With no cap, the deadline alone says this can wait. With one, a price under it is served now.
+  const scheduled = flex && !cap ? await intakeFlex(stack, flex.payer, modelName, flex.body, flex.deadline) : null
+  if (scheduled) return scheduled
+  const route = await chooseRoute(stack, { cap, model, modelName, payer, feeBps, started, tokensIn, maxTokens, locked: night?.lockedPrice, unattended: Boolean(night || flex), flex }).catch(async (err) => {
+    await endFlow()
+    await dropWindow()
+    throw err
+  })
+  if (route instanceof Response) {
+    await endFlow()
+    await dropWindow()
+    return route
+  }
+  const pay = await authorize(stack, payer, route.quote, raw, windowRun, night?.fromHold).catch(async (err) => {
+    await endFlow()
+    await dropWindow()
+    throw err
+  })
+  if (pay instanceof Response) {
+    await endFlow()
+    return pay
+  }
+  const opened = await openHost(stack, route.ranked, payload, await headerP)
+  if (opened.ok) stack.hostWaitMs?.push(opened.ttftMs)
+  if (!opened.ok) {
+    const refused = opened.error === "refused"
+    // A host that turned this request down was not asked to serve anything, so no demand goes on record.
+    if (refused) flow?.drop()
+    else await endFlow()
+    await release(stack, pay)
+    return refused ? oai(400, "The host refused this request", "invalid_request", "host_refused") : oai(503, "Host failed before the first token", "engine", "no_capacity")
+  }
+  stack.load.enter(opened.host, model.digest)
+  const servedPrice = opened.host === route.best.host ? route.priced : route.second!
+  const ctx: Ctx = { stack, reqId, started, model, modelName, payer, pay, feeBps, maxTokens, body, sent, promptHash, tokensIn: inputTokens, tokenizer: tokenizerFor(model), flow }
+  const shown = payer.mode === 4 ? { in: 0n, out: 0n } : { in: buyerUnitPrice(servedPrice.price.in, feeBps), out: buyerUnitPrice(servedPrice.price.out, feeBps) }
+  const headers = { "x-offpeak-price": `in=${shown.in},out=${shown.out}`, "x-offpeak-host": opened.host }
+  return body.stream ? streamResponse(ctx, opened, servedPrice, entered, headers) : jsonResponse(ctx, opened, servedPrice, headers)
+}
+
+const CHAT_ROLES = new Set(["system", "developer", "user", "assistant", "tool", "function"])
+
+export function messagesOk(messages: unknown): messages is ChatMessage[] {
+  if (!Array.isArray(messages) || messages.length === 0) return false
+  return messages.every((message) => {
+    if (!CHAT_ROLES.has(message?.role)) return false
+    const content = message?.content
+    if (content === null || content === undefined || typeof content === "string") return true
+    return Array.isArray(content) && content.every((part) => part?.type === "text" && typeof part.text === "string")
+  })
+}
+
+/**
+ * Everything billing needs from the buyer's body, ready before any money moves. A body that throws here would
+ * otherwise throw in `bill`, after the host has served it. `null` means it cannot be billed.
+ */
+function meterable(model: ModelEntry, body: Record<string, any>, sent: Record<string, unknown>) {
+  try {
+    return { payload: JSON.stringify(sent), promptHash: promptHashOf(sent), tokensIn: countChat(model, body) }
+  } catch {
+    return null
+  }
+}
+
+/** Output left after the input, or `null` when the model's template refuses these messages. */
+function roomLeft(model: ModelEntry, tokensIn: number, body: Record<string, any>) {
+  // Counting costs real time at load, and a prompt this small cannot reach the limit in any tokenizer.
+  if (tokensIn + MAX_OUTPUT_TOKENS < model.contextLength) return MAX_OUTPUT_TOKENS
+  try {
+    return model.contextLength - countChat(model, body)
+  } catch {
+    return null
+  }
+}
+
+type RouteInput = {
+  cap: ReturnType<typeof parseMaxPrice>
+  model: ModelEntry
+  modelName: string
+  /** Absent for a request that has not paid yet, which only wants a quote. */
+  payer?: Payer
+  feeBps: number
+  started: number
+  tokensIn: number
+  maxTokens: number
+  locked?: PriceLock
+  unattended: boolean
+  flex?: { deadline: number; payer: Extract<Payer, { mode: 0 }>; body: Record<string, unknown> }
+}
+
+/** A Window keeps its share of the host. Everyone else is served from what is left. */
+function outsideWindows(stack: Stack, rows: HostCandidate[], model: Hex) {
+  if (stack.windowShares.size === 0) return rows
+  return rows.filter((h) => h.util < 1 - (stack.windowShares.get(`${h.host.toLowerCase()}:${model}`) ?? 0))
+}
+
+/** The locked price averages floors, but only of the hosts forecast. Another host's floor can sit above it. */
+function aboveFloor(stack: Stack, h: HostCandidate, model: Hex, now: number, locked: PriceLock) {
+  const sheet = sheetFor(stack, h.host, model, now)
+  return Boolean(sheet && sheet.floorIn <= locked.in && sheet.floorOut <= locked.out)
+}
+
+const takesNightJobs = (stack: Stack, h: HostCandidate, model: Hex) => stack.nightModels?.get(h.host.toLowerCase())?.has(model.toLowerCase()) ?? !stack.nightModels
+
+async function chooseRoute(stack: Stack, input: RouteInput) {
+  const { cap, model, modelName, payer, feeBps, started, tokensIn, maxTokens, locked, unattended, flex } = input
+  const chosen = await candidates(stack, model.digest, started, feeBps)
+  const windowHost = payer?.mode === 4 ? (await stack.indexer.window(payer.windowId.toString()))?.host.toLowerCase() : undefined
+  const selected = selectHost(chosen, { sealed: false, windowHost, canary: false, interactive: !unattended })
+  const open = payer?.mode === 4 ? selected : outsideWindows(stack, selected, model.digest)
+  const healthy = locked ? open.filter((h) => takesNightJobs(stack, h, model.digest) && aboveFloor(stack, h, model.digest, started, locked)) : open
+  if (healthy.length === 0) return oai(503, "No healthy host", "capacity", "no_capacity", { next_forecast_hour: hourIndex(started) + 1 })
+  // A Window was paid for at purchase, so a live price cap has nothing to say about drawing it.
+  const capped = payer?.mode === 4 ? undefined : cap
+  const ranked = capped ? healthy.filter((h) => h.priceIn <= capped.inPerM && h.priceOut <= capped.outPerM) : healthy
+  const best = (ranked[0] ?? healthy[0])!
+  const priced = hostPrice(stack, best, model.digest, started, locked)
+  if (!priced) return oai(503, "No price", "capacity", "no_capacity")
+  if (priceAboveCap(priced.price.in, priced.price.out, feeBps, capped)) {
+    const scheduled = flex && (await intakeFlex(stack, flex.payer, modelName, flex.body, flex.deadline, capped))
+    if (scheduled) return scheduled
+    const cheaper = await nextCheaper(stack, model.digest, feeBps, capped, started)
+    return oai(429, "Live price is above the cap", "rate_limit", "price_above_cap", {
+      best_price: { in: buyerUnitPrice(priced.price.in, feeBps).toString(), out: buyerUnitPrice(priced.price.out, feeBps).toString() },
+      next_cheaper_hour: cheaper?.hour ?? null,
+      next_cheaper_price: cheaper ? { in: cheaper.in.toString(), out: cheaper.out.toString() } : null,
+    })
+  }
+  const quoteFor = (row: Priced) => quoteCost({ tokensIn: Math.max(tokensIn, 1), tokensOut: maxTokens, priceIn: row.price.in, priceOut: row.price.out, feeBps }).totalMicro
+  const nextHost = ranked.find((host) => host.host !== best.host)
+  const second = nextHost ? hostPrice(stack, nextHost, model.digest, started, locked) : null
+  const firstQuote = quoteFor(priced)
+  const secondQuote = second ? quoteFor(second) : 0n
+  return { ranked: ranked.length > 0 ? ranked : healthy, best, priced, second, quote: secondQuote > firstQuote ? secondQuote : firstQuote }
+}
