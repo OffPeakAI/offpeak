@@ -129,3 +129,132 @@ describe("before a body is read", () => {
     }, { highWaterMark: 0 })
     return { body, pulled: () => pulled }
   }
+
+  const send = (app: Awaited<ReturnType<typeof harness>>["app"], path: string, headers: Record<string, string>, body: ReadableStream<Uint8Array>) => app.request(path, { method: "POST", headers: { "content-type": "application/json", ...headers }, body, duplex: "half" } as RequestInit)
+
+  test.each([CHAT, "/offpeak/v1/embeddings", "/offpeak/v1/score"])("%s reads nothing from a caller with no signature", async (path) => {
+    const { app } = await harness()
+    const stream = watched()
+    const res = await send(app, path, {}, stream.body)
+    expect(res.status).toBe(401)
+    expect(stream.pulled()).toBe(false)
+  })
+
+  test("a stranger's signature, or a stale one, reads nothing either", async () => {
+    const { app, clock } = await harness()
+    const { signRouterBody } = await import("../src/proxy.ts")
+    const stranger = await signRouterBody(buyer as never, { reqId: newReqId(), ts: clock.now, payload: "{}" })
+    const stale = await signRouterBody(router as never, { reqId: newReqId(), ts: clock.now - 1_000, payload: "{}" })
+    for (const header of [stranger, stale, "not-a-header"]) {
+      const stream = watched()
+      expect((await send(app, CHAT, { "x-offpeak-req": header }, stream.body)).status).toBe(401)
+      expect(stream.pulled()).toBe(false)
+    }
+  })
+
+  test("a valid header still gets its body read", async () => {
+    const { app, clock } = await harness()
+    const { signRouterBody } = await import("../src/proxy.ts")
+    const stream = watched()
+    const header = await signRouterBody(router as never, { reqId: newReqId(), ts: clock.now, payload: "{}" })
+    expect((await send(app, CHAT, { "x-offpeak-req": header }, stream.body)).status).toBe(401)
+    expect(stream.pulled()).toBe(true)
+  })
+
+  test("a host that is no reference still answers not found on the score route", async () => {
+    const { app } = await harness({ auditor: null })
+    const stream = watched()
+    expect((await send(app, "/offpeak/v1/score", {}, stream.body)).status).toBe(404)
+    expect(stream.pulled()).toBe(false)
+  })
+})
+
+describe("idle sockets", () => {
+  const listenIdle = (app: Awaited<ReturnType<typeof harness>>["app"], seconds: number) => {
+    const { server, port } = serveOnFreePort((free) => serveAgent(app, { hostname: "127.0.0.1", port: free }, seconds))
+    stops.push(() => server.stop(true))
+    return port as number
+  }
+
+  test("the agent keeps an idle limit by default", () => {
+    expect(IDLE_TIMEOUT_S).toBeGreaterThan(0)
+  })
+
+  test("a socket that sends half a request is closed", async () => {
+    const { app } = await harness()
+    const port = listenIdle(app, 1)
+    let closed = false
+    const socket = await Bun.connect({ hostname: "127.0.0.1", port, socket: { data() {}, close: () => void (closed = true) } })
+    socket.write("POST /offpeak/v1/chat/completions HTTP/1.1\r\nHost: a\r\n")
+    const end = Date.now() + 15_000
+    while (!closed && Date.now() < end) await Bun.sleep(100)
+    expect(closed).toBe(true)
+  }, 20_000)
+
+  test("a signed stream outlives the idle limit while the GPU is quiet", async () => {
+    let release = () => {}
+    const hold = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const row = await harness({ hold, reply: () => ({ text: "first piece, then the rest of it" }) })
+    const port = listenIdle(row.app, 1)
+    const { signRouterBody } = await import("../src/proxy.ts")
+    const payload = JSON.stringify(row.chatBody())
+    const header = await signRouterBody(router as never, { reqId: newReqId(), ts: row.clock.now, payload })
+    const res = await fetch(`http://127.0.0.1:${port}${CHAT}`, { method: "POST", headers: { "content-type": "application/json", "x-offpeak-req": header }, body: payload })
+    const reader = res.body!.getReader()
+    await reader.read()
+    await Bun.sleep(9_000)
+    release()
+    let text = ""
+    for (;;) {
+      const { value, done } = await reader.read()
+      if (done) break
+      text += new TextDecoder().decode(value)
+    }
+    expect(text).toContain("[DONE]")
+  }, 20_000)
+})
+
+describe("streaming over a real socket", () => {
+  const listen = (app: { fetch: (req: Request) => Response | Promise<Response> }) => {
+    const { server, port } = serveOnFreePort((free) => Bun.serve({ port: free, hostname: "127.0.0.1", idleTimeout: 0, fetch: app.fetch }))
+    stops.push(() => server.stop(true))
+    return `http://127.0.0.1:${port}`
+  }
+
+  const signedChat = async (row: Awaited<ReturnType<typeof agentHarness>>, url: string) => {
+    const { signRouterBody } = await import("../src/proxy.ts")
+    const payload = JSON.stringify(row.chatBody())
+    const reqId = newReqId()
+    const header = await signRouterBody(router as never, { reqId, ts: row.clock.now, payload })
+    const res = await fetch(`${url}${CHAT}`, { method: "POST", headers: { "content-type": "application/json", "x-offpeak-req": header }, body: payload })
+    return { res, reqId }
+  }
+
+  test("a token reaches the caller while vLLM is still working", async () => {
+    let release = () => {}
+    const hold = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const row = await harness({ hold, reply: () => ({ text: "first piece, then the rest of it" }) })
+    const url = listen(row.app)
+    const { res } = await signedChat(row, url)
+    const reader = res.body!.getReader()
+    const decoder = new TextDecoder()
+    let seen = ""
+    while (!seen.includes("first")) {
+      const { value, done } = await reader.read()
+      if (done) break
+      seen += decoder.decode(value, { stream: true })
+    }
+    expect(seen).toContain("first")
+    expect(seen).not.toContain("[DONE]")
+    release()
+    for (;;) {
+      const { value, done } = await reader.read()
+      if (done) break
+      seen += decoder.decode(value, { stream: true })
+    }
+    expect(seen).toContain("data: [DONE]")
+  })
