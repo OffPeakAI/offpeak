@@ -85,3 +85,88 @@ describe("host.yaml", () => {
     expect(() => loadHostConfig(write(yaml({ gpuClass: "cpu-tdx-dev" })), envFor())).toThrow("not routable")
     expect(loadHostConfig(write(yaml({ gpuClass: "cpu-tdx-dev" })), local).gpuClass).toBe("cpu-tdx-dev")
   })
+
+  test("the endpoint needs https outside local", () => {
+    expect(() => loadHostConfig(write(yaml({ endpoint: "http://host.example.net" })), envFor())).toThrow("https")
+    expect(loadHostConfig(write(yaml({ endpoint: "http://127.0.0.1:31990" })), envFor({ OFFPEAK_ENV: "local" })).endpoint).toBe("http://127.0.0.1:31990")
+  })
+
+  test("the operator key must match operator", () => {
+    expect(() => loadHostConfig(write(yaml({ operator: buyer.address })), envFor())).toThrow("operator key")
+  })
+
+  test("the endpoint in the environment must match", () => {
+    expect(() => loadHostConfig(write(yaml()), envFor({ OFFPEAK_HOST_ENDPOINT: "https://other.example.net" }))).toThrow("differs")
+  })
+
+  test("plain HTTP stays on loopback outside local", () => {
+    const open = yaml({ extra: "listen:\n  host: 0.0.0.0\n  port: 8790" })
+    expect(() => loadHostConfig(write(open), envFor())).toThrow("listen.host must be loopback")
+    expect(loadHostConfig(write(yaml({ extra: "listen:\n  host: 127.0.0.1\n  port: 8790" })), envFor()).listen.host).toBe("127.0.0.1")
+    expect(loadHostConfig(write(open), envFor({ OFFPEAK_ENV: "local" })).listen.host).toBe("0.0.0.0")
+  })
+
+  test("the manifest must be for this model", () => {
+    expect(() => loadHostConfig(write(yaml({ name: "other-model" })), envFor())).toThrow("manifest is for")
+  })
+})
+
+describe("the vLLM recipe", () => {
+  const recipe = { "tensor-parallel-size": [1, 2], "max-model-len": [8192], dtype: ["auto" as const], "enable-prefix-caching": [true] }
+
+  test("the four approved arguments pass", () => {
+    assertRecipe({ vllmArgs: ["--tensor-parallel-size=2", "--max-model-len=8192", "--dtype=auto", "--enable-prefix-caching"] }, recipe)
+    assertRecipe({ vllmArgs: ["--tensor-parallel-size=8", "--max-model-len=128000", "--dtype=float16", "--no-enable-prefix-caching"] })
+  })
+
+  test.each([
+    ["an argument outside the recipe", "--quantization=awq"],
+    ["a swapped model", "--model=/models/smaller"],
+    ["a chat template override", "--chat-template=/tmp/x.jinja"],
+    ["remote code", "--trust-remote-code"],
+    ["a two-part argument", "--dtype"],
+    ["a bad number", "--max-model-len=abc"],
+    ["a suffixed number", "--max-model-len=8k"],
+    ["a zero", "--tensor-parallel-size=0"],
+    ["an unknown dtype", "--dtype=int8"],
+    ["no dashes", "dtype=auto"],
+    ["a value on the flag", "--enable-prefix-caching=yes"],
+    ["a shell tail", "--dtype=auto --quantization=awq"],
+  ])("%s fails", (_name, arg) => {
+    expect(() => assertRecipe({ vllmArgs: [arg] })).toThrow("vllm arg not in the recipe")
+  })
+
+  test("a value outside this model's list fails", () => {
+    expect(() => assertRecipe({ vllmArgs: ["--tensor-parallel-size=4"] }, recipe)).toThrow("vllm arg not in the recipe")
+    expect(() => assertRecipe({ vllmArgs: ["--dtype=float16"] }, recipe)).toThrow("vllm arg not in the recipe")
+    expect(() => assertRecipe({ vllmArgs: ["--max-model-len=32768"] }, recipe)).toThrow("vllm arg not in the recipe")
+    expect(() => assertRecipe({ vllmArgs: ["--no-enable-prefix-caching"] }, recipe)).toThrow("vllm arg not in the recipe")
+  })
+
+  test("an argument given twice fails", () => {
+    expect(() => assertRecipe({ vllmArgs: ["--dtype=auto", "--dtype=float16"] })).toThrow("vllm arg not in the recipe")
+    expect(() => assertRecipe({ vllmArgs: ["--enable-prefix-caching", "--no-enable-prefix-caching"] })).toThrow("vllm arg not in the recipe")
+  })
+
+  test("a bad argument in host.yaml stops the boot", () => {
+    expect(() => loadHostConfig(write(yaml({}, ['    vllmArgs: ["--quantization=awq"]'])), envFor())).toThrow("vllm arg not in the recipe")
+    expect(() => loadHostConfig(write(yaml({}, ['    vllmArgs: ["--tensor-parallel-size=4"]'])), envFor())).toThrow("vllm arg not in the recipe")
+  })
+})
+
+describe("the environment", () => {
+  const base = { OFFPEAK_RPC_URL: "http://127.0.0.1:31999", OFFPEAK_DEPLOYMENT_FILE: "d.json", OFFPEAK_HOST_OPERATOR_KEY: HOST_KEY }
+
+  test("another role's key stops the agent", () => {
+    for (const name of ["OFFPEAK_ROUTER_SIGNER_KEY", "OFFPEAK_AUDITOR_KEY", "OFFPEAK_SETTLER_KEY", "OFFPEAK_RULING_KEY"]) {
+      expect(() => readHostEnv({ ...base, [name]: `0x${"11".repeat(32)}` })).toThrow("another role key")
+    }
+    expect(readHostEnv({ ...base, OFFPEAK_ROUTER_SIGNER_KEY: "replace-me" }).OFFPEAK_ENV).toBe("local")
+  })
+
+  test("a missing or malformed operator key, and the wrong chain, are boot failures", () => {
+    expect(() => readHostEnv({ ...base, OFFPEAK_HOST_OPERATOR_KEY: undefined })).toThrow()
+    expect(() => readHostEnv({ ...base, OFFPEAK_HOST_OPERATOR_KEY: "replace-me" })).toThrow()
+    expect(() => readHostEnv({ ...base, OFFPEAK_CHAIN_ID: "1" })).toThrow()
+  })
+})
