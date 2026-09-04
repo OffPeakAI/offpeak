@@ -159,3 +159,121 @@ describe("prices come from this host's own sheets", () => {
     const hash = await sheets.save(other, await signSheet(other))
     expect((await sign({ ...good, sheetHash: hash })).body.reason).toBe("sheet")
   })
+
+  test("a sheet not yet valid at the record's start is refused", async () => {
+    const { sign, good, sheets } = await served()
+    const later = baseSheet({ validFrom: NOW + 3600, nonce: 2n })
+    const hash = await sheets.save(later, await signSheet(later))
+    await sheets.load()
+    expect((await sign({ ...good, sheetHash: hash })).body.reason).toBe("sheet")
+  })
+
+  test("a sheet replaced before the record started is refused", async () => {
+    const { sign, good, sheets } = await served()
+    const newer = baseSheet({ validFrom: NOW - 60, nonce: 2n })
+    await sheets.save(newer, await signSheet(newer))
+    await sheets.load()
+    expect((await sign(good)).body.reason).toBe("sheet")
+  })
+
+  test("the live band: lowest and highest load pass, one unit outside does not", async () => {
+    const { sign, record, reqId, tokensIn, tokensOut, sheet } = await served()
+    const band = liveBand(sheet, NOW)
+    expect(band.in).toEqual({ low: 100_000n, high: 240_000n })
+    expect(band.out).toEqual({ low: 400_000n, high: 960_000n })
+    const counts = { tokensIn, tokensOut }
+    expect((await sign(record(reqId, { ...counts, priceIn: band.in.low - 1n }))).body.reason).toBe("price")
+    expect((await sign(record(reqId, { ...counts, priceIn: band.in.high + 1n }))).body.reason).toBe("price")
+    expect((await sign(record(reqId, { ...counts, priceOut: band.out.low - 1n }))).body.reason).toBe("price")
+    expect((await sign(record(reqId, { ...counts, priceOut: band.out.high + 1n }))).body.reason).toBe("price")
+    expect((await sign(record(reqId, { ...counts, priceIn: band.in.low, priceOut: band.out.high }))).status).toBe(200)
+  })
+
+  test("the band follows the sheet's hour of the week", async () => {
+    const { sign, record, reqId, tokensIn, tokensOut, sheets } = await served()
+    const dear = baseSheet({ baseIn: week(200_000n).with(hourOfWeek(NOW), 1_000_000n), validFrom: 1, nonce: 2n })
+    const sheetHash = await sheets.save(dear, await signSheet(dear))
+    await sheets.load()
+    const counts = { tokensIn, tokensOut, sheetHash }
+    expect((await sign(record(reqId, { ...counts, priceIn: 200_000n }))).body.reason).toBe("night_jobs_off")
+    expect((await sign(record(reqId, { ...counts, priceIn: 400_000n }))).status).toBe(200)
+  })
+
+  test("a host cost that does not follow from the record is refused", async () => {
+    const { sign, good } = await served()
+    expect((await sign({ ...good, hostCostMicro: good.hostCostMicro - 1n })).body.reason).toBe("cost")
+    expect((await sign({ ...good, hostCostMicro: good.hostCostMicro + 1n })).body.reason).toBe("cost")
+  })
+
+  test("a zero output price needs zero output", async () => {
+    const { sign, record, reqId, tokensIn, tokensOut } = await served()
+    expect((await sign(record(reqId, { tokensIn, tokensOut, priceOut: 0n }))).body.reason).toBe("price")
+  })
+
+  test("window draw-downs carry no price and must be zero throughout", async () => {
+    const { sign, record, reqId, tokensIn, tokensOut } = await served()
+    const counts = { tokensIn, tokensOut, payMode: 4 as const, feeMicro: 0n }
+    expect((await sign(record(reqId, { ...counts, priceIn: 0n, priceOut: 0n, hostCostMicro: 1n }))).body.reason).toBe("price")
+    expect((await sign(record(reqId, { ...counts, priceIn: 0n, priceOut: 0n, hostCostMicro: 0n }))).status).toBe(200)
+  })
+
+  test("a zero-priced record is refused in every other pay mode", async () => {
+    const { sign, record, reqId, tokensIn, tokensOut } = await served()
+    expect((await sign(record(reqId, { tokensIn, tokensOut, priceIn: 0n, priceOut: 0n, payMode: 3 }))).body.reason).toBe("price")
+  })
+
+  test("a locked night price passes only on a host that opted in, and a refusal says why", async () => {
+    const dear = baseSheet({ baseIn: week(200_000n).with(0, 900_000n) })
+    expect(nightBand(dear).in).toEqual({ low: 100_000n, high: 1_080_000n })
+    const locked = 500_000n
+    const honest = await served({ nightJobs: true })
+    const sheet = baseSheet({ baseIn: dear.baseIn, validFrom: 1, nonce: 2n })
+    const sheetHash = await honest.sheets.save(sheet, await signSheet(sheet))
+    await honest.sheets.load()
+    expect((await honest.sign(honest.record(honest.reqId, { tokensIn: honest.tokensIn, tokensOut: honest.tokensOut, priceIn: locked, sheetHash }))).status).toBe(200)
+    const strict = await served({ nightJobs: false })
+    const hash = await strict.sheets.save(sheet, await signSheet(sheet))
+    await strict.sheets.load()
+    expect((await strict.sign(strict.record(strict.reqId, { tokensIn: strict.tokensIn, tokensOut: strict.tokensOut, priceIn: locked, sheetHash: hash }))).body.reason).toBe("night_jobs_off")
+  })
+
+  test("a price outside even the week's limits is still a plain price refusal", async () => {
+    const strict = await served({ nightJobs: false })
+    expect((await strict.sign(strict.record(strict.reqId, { tokensIn: strict.tokensIn, tokensOut: strict.tokensOut, priceIn: 90_000_000n }))).body.reason).toBe("price")
+  })
+
+  test("the agent says which models take night jobs, so a router can avoid the rest", async () => {
+    const off = await served({ nightJobs: false })
+    const on = await served({ nightJobs: true })
+    const listed = async (row: typeof off) => ((await (await row.app.request("/offpeak/v1/info")).json()) as { nightJobModels: string[] }).nightJobModels
+    expect(await listed(off)).toEqual([])
+    expect(await listed(on)).toEqual([DIGEST])
+  })
+
+  test("a sheet's hash here equals the router's", async () => {
+    const { sheetHashOf: routerHash } = await import("../../router/src/pricing/pricebook.ts")
+    const sheet = baseSheet()
+    expect(sheetHashOf(sheet, REGISTRY)).toBe(routerHash(sheet, REGISTRY))
+  })
+
+  test("a forged sheet file stops the book from loading", async () => {
+    const { sheets, dataDir, sheetHash } = await harness()
+    const path = join(dataDir, "sheets", `${sheetHash}.json`)
+    const stored = JSON.parse(readFileSync(path, "utf8"))
+    stored.sheet.floorIn = "1"
+    writeFileSync(path, JSON.stringify(stored))
+    await expect(sheets.load()).rejects.toThrow("is not this host's")
+  })
+})
+
+describe("one signature per request", () => {
+  test("a retry of the same record gets the same answer and one log line", async () => {
+    const { sign, good, dataDir } = await served()
+    const first = await sign(good)
+    const second = await sign(good)
+    expect(second.status).toBe(200)
+    expect(second.body.hostSig).toBe(first.body.hostSig)
+    const day = readdirSync(join(dataDir, "signed"))
+    expect(day).toHaveLength(1)
+    expect(readFileSync(join(dataDir, "signed", day[0]!), "utf8").trim().split("\n")).toHaveLength(1)
+  })
