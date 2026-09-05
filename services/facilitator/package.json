@@ -1,0 +1,16 @@
+{
+  "name": "@offpeak/facilitator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "dev": "bun run src/main.ts" },
+  "dependencies": {
+    "@offpeak/abis": "workspace:*",
+    "@offpeak/common": "workspace:*",
+    "@offpeak/shared": "workspace:*",
+    "bullmq": "5",
+    "hono": "^4.7.0",
+    "ioredis": "5",
+    "viem": "^2.38.0"
+  }
+}
