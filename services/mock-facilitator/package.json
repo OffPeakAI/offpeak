@@ -1,0 +1,13 @@
+{
+  "name": "@offpeak/mock-facilitator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "dev": "bun run src/main.ts" },
+  "dependencies": {
+    "@offpeak/shared": "workspace:*",
+    "hono": "^4.7.0",
+    "viem": "^2.38.0",
+    "zod": "^4.0.0"
+  }
+}
