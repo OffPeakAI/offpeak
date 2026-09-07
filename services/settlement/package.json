@@ -1,0 +1,12 @@
+{
+  "name": "@offpeak/settlement",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@offpeak/abis": "workspace:*",
+    "@offpeak/common": "workspace:*",
+    "@offpeak/shared": "workspace:*",
+    "viem": "^2.38.0"
+  }
+}
