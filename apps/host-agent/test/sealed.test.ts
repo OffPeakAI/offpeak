@@ -200,3 +200,235 @@ describe("boot", () => {
       delete process.env.HTTP_PROXY
     }
   })
+
+  test("no TSM, or no GPU evidence, stops the boot", async () => {
+    await expect(start("/nonexistent/tsm/report")).rejects.toThrow()
+    await expect(start(tsm().root, ["/bin/sh", "-c", "exit 1"])).rejects.toThrow()
+  })
+
+  test("the private key is in no reply and no public field", async () => {
+    const booted = await rig()
+    const nonce = `0x${"cd".repeat(32)}`
+    const reply = await (await agentOf(booted).request(`/offpeak/v1/attest?nonce=${nonce}`)).text()
+    expect(reply.toLowerCase()).not.toContain("private")
+    expect(JSON.stringify(booted.sealed)).not.toContain("privateKey")
+    expect(Object.keys(booted.sealed.identity)).not.toContain("privateKey")
+  })
+
+  test("host.yaml names a sealed model it serves, and the agent boots through the real path", async () => {
+    const base = { operator: host.address, endpoint: "https://host.example.net", gpuClass: "h100-80g-sxm", image: IMAGE, router: routerKey.address, models: [{ name: "m", path: "/m", manifest: "/m.json", maxTps: 1 }] }
+    expect(() => parseHostYaml(JSON.stringify({ ...base, sealed: { model: "other" } }))).toThrow()
+    expect(parseHostYaml(JSON.stringify({ ...base, sealed: { model: "m" } })).sealed?.tsmRoot).toBe("/sys/kernel/config/tsm/report")
+    // An evidence command from host.yaml would run in the VM, so the key itself no longer parses.
+    expect(() => parseHostYaml(JSON.stringify({ ...base, sealed: { model: "m", gpuEvidenceCommand: ["x"] } }))).toThrow()
+    const fake = tsm()
+    const folder = hostFolder({ topLines: ["sealed:", "  model: qwen2.5-0.5b-instruct", `  tsmRoot: ${fake.root}`] })
+    stops.push(() => rmSync(folder.root, { recursive: true, force: true }))
+    const chain = {
+      chainId: async () => CHAIN_ID,
+      routerSigner: async () => routerKey.address,
+      registration: async () => ({ status: HOST_STATUS.Active, imageDigest: imageDigestFor({ image: IMAGE }), gpuClass: gpuClassOf("h100-80g-sxm"), models: [folder.digest], bondUsdg: 0n, bondOfpk: 0n, releasableCredits: 0n, pendingCredits: 0n }),
+      bondTokens: async () => ({ usdg: ZERO_BYTES32 as Hex, ofpk: ZERO_BYTES32 as Hex }),
+    }
+    const booted = await bootAgent({ configPath: folder.configPath, env: folder.env, chain, gpu: async () => SMI, gpuTool: fakeGpuCommand() })
+    expect(booted.sealed?.bootBindings.modelDigest).toBe(folder.digest)
+    expect(booted.sealed?.boot.engine).toBe("http://127.0.0.1:8000")
+    const info = (await (await booted.app.request("/offpeak/v1/info")).json()) as { sealed: boolean }
+    expect(info.sealed).toBe(true)
+    const status = (await (await booted.app.request("/offpeak/v1/attest")).json()) as { attestationRef: string }
+    expect(status.attestationRef).toBe(booted.sealed!.attestationRef)
+  })
+})
+
+describe("GET /offpeak/v1/attest", () => {
+  test("a fresh quote under the caller's nonce, with GPU evidence bound in, and the boot quote beside it", async () => {
+    const booted = await rig()
+    const nonce = `0x${"cd".repeat(32)}` as Hex
+    const reply = (await (await agentOf(booted).request(`/offpeak/v1/attest?nonce=${nonce}`)).json()) as any
+    expect(reply.nonce).toBe(nonce)
+    expect(reply.hpkePublicKey).toBe(booted.sealed.identity.publicKey)
+    expect(parseQuote(reply.quote).reportData).toBe(bytesToHex(reportDataFor(reply.bindings, nonce)))
+    expect(reply.bindings.gpuEvidenceHash).toBe(gpuEvidenceHash(reply.gpuEvidence))
+    expect(reply.bindings.hpkePublicKey).toBe(booted.sealed.identity.publicKey)
+    expect(reply.boot.quote).toBe(booted.sealed.bootQuote)
+    expect(reply.quote).not.toBe(reply.boot.quote)
+  })
+
+  test("a bad nonce, and the boot quote's zero nonce, are refused", async () => {
+    const agent = agentOf(await rig())
+    expect((await agent.request("/offpeak/v1/attest?nonce=abc")).status).toBe(400)
+    expect((await agent.request(`/offpeak/v1/attest?nonce=${ZERO_NONCE}`)).status).toBe(400)
+  })
+
+  test("the queue is bounded", async () => {
+    const booted = await rig()
+    const nonce = `0x${"cd".repeat(32)}`
+    const replies = await Promise.all(Array.from({ length: 8 }, () => agentOf(booted).request(`/offpeak/v1/attest?nonce=${nonce}`)))
+    expect(replies.filter((res) => res.status === 429).length).toBeGreaterThan(0)
+    expect(replies.filter((res) => res.status === 200).length).toBeGreaterThan(0)
+  })
+})
+
+describe("sealed serving", () => {
+  test("decrypts, forwards to vLLM on localhost and encrypts the stream back", async () => {
+    const booted = await rig()
+    const sealed = await sealedBody(booted, chat("hello inside"))
+    const { res } = await send(booted, sealed.bytes)
+    expect(res.status).toBe(200)
+    expect(res.headers.get("content-type")).toBe("application/offpeak-hpke-stream")
+    const { text } = await readReply(res, sealed)
+    expect(text).toContain("data: ")
+    expect(text).toContain("Serve")
+    expect(booted.engine.requests[0]!.body.messages[0].content).toBe("hello inside")
+    expect(booted.engine.requests[0]!.body.stream).toBe(true)
+  })
+
+  test("plaintext goes to the engine the VM attested, whatever the model table says", async () => {
+    const logger = startFakeVllm({ name: MODEL, tokenizer: byteTokenizer })
+    stops.push(logger.stop)
+    const booted = await rig({ modelEngine: logger.url })
+    const sealed = await sealedBody(booted, chat("attested engine only"))
+    await readReply((await send(booted, sealed.bytes)).res, sealed)
+    expect(booted.engine.requests.length).toBe(1)
+    expect(logger.requests.length).toBe(0)
+  })
+
+  test("every frame has one size, so a short token and a long one look the same", async () => {
+    const framesFor = async (text: string) => {
+      const booted = await rig({ reply: () => ({ text }) })
+      const sealed = await sealedBody(booted, chat("pad"))
+      const bytes = new Uint8Array(await (await send(booted, sealed.bytes)).res.arrayBuffer())
+      return new FrameSplitter().push(bytes).map((frame) => frame.raw.length)
+    }
+    const short = await framesFor("a b c d e f g h i j k l m n o p q r s t u v w x y z")
+    const long = await framesFor("extraordinarily-long-tokens-with-no-spaces-at-all-anywhere")
+    expect(new Set([...short, ...long])).toEqual(new Set([FRAME_WIRE_BYTES]))
+  })
+
+  test("padding comes back off, across frames, and a reply of no text still ends", async () => {
+    const booted = await rig({ reply: () => ({ text: "z".repeat(FRAME_DATA_BYTES * 3) }) })
+    const sealed = await sealedBody(booted, chat("long"))
+    const { text } = await readReply((await send(booted, sealed.bytes)).res, sealed)
+    expect(text.match(/"content":"z+"/g)!.join("").replaceAll(/[^z]/g, "").length).toBe(FRAME_DATA_BYTES * 3)
+    expect(text.endsWith("data: [DONE]\n\n")).toBe(true)
+    const empty = await rig({ reply: () => ({ text: "" }) })
+    const quiet = await sealedBody(empty, chat("nothing"))
+    expect((await readReply((await send(empty, quiet.bytes)).res, quiet)).text).toContain("[DONE]")
+  })
+
+  test("the response on the wire holds no plaintext", async () => {
+    const booted = await rig()
+    const sealed = await sealedBody(booted, chat("x"))
+    const { res } = await send(booted, sealed.bytes)
+    expect(Buffer.from(await res.arrayBuffer()).includes("Served")).toBe(false)
+  })
+
+  test("a repeated enc is refused, even under a new router request", async () => {
+    const booted = await rig()
+    const sealed = await sealedBody(booted, chat("once"))
+    expect((await send(booted, sealed.bytes)).res.status).toBe(200)
+    const { res } = await send(booted, sealed.bytes)
+    expect(res.status).toBe(409)
+    expect(await errorCode(res)).toBe("sealed_replayed_enc")
+    expect(booted.engine.requests.length).toBe(1)
+  })
+
+  test("two copies racing each other serve once", async () => {
+    const booted = await rig()
+    const sealed = await sealedBody(booted, chat("race"))
+    const replies = await Promise.all([send(booted, sealed.bytes), send(booted, sealed.bytes), send(booted, sealed.bytes)])
+    expect(replies.map(({ res }) => res.status).sort()).toEqual([200, 409, 409])
+  })
+
+  test("garbage under someone's enc does not burn it", async () => {
+    const booted = await rig()
+    const sealed = await sealedBody(booted, chat("mine"))
+    const garbled = sealed.bytes.slice()
+    garbled[garbled.length - 1]! ^= 1
+    expect(await errorCode((await send(booted, garbled)).res)).toBe("sealed_cannot_open")
+    expect((await send(booted, sealed.bytes)).res.status).toBe(200)
+  })
+
+  test("the replay window is ±60 s", async () => {
+    const booted = await rig()
+    const now = booted.stack.clock() * 1000
+    expect((await send(booted, (await sealedBody(booted, chat("late"), now - 60_000)).bytes)).res.status).toBe(200)
+    expect((await send(booted, (await sealedBody(booted, chat("early"), now + 60_000)).bytes)).res.status).toBe(200)
+    const late = (await send(booted, (await sealedBody(booted, chat("too late"), now - 60_001)).bytes)).res
+    const early = (await send(booted, (await sealedBody(booted, chat("too early"), now + 60_001)).bytes)).res
+    expect([late.status, early.status]).toEqual([400, 400])
+    expect(await errorCode(late)).toBe("sealed_bad_time")
+    expect(booted.engine.requests.length).toBe(2)
+  })
+
+  test("the replay book forgets only what the window already refuses, and fills closed", () => {
+    const guard = new ReplayGuard()
+    const FULL = 200_000
+    expect(guard.take("a", 1_000n, 1_000)).toBe(true)
+    expect(guard.take("a", 1_000n, 1_000)).toBe(false)
+    for (let at = 1; at < FULL; at++) guard.take(`e${at}`, 1_000n, 1_000)
+    expect(guard.take("one too many", 1_000n, 1_000)).toBe(false)
+    expect(guard.has("a")).toBe(true)
+    // Past the window these can never open again, so they may go.
+    expect(guard.take("later", 500_000n, 500_000)).toBe(true)
+    expect(guard.has("a")).toBe(false)
+  })
+
+  test("only the router can send", async () => {
+    const booted = await rig()
+    const sealed = await sealedBody(booted, chat("anyone"))
+    expect((await send(booted, sealed.bytes, { header: null })).res.status).toBe(401)
+    expect((await send(booted, sealed.bytes, { signer: host })).res.status).toBe(401)
+    expect(booted.engine.requests.length).toBe(0)
+  })
+
+  test("the router's signature covers the ciphertext and both clear limits", async () => {
+    const booted = await rig()
+    const sealed = await sealedBody(booted, chat("limits"))
+    expect((await send(booted, sealed.bytes, { maxTokens: 4096, signedMaxTokens: 8 })).res.status).toBe(401)
+    expect((await send(booted, sealed.bytes, { model: "ofm-70b", signedModel: MODEL })).res.status).toBe(401)
+    expect((await send(booted, sealed.bytes, { signedBytes: new Uint8Array(9) })).res.status).toBe(401)
+  })
+
+  test("the body cannot ask for more tokens than the clear header paid for", async () => {
+    const booted = await rig()
+    const sealed = await sealedBody(booted, chat("big ask", { max_tokens: 4096 }))
+    const { res } = await send(booted, sealed.bytes, { maxTokens: 16 })
+    await readReply(res, sealed)
+    expect(booted.engine.requests[0]!.body.max_tokens).toBe(16)
+  })
+
+  test("max_completion_tokens is held to the same limit, and a body with none takes it", async () => {
+    const booted = await rig()
+    const first = await sealedBody(booted, chat("alias", { max_tokens: undefined, max_completion_tokens: 4096 }))
+    await readReply((await send(booted, first.bytes, { maxTokens: 12 })).res, first)
+    expect(booted.engine.requests[0]!.body.max_tokens).toBe(12)
+    const second = await sealedBody(booted, chat("none", { max_tokens: undefined }))
+    await readReply((await send(booted, second.bytes, { maxTokens: 7 })).res, second)
+    expect(booted.engine.requests[1]!.body.max_tokens).toBe(7)
+  })
+
+  test("a smaller ask inside stands", async () => {
+    const booted = await rig()
+    const sealed = await sealedBody(booted, chat("small", { max_tokens: 5 }))
+    await readReply((await send(booted, sealed.bytes, { maxTokens: 64 })).res, sealed)
+    expect(booted.engine.requests[0]!.body.max_tokens).toBe(5)
+  })
+
+  test("the body must name the model the clear header priced", async () => {
+    const booted = await rig()
+    const sealed = await sealedBody(booted, chat("x", { model: "ofm-70b" }))
+    const { res } = await send(booted, sealed.bytes)
+    expect(await errorCode(res)).toBe("sealed_model_mismatch")
+    expect(booted.engine.requests.length).toBe(0)
+  })
+
+  test("bad bodies are refused without reaching vLLM", async () => {
+    const booted = await rig()
+    const raw = await sealRequest(await publicKeyFrom(hexToBytes(booted.sealed.identity.publicKey)), new TextEncoder().encode("not json"), SEALED_PATH, booted.stack.clock() * 1000)
+    expect(await errorCode((await send(booted, raw.bytes)).res)).toBe("bad_request")
+    expect(await errorCode((await send(booted, (await sealedBody(booted, { model: MODEL })).bytes)).res)).toBe("bad_request")
+    expect(await errorCode((await send(booted, (await sealedBody(booted, chat("x", { max_tokens: -1 }))).bytes)).res)).toBe("bad_max_tokens")
+    expect((await send(booted, new Uint8Array(5))).res.status).toBe(400)
+    expect(booted.engine.requests.length).toBe(0)
+  })
