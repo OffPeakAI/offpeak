@@ -1,0 +1,14 @@
+{
+  "name": "@offpeak/rulings",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "dev": "bun run src/main.ts" },
+  "dependencies": {
+    "@offpeak/abis": "workspace:*",
+    "@offpeak/audit-tests": "workspace:*",
+    "@offpeak/common": "workspace:*",
+    "@offpeak/shared": "workspace:*",
+    "viem": "^2.38.0"
+  }
+}
