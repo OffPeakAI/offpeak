@@ -432,3 +432,199 @@ describe("sealed serving", () => {
     expect((await send(booted, new Uint8Array(5))).res.status).toBe(400)
     expect(booted.engine.requests.length).toBe(0)
   })
+
+  test("missing or impossible clear limits are refused", async () => {
+    const booted = await rig()
+    const sealed = await sealedBody(booted, chat("x"))
+    expect((await send(booted, sealed.bytes, { maxTokens: 0 })).res.status).toBe(400)
+    expect((await send(booted, sealed.bytes, { maxTokens: 5000 })).res.status).toBe(400)
+  })
+
+  test("a request for a key this boot does not hold cannot open", async () => {
+    const booted = await rig()
+    const other = await booted.restartHost()
+    const sealed = await sealedBody(booted, chat("old key"), undefined, booted.sealed.identity.publicKey)
+    expect(other.identity.publicKey).not.toBe(booted.sealed.identity.publicKey)
+    expect(await errorCode((await send(booted, sealed.bytes)).res)).toBe("sealed_cannot_open")
+  })
+
+  const deep = (depth: number) => JSON.parse(`${"[".repeat(depth)}1${"]".repeat(depth)}`) as unknown
+
+  test("tools nested past the limit are refused before the engine runs", async () => {
+    const booted = await rig()
+    const { res } = await send(booted, (await sealedBody(booted, chat("deep", { tools: [{ type: "function", deep: deep(12_000) }] }))).bytes)
+    expect(res.status).toBe(400)
+    expect(await errorCode(res)).toBe("bad_request")
+    expect(booted.engine.requests.length).toBe(0)
+  })
+
+  test("the depth check needs no stack, and real tool schemas pass it", () => {
+    let nested: unknown = 1
+    for (let depth = 0; depth < 1_000_000; depth += 1) nested = [nested]
+    expect(withinDepth(nested)).toBe(false)
+    expect(withinDepth(deep(62))).toBe(true)
+    expect(withinDepth({ type: "object", properties: { a: { type: "array", items: { type: "string" } } } })).toBe(true)
+  })
+
+  test("a body the tokenizer cannot count never reaches the engine, so no output goes unbilled", async () => {
+    const tokenizer = {
+      ...byteTokenizer,
+      countChat: () => {
+        throw new RangeError("too deep")
+      },
+    }
+    const booted = await rig({ tokenizer })
+    const { res } = await send(booted, (await sealedBody(booted, chat("cannot count"))).bytes)
+    expect(res.status).toBe(400)
+    expect(await errorCode(res)).toBe("uncountable")
+    expect(booted.engine.requests.length).toBe(0)
+    expect(countInput(tokenizer, { messages: [] })).toBeNull()
+  })
+
+  test("a count the ciphertext could not hold is refused before the engine runs", async () => {
+    const booted = await rig({ tokenizer: { ...byteTokenizer, countChat: () => 1_000_000 } })
+    const { res } = await send(booted, (await sealedBody(booted, chat("too many"))).bytes)
+    expect(await errorCode(res)).toBe("uncountable")
+    expect(booted.engine.requests.length).toBe(0)
+  })
+
+  test("the input is counted once, up front", async () => {
+    let calls = 0
+    const booted = await rig({ tokenizer: { ...byteTokenizer, countChat: (body) => ((calls += 1), byteTokenizer.countChat(body)) } })
+    const sealed = await sealedBody(booted, chat("once"))
+    await readReply((await send(booted, sealed.bytes)).res, sealed)
+    expect(calls).toBe(1)
+  })
+
+  test("vLLM's error text never leaves the VM", async () => {
+    const booted = await rig({ failWith: 400 })
+    const { res } = await send(booted, (await sealedBody(booted, chat("rejected prompt"))).bytes)
+    expect(res.status).toBe(502)
+    const body = await res.text()
+    expect(body).not.toContain("engine failed")
+    expect(body).toContain("engine_refused")
+  })
+
+  test("/offpeak/v1/info says sealed", async () => {
+    const info = (await (await agentOf(await rig()).request("/offpeak/v1/info")).json()) as { sealed: boolean }
+    expect(info.sealed).toBe(true)
+  })
+})
+
+describe("sealed counts and signing", () => {
+  /** A record for what was served, as the router would build it from the VM's counts. */
+  async function recordFor(booted: Rig, reqId: Hex, promptHash: Hex, outputHash: Hex, reported: { tokensIn: number; tokensOut: number }) {
+    const { stack } = booted
+    const sheet = stack.sheets[0]!
+    const price = livePrice(sheet, hourOfWeek(stack.clock()), loadFactorBps(0))
+    const record: UsageRecord = {
+      reqId,
+      buyerRef: buyerRefOf(booted.buyer, reqId),
+      host: booted.host as Hex,
+      modelDigest: booted.modelDigest,
+      ...reported,
+      promptHash,
+      outputHash,
+      priceIn: price.in,
+      priceOut: price.out,
+      hostCostMicro: hostCostMicro(reported.tokensIn, reported.tokensOut, price.in, price.out),
+      feeMicro: 1n,
+      payMode: 0,
+      payRef: ZERO_BYTES32 as Hex,
+      ts: stack.clock(),
+      sheetHash: sheet.sheetHash,
+    }
+    return record
+  }
+
+  async function sign(booted: Rig, record: UsageRecord, partial?: boolean) {
+    const routerSig = await signTyped(booted.stack.router, { domain: domain("OffpeakUsage", booted.stack.usageLedger), types: usageTypes, primaryType: "UsageRecord", message: recordToMessage(record) as never })
+    const res = await agentOf(booted).request("/offpeak/v1/sign", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ record: serializeRecord(record), routerSig, partial }) })
+    return { status: res.status, body: (await res.json()) as Record<string, any> }
+  }
+
+  async function served(booted: Rig) {
+    const sealed = await sealedBody(booted, chat("count me"))
+    const promptHash = keccak256(sealed.bytes)
+    const { res, reqId } = await send(booted, sealed.bytes)
+    const { outputHash } = await readReply(res, sealed)
+    return { reqId, promptHash, outputHash }
+  }
+
+  test("the VM's counts come back with hashes over ciphertext, not plaintext", async () => {
+    const booted = await rig()
+    const { reqId, promptHash, outputHash } = await served(booted)
+    const res = await counts(booted, reqId)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { tokensIn: number; tokensOut: number; promptHash: string; outputHash: string }
+    expect(body.tokensIn).toBeGreaterThan(0)
+    expect(body.tokensOut).toBeGreaterThan(0)
+    expect(body).toMatchObject({ promptHash, outputHash })
+  })
+
+  test("the counts carry the VM's signature, under the key its bindings name", async () => {
+    const booted = await rig()
+    const { reqId } = await served(booted)
+    const signed = sealedCountsSchema.parse(await (await counts(booted, reqId)).json())
+    expect(signed.reqId).toBe(reqId)
+    expect(await countsSignedBy(signed, booted.sealed.bootBindings.countsSigner)).toBe(true)
+    expect(await countsSignedBy({ ...signed, tokensOut: signed.tokensOut + 1 }, booted.sealed.bootBindings.countsSigner)).toBe(false)
+    expect(await countsSignedBy(signed, host.address)).toBe(false)
+  })
+
+  test("counts are for the router only, and only for a sealed request", async () => {
+    const booted = await rig()
+    const { reqId } = await served(booted)
+    expect((await counts(booted, reqId, host)).status).toBe(401)
+    expect((await agentOf(booted).request(`${SEALED_COUNTS_ROUTE}/${reqId}`)).status).toBe(401)
+    expect((await counts(booted, newReq())).status).toBe(404)
+  })
+
+  test("a record with the right hashes is signed", async () => {
+    const booted = await rig()
+    const { reqId, promptHash, outputHash } = await served(booted)
+    const reported = (await (await counts(booted, reqId)).json()) as { tokensIn: number; tokensOut: number }
+    const { status, body } = await sign(booted, await recordFor(booted, reqId, promptHash, outputHash, { tokensIn: reported.tokensIn, tokensOut: reported.tokensOut }))
+    expect(status).toBe(200)
+    expect(body.hostSig).toMatch(/^0x/)
+  })
+
+  test("a record whose hashes are not over these ciphertext bytes is refused", async () => {
+    const booted = await rig()
+    const { reqId, promptHash, outputHash } = await served(booted)
+    const reported = (await (await counts(booted, reqId)).json()) as { tokensIn: number; tokensOut: number }
+    const shape = { tokensIn: reported.tokensIn, tokensOut: reported.tokensOut }
+    const wrong = `0x${"12".repeat(32)}` as Hex
+    expect((await sign(booted, await recordFor(booted, reqId, wrong, outputHash, shape))).body.reason).toBe("sealed_prompt_hash")
+    expect((await sign(booted, await recordFor(booted, reqId, promptHash, wrong, shape))).body.reason).toBe("sealed_output_hash")
+  })
+
+  test("a cut stream may differ on output, since the router saw less, but never on the prompt", async () => {
+    const booted = await rig()
+    const { reqId, promptHash } = await served(booted)
+    const reported = (await (await counts(booted, reqId)).json()) as { tokensIn: number; tokensOut: number }
+    const wrong = `0x${"12".repeat(32)}` as Hex
+    const shape = { tokensIn: reported.tokensIn, tokensOut: reported.tokensOut }
+    expect((await sign(booted, await recordFor(booted, reqId, wrong, wrong, shape), true)).body.reason).toBe("sealed_prompt_hash")
+    expect((await sign(booted, await recordFor(booted, reqId, promptHash, wrong, shape), true)).status).toBe(200)
+  })
+
+  test("counts outside tolerance are refused here as for any request", async () => {
+    const booted = await rig()
+    const { reqId, promptHash, outputHash } = await served(booted)
+    expect((await sign(booted, await recordFor(booted, reqId, promptHash, outputHash, { tokensIn: 9_999, tokensOut: 9_999 }))).body.reason).toBe("counts")
+  })
+
+  test("the signed log keeps ciphertext hashes, and nothing derived from plaintext", async () => {
+    const booted = await rig()
+    const { reqId, promptHash, outputHash } = await served(booted)
+    const reported = (await (await counts(booted, reqId)).json()) as { tokensIn: number; tokensOut: number }
+    await sign(booted, await recordFor(booted, reqId, promptHash, outputHash, { tokensIn: reported.tokensIn, tokensOut: reported.tokensOut }))
+    const folder = (booted.log as unknown as { dir: string }).dir
+    const logged = readdirSync(folder).map((name) => readFileSync(join(folder, name), "utf8")).join("")
+    expect((JSON.parse(logged.trim().split("\n").at(-1)!) as { hostOutputHash: string }).hostOutputHash).toBe(outputHash)
+    expect(logged).not.toContain(outputHashOf("Served in the sealed VM.", []))
+    expect(logged).not.toContain("count me")
+    expect(logged).not.toContain("Served in the sealed VM.")
+  })
+})

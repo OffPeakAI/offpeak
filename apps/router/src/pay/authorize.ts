@@ -176,3 +176,88 @@ export async function authorize(stack: Stack, payer: Payer, maxCostMicro: bigint
     reservedTokens: windowRun!.reservedTokens,
   }
 }
+
+export async function release(stack: Stack, pay: PayHold) {
+  if (pay.kind === "prepaid") await stack.ledger.release(pay.wallet, pay.holdId)
+  if (pay.kind === "channel") await releaseChannel(stack.db, pay.reservationId)
+  if (pay.kind === "window") await stack.counters.add(pay.pendingKey, -pay.reservedTokens, 3 * 86_400)
+  // The money may already be on chain. The sweep refunds it once the chain says so.
+  if (pay.kind === "exact") await stack.db.query("UPDATE serving.x402_requests SET status = 'refund_due' WHERE req_id = $1 AND status = 'submitted'", [pay.payRef])
+}
+
+/** A slot lasts until the chain answers for this payment, or a request would have given up waiting for it. */
+async function holdUnconfirmedSlot(stack: Stack, wallet: string, reqId: string) {
+  const key = `offpeak:unconfirmed:${wallet.toLowerCase()}`
+  const free = () => stack.counters.add(key, -1n, UNCONFIRMED_TTL_S)
+  if ((await stack.counters.add(key, 1n, UNCONFIRMED_TTL_S)) > MAX_UNCONFIRMED) {
+    await free()
+    return false
+  }
+  void waitAuthorized(stack, reqId, stack.preconfirmTimeoutMs)
+    .then(free)
+    .catch((err) => console.error(JSON.stringify({ service: "router", event: "unconfirmed_slot_failed", reqId, error: String(err) })))
+  return true
+}
+
+function witnessAmount(payment: PaymentPayload) {
+  const amount = String(payment.payload.witness.amount ?? "")
+  return /^\d{1,30}$/.test(amount) ? BigInt(amount) : null
+}
+
+/** Written before the money can move, so a crash at any later point still leaves a row for the sweep to refund. */
+async function noteExact(stack: Stack, reqId: string, payer: string, amount: bigint, payment: PaymentPayload) {
+  await stack.db.query("INSERT INTO serving.x402_requests (req_id, payer, max_amount, status, valid_before, created_at) VALUES ($1,$2,$3,'submitted',$4,$5) ON CONFLICT (req_id) DO NOTHING", [
+    reqId,
+    payer,
+    amount.toString(),
+    String(payment.payload.witness.validBefore ?? 0),
+    stack.clock(),
+  ])
+}
+
+export async function waitAuthorized(stack: Stack, reqId: string, timeoutMs: number): Promise<"ok" | "fail" | "timeout"> {
+  const key = reqId.toLowerCase()
+  const known = stack.authResults.get(key)
+  if (known) return known
+  const decided = new Promise<"ok" | "fail" | "timeout">((resolve) => {
+    const finish = (kind: string) => {
+      clearTimeout(timer)
+      resolve(kind === "fail" ? "fail" : "ok")
+    }
+    const timer = setTimeout(() => {
+      const list = stack.authWaiters.get(key)?.filter((fn) => fn !== finish) ?? []
+      if (list.length > 0) stack.authWaiters.set(key, list)
+      else stack.authWaiters.delete(key)
+      resolve("timeout")
+    }, timeoutMs)
+    stack.authWaiters.set(key, [...(stack.authWaiters.get(key) ?? []), finish])
+  })
+  const row = await stack.indexer.escrow(key).catch(() => null)
+  if (row?.status === "authorized" || row?.status === "captured") settleAuthorization(stack, key, "ok")
+  return decided
+}
+
+export function paymentRequiredResponse(stack: Stack, maxAmount: bigint, exact: boolean) {
+  const reqId = `0x${randomBytes(32).toString("hex")}` as Hex
+  const built = paymentRequired({
+    asset: stack.usdg as Hex,
+    channelManager: stack.channelManager as Hex,
+    payee: stack.channelPayee.toLowerCase() as Hex,
+    vault: stack.vault as Hex,
+    permit2: stack.permit2,
+    escrow: stack.escrow as Hex,
+    maxAmount,
+    reqId,
+    validBefore: stack.clock() + 600,
+    resourceHash: ZERO_BYTES32,
+    exact,
+    creditLimit: creditLimit(1_000_000n).toString(),
+    channels: stack.flags.channels,
+    x402: stack.flags.upto,
+  })
+  const message = built.accepts.length > 0 ? "Payment required" : "Send an API key. Only prepaid balances are switched on"
+  return Response.json({ x402Version: 2, accepts: built.accepts, error: { message, type: "payment", code: "payment_required" } }, {
+    status: 402,
+    headers: { "payment-required": JSON.stringify({ accepts: built.accepts }) },
+  })
+}

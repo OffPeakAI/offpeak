@@ -277,3 +277,192 @@ describe("one signature per request", () => {
     expect(day).toHaveLength(1)
     expect(readFileSync(join(dataDir, "signed", day[0]!), "utf8").trim().split("\n")).toHaveLength(1)
   })
+
+  test("a second, different record for that request is refused", async () => {
+    const { sign, good } = await served()
+    expect((await sign(good)).status).toBe(200)
+    const lower = { ...good, tokensOut: good.tokensOut - 1, hostCostMicro: hostCostMicro(good.tokensIn, good.tokensOut - 1, good.priceIn, good.priceOut) }
+    expect((await sign(lower)).body.reason).toBe("already_signed")
+  })
+
+  test("two different records at once cannot both be signed", async () => {
+    const { sign, good } = await served()
+    const lower = { ...good, tokensOut: good.tokensOut - 1, hostCostMicro: hostCostMicro(good.tokensIn, good.tokensOut - 1, good.priceIn, good.priceOut) }
+    const replies = await Promise.all([sign(good), sign(lower)])
+    expect(replies.map((reply) => reply.status).sort()).toEqual([200, 409])
+  })
+
+  test("a refused record can be corrected", async () => {
+    const { sign, good } = await served()
+    expect((await sign({ ...good, hostCostMicro: 1n })).status).toBe(409)
+    expect((await sign(good)).status).toBe(200)
+  })
+})
+
+describe("the signing log", () => {
+  test("holds the record, both signatures and vLLM's usage, and no text", async () => {
+    const { sign, good, dataDir, routerSig, tokensIn, tokensOut } = await served()
+    const { body } = await sign(good)
+    const [file] = readdirSync(join(dataDir, "signed"))
+    expect(file).toBe(`signed-${new Date(NOW * 1000).toISOString().slice(0, 10)}.jsonl`)
+    const raw = readFileSync(join(dataDir, "signed", file!), "utf8")
+    const entry = JSON.parse(raw)
+    expect(parseRecord(entry.record)).toEqual(parseRecord(serializeRecord(good)))
+    expect(entry.routerSig).toBe(await routerSig(good))
+    expect(entry.hostSig).toBe(body.hostSig)
+    expect(entry.hostCounts).toEqual({ tokensIn, tokensOut })
+    expect(entry.engineUsage.prompt_tokens).toBe(tokensIn)
+    expect(entry.engineUsage.completion_tokens).toBe(tokensOut)
+    expect(raw).not.toContain("Say something")
+    expect(raw).not.toContain("neural networks")
+  })
+
+  test("a log that cannot be written stops the signature", async () => {
+    const { sign, good, log } = await served()
+    log.append = async () => {
+      throw new Error("disk full")
+    }
+    const reply = await sign(good)
+    expect(reply.status).toBe(500)
+    expect(reply.body.hostSig).toBeUndefined()
+    expect(reply.body.reason).toBe("sign_failed")
+  })
+
+  test("drops days past 30 and nothing else", async () => {
+    const { dataDir } = await harness()
+    const dir = join(dataDir, "signed")
+    const log = new SignedLog(dir)
+    const day = (back: number) => new Date((NOW - back * 86_400) * 1000).toISOString().slice(0, 10)
+    for (const back of [31, 30, 1]) writeFileSync(join(dir, `signed-${day(back)}.jsonl`), "{}\n")
+    writeFileSync(join(dir, "notes.txt"), "keep")
+    await log.prune(NOW)
+    expect(readdirSync(dir).sort()).toEqual([`signed-${day(30)}.jsonl`, `signed-${day(1)}.jsonl`, "notes.txt"].sort())
+  })
+
+  const anEntry = { at: NOW, record: {} as never, routerSig: "0x" as Hex, hostSig: "0x" as Hex, leaf: "0x" as Hex, partial: false, hostCounts: { tokensIn: 1, tokensOut: 1 }, engineUsage: null, hostOutputHash: null }
+
+  test("an entry is on disk before append returns", async () => {
+    const { dataDir } = await harness()
+    const steps: string[] = []
+    const watching = (async (...args: Parameters<typeof open>) => {
+      const file = await open(...args)
+      const { appendFile, sync } = file
+      file.appendFile = (...rest: Parameters<typeof appendFile>) => (steps.push("write"), appendFile.apply(file, rest))
+      file.sync = () => (steps.push("sync"), sync.apply(file))
+      return file
+    }) as typeof open
+    const log = new SignedLog(join(dataDir, "signed"), watching)
+    await log.open()
+    await log.append(anEntry)
+    expect(steps.slice(0, 2)).toEqual(["write", "sync"])
+    steps.length = 0
+    await log.append(anEntry)
+    expect(steps).toEqual(["write", "sync"])
+  })
+
+  test("a line cut short by a crash stays apart from the next entry", async () => {
+    const { dataDir } = await harness()
+    const dir = join(dataDir, "signed")
+    const file = join(dir, `signed-${new Date(NOW * 1000).toISOString().slice(0, 10)}.jsonl`)
+    writeFileSync(file, `${JSON.stringify({ whole: 1 })}\n{"cut":"sho`)
+    const log = new SignedLog(dir)
+    await log.open()
+    await log.append(anEntry)
+    const lines = readFileSync(file, "utf8").trim().split("\n")
+    expect(lines).toHaveLength(3)
+    expect(lines[1]).toBe('{"cut":"sho')
+    expect(JSON.parse(lines[2]!).at).toBe(NOW)
+  })
+
+  test("reopening a clean log adds nothing", async () => {
+    const { dataDir } = await harness()
+    const dir = join(dataDir, "signed")
+    const log = new SignedLog(dir)
+    await log.open()
+    await log.append(anEntry)
+    const [name] = readdirSync(dir)
+    const before = readFileSync(join(dir, name!), "utf8")
+    await new SignedLog(dir).open()
+    expect(readFileSync(join(dir, name!), "utf8")).toBe(before)
+  })
+
+  test("entries written at once stay whole lines", async () => {
+    const { dataDir } = await harness()
+    const dir = join(dataDir, "signed")
+    const log = new SignedLog(dir)
+    await log.open()
+    await Promise.all(Array.from({ length: 50 }, () => log.append(anEntry)))
+    const [name] = readdirSync(dir)
+    for (const line of readFileSync(join(dir, name!), "utf8").trim().split("\n")) expect(JSON.parse(line).at).toBe(NOW)
+  })
+
+  test("appends and never rewrites", async () => {
+    const { dataDir } = await harness()
+    const log = new SignedLog(join(dataDir, "signed"))
+    const entry = { at: NOW, record: {} as never, routerSig: "0x" as Hex, hostSig: "0x" as Hex, leaf: "0x" as Hex, partial: false, hostCounts: { tokensIn: 1, tokensOut: 1 }, engineUsage: null, hostOutputHash: null }
+    await log.append(entry)
+    await log.append(entry)
+    const [file] = readdirSync(join(dataDir, "signed"))
+    expect(readFileSync(join(dataDir, "signed", file!), "utf8").trim().split("\n")).toHaveLength(2)
+  })
+})
+
+describe("what the host counts", () => {
+  test("tool calls fold across chunks the way the router folds them", async () => {
+    const toolCalls = [{ id: "call_1", type: "function", function: { name: "lookup", arguments: '{"q": "1"}' } }]
+    const { sign, record, reqId, tokensIn } = await served({ reply: () => ({ text: "", toolCalls }) })
+    const tokensOut = tokenizer.countOutput("", toolCalls, "tool_calls")
+    const { status, body } = await sign(record(reqId, { tokensIn, tokensOut }))
+    expect(status).toBe(200)
+    expect(body.hostCounts.tokensOut).toBe(tokensOut)
+  })
+
+  test("a reply cut by max_tokens counts no end token", async () => {
+    const { sign, record, reqId, tokensIn } = await served({ reply: () => ({ text: REPLY, finish: "length" }) })
+    const tokensOut = tokenizer.countText(REPLY)
+    expect((await sign(record(reqId, { tokensIn, tokensOut }))).body.hostCounts.tokensOut).toBe(tokensOut)
+  })
+
+  test("a prompt the template cannot render leaves the host with nothing to sign", async () => {
+    const row = await harness({ model: { tokenizer: { ...pick(tokenizer), countChat: () => { throw new Error("template failed") } } } })
+    const { reqId } = await row.serve()
+    expect((await row.sign(row.record(reqId, { tokensIn: 1, tokensOut: 1 }))).body.reason).toBe("uncounted")
+  })
+
+  test("the digest and name in the record match the manifest", () => {
+    expect(DIGEST).toBe("0x9599ee65e52af1a4254555c5d515ea86484eff63776402469bc1c640636875c9")
+  })
+})
+
+function pick(source: typeof tokenizer) {
+  return {
+    render: source.render.bind(source),
+    encode: source.encode.bind(source),
+    decodeToken: source.decodeToken.bind(source),
+    countChat: source.countChat.bind(source),
+    countOutput: source.countOutput.bind(source),
+    countInputs: source.countInputs.bind(source),
+  }
+}
+
+test("no record is signed while its stream is still running", async () => {
+  let release = () => {}
+  const hold = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const row = await harness({ hold })
+  const { res, reqId } = await row.post("/offpeak/v1/chat/completions", row.chatBody())
+  const reading = res.text()
+  let finished = false
+  const signing = row.sign(row.record(reqId, { tokensIn: 1, tokensOut: 1 }), { partial: true }).then((reply) => {
+    finished = true
+    return reply
+  })
+  await Bun.sleep(30)
+  expect(finished).toBe(false)
+  release()
+  await reading
+  const reply = await signing
+  expect(reply.body.reason).toBe("counts")
+  expect(reply.body.hostCounts.tokensOut).toBe(tokenizer.countOutput(REPLY, undefined, "stop"))
+})

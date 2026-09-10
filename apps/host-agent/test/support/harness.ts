@@ -98,3 +98,99 @@ let nextReq = 0
 export const newReqId = () => keccak256(toBytes(`req-${Date.now()}-${nextReq++}`))
 
 type HarnessOptions = Partial<FakeVllmOptions> & { nightJobs?: boolean; integrityFailed?: string; auditor?: Hex | null; model?: Partial<AgentModel> }
+
+export async function agentHarness(opts: HarnessOptions = {}) {
+  const dataDir = mkdtempSync(join(tmpdir(), "offpeak-agent-"))
+  const engine = startFakeVllm({ name: MODEL, tokenizer, ...opts })
+  const sheets = new SheetBook(join(dataDir, "sheets"), host.address.toLowerCase(), REGISTRY)
+  await sheets.load()
+  const sheet = baseSheet()
+  const sheetHash = await sheets.save(sheet, await signSheet(sheet))
+  const log = new SignedLog(join(dataDir, "signed"))
+  await log.open()
+  const clock = { now: NOW }
+  const integrity = { failed: opts.integrityFailed ?? null }
+  const app = createAgentApp({
+    operator: host as never,
+    routerAddress: router.address,
+    usageLedger: LEDGER,
+    sheets,
+    log,
+    clock: () => clock.now,
+    imageDigest: IMAGE_DIGEST,
+    gpuClass: "h100-80g-sxm",
+    models: [{ name: MODEL, digest: DIGEST, engine: engine.url, tokenizer, nightJobs: opts.nightJobs ?? false, ...opts.model }],
+    integrity,
+    engines: new EngineWatch([{ name: MODEL, engine: engine.url, vllmArgs: [] }]),
+    auditor: opts.auditor === undefined ? (auditor.address.toLowerCase() as Hex) : opts.auditor,
+  })
+
+  /** A request as the router sends it: signed over the exact bytes. */
+  const post = async (path: string, body: unknown, over: { reqId?: Hex; ts?: number; signer?: unknown; rawBody?: string; signedBody?: string; header?: string | null; headerName?: string } = {}) => {
+    const reqId = over.reqId ?? newReqId()
+    const payload = over.signedBody ?? JSON.stringify(body)
+    const header = over.header === undefined ? await signRouterBody((over.signer ?? router) as never, { reqId, ts: over.ts ?? clock.now, payload }) : over.header
+    const res = await app.request(path, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(header ? { [over.headerName ?? "x-offpeak-req"]: header } : {}) },
+      body: over.rawBody ?? payload,
+    })
+    return { res, reqId }
+  }
+
+  const chatBody = (over: Record<string, unknown> = {}) => ({ model: MODEL, messages: [{ role: "user", content: "Say something." }], stream: true, max_tokens: 64, stream_options: { include_usage: true }, ...over })
+
+  /** Serves one chat to the end, as the router would read it. */
+  const serve = async (over: Record<string, unknown> = {}) => {
+    const body = chatBody(over)
+    const { res, reqId } = await post("/offpeak/v1/chat/completions", body)
+    const text = await res.text()
+    return { res, reqId, text, body }
+  }
+
+  /** A record that passes every check for a served reply. Tests change one field at a time. */
+  const record = (reqId: Hex, over: Partial<UsageRecord> = {}): UsageRecord => {
+    const tokensIn = over.tokensIn ?? 0
+    const tokensOut = over.tokensOut ?? 0
+    const priceIn = over.priceIn ?? LIVE.in
+    const priceOut = over.priceOut ?? LIVE.out
+    return {
+      reqId,
+      buyerRef: buyerRefOf(buyer.address, reqId),
+      host: host.address.toLowerCase() as Hex,
+      modelDigest: DIGEST,
+      tokensIn,
+      tokensOut,
+      promptHash: promptHashOf({ any: 1 }),
+      outputHash: outputHashOf("text", []),
+      priceIn,
+      priceOut,
+      hostCostMicro: hostCostMicro(tokensIn, tokensOut, priceIn, priceOut),
+      feeMicro: 1n,
+      payMode: 0,
+      payRef: ZERO_BYTES32,
+      ts: NOW,
+      sheetHash,
+      ...over,
+    }
+  }
+
+  const routerSig = (rec: UsageRecord, signer: unknown = router, ledger: string = LEDGER) =>
+    signTyped(signer as never, { domain: domain("OffpeakUsage", ledger), types: usageTypes, primaryType: "UsageRecord", message: recordToMessage(rec) as never })
+
+  const sign = async (rec: UsageRecord, over: { partial?: boolean; signer?: unknown; sig?: Hex } = {}) => {
+    const res = await app.request("/offpeak/v1/sign", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ record: serializeRecord(rec), routerSig: over.sig ?? (await routerSig(rec, over.signer)), partial: over.partial }),
+    })
+    return { status: res.status, body: (await res.json()) as Record<string, any> }
+  }
+
+  const stop = () => {
+    engine.stop()
+    rmSync(dataDir, { recursive: true, force: true })
+  }
+
+  return { app, engine, sheets, sheet, sheetHash, log, dataDir, clock, integrity, post, chatBody, serve, record, routerSig, sign, stop }
+}
