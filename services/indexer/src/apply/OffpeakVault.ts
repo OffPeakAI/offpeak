@@ -86,3 +86,84 @@ async function applyCollection(tx: Db, e: ChainEvent) {
     [e.args.paymentId, e.txHash, hour],
   )
 }
+
+export async function applyOffpeakVault(tx: Db, e: ChainEvent) {
+  const args = e.args
+  switch (e.event) {
+    case "Deposited":
+    case "Withdrawn": {
+      const buyer = addr(args.buyer)
+      await touchBuyer(tx, buyer)
+      await tx.query("UPDATE chain.buyers SET balance = $1 WHERE address = $2", [args.balance, buyer])
+      return
+    }
+    case "Debited": {
+      const buyer = addr(args.buyer)
+      await touchBuyer(tx, buyer)
+      await tx.query("UPDATE chain.buyers SET balance = $1 WHERE address = $2", [args.balance, buyer])
+      return
+    }
+    case "CapsChanged": {
+      const buyer = addr(args.buyer)
+      await touchBuyer(tx, buyer)
+      await tx.query(
+        `UPDATE chain.buyers SET hourly_cap = $1, daily_cap = $2, pending_hourly_cap = 0, pending_daily_cap = 0,
+           caps_effective_after_hour = 0 WHERE address = $3`,
+        [args.hourlyCap, args.dailyCap, buyer],
+      )
+      return
+    }
+    case "CapsChangeRequested": {
+      const buyer = addr(args.buyer)
+      await touchBuyer(tx, buyer)
+      await tx.query(
+        `UPDATE chain.buyers SET pending_hourly_cap = $1, pending_daily_cap = $2, caps_effective_after_hour = $3
+         WHERE address = $4`,
+        [args.hourlyCap, args.dailyCap, args.effectiveAfterHour, buyer],
+      )
+      return
+    }
+    case "WithdrawAllRequested": {
+      const buyer = addr(args.buyer)
+      await touchBuyer(tx, buyer)
+      await tx.query("UPDATE chain.buyers SET withdraw_requested_at = $1 WHERE address = $2", [args.requestedAt, buyer])
+      return
+    }
+    case "WithdrawAllCancelled":
+      await tx.query("UPDATE chain.buyers SET withdraw_requested_at = 0 WHERE address = $1", [addr(args.buyer)])
+      return
+    case "WithdrawAllExecuted":
+      await tx.query("UPDATE chain.buyers SET balance = 0, withdraw_requested_at = 0 WHERE address = $1", [addr(args.buyer)])
+      return
+    case "Refunded": {
+      const payer = addr(args.payer)
+      await touchBuyer(tx, payer)
+      await tx.query("UPDATE chain.buyers SET balance = balance + $1 WHERE address = $2", [args.amount, payer])
+      await tx.query(
+        `INSERT INTO chain.refunds_paid (refund_id, payer, amount, tx_hash) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING`,
+        [args.refundId, payer, args.amount, e.txHash],
+      )
+      await tx.query(
+        `UPDATE shared.refunds SET paid_hour = $1 WHERE id IN (SELECT id FROM chain.refund_ids WHERE refund_id = $2)`,
+        [hourIndex(e.blockTs), args.refundId],
+      )
+      return
+    }
+    case "Settled":
+      await applySettled(tx, e)
+      return
+    case "AgentPoolCredited":
+      await applyCollection(tx, e)
+      return
+    case "Paused":
+      await tx.query("UPDATE chain.vault_state SET usage_paused = $1, settles_paused = $2", [args.usagePaused, args.settlesPaused])
+      return
+    case "SignersChanged":
+      await tx.query(
+        `INSERT INTO chain.signer_sets (contract, block, signers) VALUES ('OffpeakVault', $1, $2::jsonb)
+         ON CONFLICT DO NOTHING`,
+        [e.blockNumber, JSON.stringify(args.newSigners)],
+      )
+      return
+  }
+}

@@ -89,3 +89,95 @@ function typedMessage(payload: PaymentPayload["payload"], scheme: "upto" | "exac
     },
   } as const
 }
+
+/** An EOA recovers. A contract wallet names itself and answers EIP-1271. */
+async function recoverPayer(deps: VerifyDeps, payload: PaymentPayload["payload"], scheme: "upto" | "exact"): Promise<Address | null> {
+  const typed = typedMessage(payload, scheme)
+  const claimed = payload.payer ? getAddress(payload.payer) : null
+  const recovered = await recoverTypedDataAddress({ ...typed, signature: payload.signature } as never).catch(() => null)
+  if (recovered && (!claimed || isAddressEqual(recovered, claimed))) return recovered
+  if (!claimed) return null
+  const answer = await deps.reader
+    .readContract({
+      address: claimed,
+      abi: eip1271Abi,
+      functionName: "isValidSignature",
+      args: [hashTypedData(typed as never), payload.signature],
+    })
+    .catch(() => null)
+  return answer === EIP1271_MAGIC ? claimed : null
+}
+
+function checkTerms(deps: VerifyDeps, body: VerifyBody, now: number): string | null {
+  const { paymentPayload: payment, paymentRequirements: required } = body
+  const { payload } = payment
+  if (payment.x402Version !== undefined && payment.x402Version !== 1 && payment.x402Version !== 2) return "unsupported_version"
+  if (payment.scheme === "channel") return "use_channel_header"
+  if (payment.scheme !== "upto" && payment.scheme !== "exact") return "unsupported_scheme"
+  if ((payment.network ?? NETWORK) !== NETWORK || (required.network ?? NETWORK) !== NETWORK) return "wrong_network"
+  if (!isAddressEqual(payload.permitted.token, deps.usdg) || !isAddressEqual(required.asset as Address, deps.usdg)) return "wrong_asset"
+  const w = payload.witness
+  if (!isAddressEqual(w.payee as Address, deps.vault) || !isAddressEqual(required.payTo as Address, deps.vault)) return "wrong_payee"
+  if (!isAddressEqual(payload.spender, deps.escrow)) return "wrong_spender"
+  const amount = BigInt(String(payment.scheme === "exact" ? w.amount : w.maxAmount))
+  if (BigInt(payload.permitted.amount) !== amount) return "wrong_amount"
+  if (amount < BigInt(required.maxAmountRequired ?? required.maxAmount ?? 0)) return "amount_too_low"
+  if (payment.scheme === "upto" && amount < UPTO_MIN_MAX_MICRO) return "max_too_low"
+  if (BigInt(payload.deadline) < BigInt(now + MIN_DEADLINE_S)) return "deadline"
+  if (BigInt(String(w.validBefore)) < BigInt(now + MIN_VALID_S)) return "valid_before"
+  return null
+}
+
+async function nonceUnused(deps: VerifyDeps, cache: ReadCache, payer: Address, nonce: bigint) {
+  const word = nonce >> 8n
+  const bitmap = await cache.read(`nonce:${payer}:${word}`, (blockNumber) =>
+    deps.reader.readContract({ address: PERMIT2 as Address, abi: permit2Abi, functionName: "nonceBitmap", args: [payer, word], blockNumber }),
+  )
+  return (bitmap & (1n << (nonce & 0xffn))) === 0n
+}
+
+async function checkFunds(deps: VerifyDeps, cache: ReadCache, payer: Address, amount: bigint): Promise<string | null> {
+  const token = { address: deps.usdg, abi: erc20Abi }
+  const [allowance, balance] = await Promise.all([
+    cache.read(`allowance:${payer}`, (blockNumber) =>
+      deps.reader.readContract({ ...token, functionName: "allowance", args: [payer, PERMIT2 as Address], blockNumber }),
+    ),
+    cache.read(`balance:${payer}`, (blockNumber) => deps.reader.readContract({ ...token, functionName: "balanceOf", args: [payer], blockNumber })),
+  ])
+  if (allowance < amount) return "allowance"
+  if (balance < amount) return "balance"
+  return null
+}
+
+/** Runs the checks in the documented order. The last one writes the claim, so a payload is accepted once. */
+export async function verifyPayment(deps: VerifyDeps, cache: ReadCache, body: VerifyBody): Promise<VerifyResult> {
+  const relayBalance = await cache.read("relay", (blockNumber) => deps.reader.getBalance({ address: deps.relay, blockNumber }))
+  if (relayBalance < deps.relayFloorWei) return { isValid: false, invalidReason: "facilitator_unavailable", payer: null }
+
+  const head = await cache.currentHead()
+  let invalid: string | null
+  try {
+    invalid = checkTerms(deps, body, head.timestamp)
+  } catch {
+    invalid = "malformed"
+  }
+  if (invalid) return { isValid: false, invalidReason: invalid, payer: null }
+
+  const { payload, scheme } = body.paymentPayload
+  const permitScheme = scheme as "upto" | "exact"
+  const payer = await recoverPayer(deps, payload, permitScheme)
+  if (!payer) return { isValid: false, invalidReason: "bad_signature", payer: null }
+  const reply = (invalidReason: string) => ({ isValid: false, invalidReason, payer: payer.toLowerCase() })
+
+  if (!(await nonceUnused(deps, cache, payer, BigInt(payload.nonce)))) return reply("nonce_used")
+  const funds = await checkFunds(deps, cache, payer, BigInt(payload.permitted.amount))
+  if (funds) return reply(funds)
+  if (deps.denylist.has(payer)) return reply("denied")
+
+  const claimed = await deps.db.query(
+    "INSERT INTO chain.x402_claims (req_id, payer, scheme) VALUES ($1,$2,$3) ON CONFLICT (req_id) DO NOTHING RETURNING req_id",
+    [String(payload.witness.reqId).toLowerCase(), payer.toLowerCase(), scheme],
+  )
+  if (claimed.rows.length === 0) return reply("req_id_used")
+  return { isValid: true, payer: payer.toLowerCase() }
+}
