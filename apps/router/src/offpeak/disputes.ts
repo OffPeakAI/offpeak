@@ -154,3 +154,81 @@ async function checkRecord(stack: Stack, row: UsageRow, material: Material | und
   if (fair < billed && !reasons.includes("tokens_overcounted") && !reasons.includes("price_above_sheet")) reasons.push("cost_mismatch")
   return done(fair < billed ? billed - fair : 0n)
 }
+
+function materialFor(material: z.infer<typeof disputeBody>["material"], reqId: string, only: boolean) {
+  if (!material) return undefined
+  if (Array.isArray(material)) return material.find((row) => row.req_id === reqId) ?? (only ? material[0] : undefined)
+  return material.req_id === reqId || only ? material : undefined
+}
+
+export async function openDispute(stack: Stack, wallet: string, raw: unknown) {
+  const body = disputeBody.safeParse(raw)
+  if (!body.success) return { error: "bad_dispute" as const }
+  const reqIds = [...new Set(body.data.req_ids)]
+  const now = stack.clock()
+  const rows = await stack.db.query<UsageRow>("SELECT * FROM shared.usage_records WHERE req_id = ANY($1) AND payer = $2", [reqIds, wallet])
+  if (rows.rows.length !== reqIds.length) return { error: "unknown_request" as const }
+  if (rows.rows.some((row) => now - Number(row.ts) > DISPUTE_WINDOW_S)) return { error: "dispute_window" as const }
+  const id = `dsp_${randomBytes(12).toString("hex")}`
+  const checks = await Promise.all(rows.rows.map((row) => checkRecord(stack, row, materialFor(body.data.material, row.req_id, reqIds.length === 1))))
+  const materialHash = body.data.material ? keccakUtf8(JSON.stringify(body.data.material)) : null
+  const decided = await stack.db.transaction(async (tx) => {
+    // One dispute per wallet at a time, so two at once cannot refund a record twice.
+    await tx.query("SELECT pg_advisory_xact_lock(hashtext($1))", [wallet])
+    const refunded = await tx.query<{ req_ids: string[] }>("SELECT req_ids FROM shared.refunds WHERE payer = $1 AND id LIKE 'dispute:%' AND req_ids && $2::text[]", [wallet, reqIds])
+    const paid = new Set(refunded.rows.flatMap((row) => row.req_ids))
+    for (const check of checks) {
+      if (!paid.has(check.req_id) || !check.upheld) continue
+      check.upheld = false
+      check.refund_micro = "0"
+      check.reasons.push("already_refunded")
+    }
+    const upheld = checks.filter((check) => check.upheld)
+    const refundMicro = upheld.reduce((sum, check) => sum + BigInt(check.refund_micro), 0n)
+    const refundId = refundMicro > 0n ? `dispute:${id}` : null
+    const outcome = refundId ? "upheld" : "rejected"
+    if (refundId) {
+      await tx.query("INSERT INTO shared.refunds (id, payer, amount, reason, req_ids) VALUES ($1,$2,$3,$4,$5)", [refundId, wallet, refundMicro.toString(), "dispute_upheld", upheld.map((check) => check.req_id)])
+    }
+    for (const check of upheld) {
+      const row = rows.rows.find((r) => r.req_id === check.req_id)!
+      await tx.query("INSERT INTO serving.metering_flags (req_id, host, router_counts, host_counts, reason) VALUES ($1,$2,$3::jsonb,'{}'::jsonb,'dispute_upheld') ON CONFLICT (req_id) DO NOTHING", [
+        check.req_id,
+        row.host,
+        JSON.stringify({ tokensIn: row.tokens_in, tokensOut: row.tokens_out }),
+      ])
+    }
+    await tx.query("INSERT INTO serving.disputes (id, wallet, req_ids, reason, submitted_material_hash, status, outcome, refund_id, refund_micro, checks, created_at) VALUES ($1,$2,$3,$4,$5,'decided',$6,$7,$8,$9::jsonb,$10)", [
+      id,
+      wallet,
+      reqIds,
+      body.data.reason,
+      materialHash,
+      outcome,
+      refundId,
+      refundMicro.toString(),
+      JSON.stringify(checks),
+      now,
+    ])
+    return { outcome, refundId, refundMicro }
+  })
+  return { id, status: "decided" as const, outcome: decided.outcome, refund_id: decided.refundId, refund_micro: decided.refundMicro.toString(), checks }
+}
+
+type DisputeRow = { id: string; wallet: string; req_ids: string[]; reason: string; status: string; outcome: string | null; refund_id: string | null; refund_micro: string; checks: DisputeCheck[]; created_at: string }
+
+/** A wallet's disputes, newest first. */
+export async function listDisputes(stack: Stack, wallet: string) {
+  const rows = await stack.db.query<DisputeRow>("SELECT id, wallet, req_ids, reason, status, outcome, refund_id, refund_micro, checks, created_at FROM serving.disputes WHERE wallet = $1 ORDER BY created_at DESC LIMIT 200", [wallet])
+  return rows.rows.map((row) => ({
+    id: row.id,
+    reqIds: row.req_ids,
+    reason: row.reason,
+    status: row.status,
+    outcome: row.outcome,
+    refundId: row.refund_id,
+    refundMicro: String(row.refund_micro),
+    checks: row.checks,
+    createdAt: Number(row.created_at),
+  }))
+}
