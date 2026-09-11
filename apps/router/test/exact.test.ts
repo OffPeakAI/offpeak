@@ -148,3 +148,105 @@ describe("exact for embeddings", () => {
     expect((await embed(booted, { "payment-signature": await exactHeader(booted, keccak256(toBytes("exact-large-ok")), amount) }, large)).status).toBe(200)
     expect(calls).toBe(1)
   })
+
+  test("money taken for a request no host served comes back, once, and only if it was taken", async () => {
+    const booted = await bootStack()
+    booted.facilitator.delayMs = 1
+    const [, exact] = await quoted(booted)
+    const amount = BigInt(exact!.maxAmountRequired!)
+    const down = new Hono()
+    down.all("*", (c) => c.text("down", 500))
+    const healthy = booted.hostApps.get(booted.host)!
+    booted.hostApps.set(booted.host, down)
+    const reqId = keccak256(toBytes("exact-unserved"))
+    expect((await embed(booted, { "payment-signature": await exactHeader(booted, reqId, amount) })).status).toBe(503)
+    await Bun.sleep(20)
+    expect(booted.indexer.escrows.get(reqId)?.status).toBe("captured")
+    await sweepExact(booted.stack)
+    await sweepExact(booted.stack)
+    const refunds = await booted.stack.db.query<{ id: string; payer: string; amount: string; reason: string }>("SELECT * FROM shared.refunds")
+    expect(refunds.rows.length).toBe(1)
+    expect(refunds.rows[0]!.payer).toBe(booted.buyer)
+    expect(BigInt(refunds.rows[0]!.amount)).toBe(amount)
+    booted.hostApps.set(booted.host, healthy)
+  })
+
+  test("a payment the chain never took is not refunded, and stops being looked at once it expires", async () => {
+    const booted = await bootStack()
+    booted.facilitator.delayMs = 1
+    const [, exact] = await quoted(booted)
+    const down = new Hono()
+    down.all("*", (c) => c.text("down", 500))
+    booted.hostApps.set(booted.host, down)
+    const reqId = keccak256(toBytes("exact-never-settled"))
+    booted.facilitator.failReqIds.add(reqId)
+    expect((await embed(booted, { "payment-signature": await exactHeader(booted, reqId, BigInt(exact!.maxAmountRequired!)) })).status).toBe(503)
+    await Bun.sleep(20)
+    const status = async () => (await booted.stack.db.query<{ status: string }>("SELECT status FROM serving.x402_requests WHERE req_id = $1", [reqId])).rows[0]!.status
+    await sweepExact(booted.stack)
+    expect((await booted.stack.db.query("SELECT 1 FROM shared.refunds")).rows.length).toBe(0)
+    expect(await status()).toBe("refund_due")
+    await booted.stack.db.query("UPDATE serving.x402_requests SET valid_before = 1")
+    await sweepExact(booted.stack)
+    expect(await status()).toBe("unpaid")
+    expect((await booted.stack.db.query("SELECT 1 FROM shared.refunds")).rows.length).toBe(0)
+  })
+
+  test("a crash that loses a paid request is refunded by the sweep", async () => {
+    const booted = await bootStack()
+    const reqId = keccak256(toBytes("exact-crashed"))
+    const now = booted.stack.clock()
+    await booted.stack.db.query("INSERT INTO serving.x402_requests (req_id, payer, max_amount, status, valid_before, created_at) VALUES ($1,$2,500,'submitted',$3,$4)", [reqId, booted.buyer, now + 3600, now - 1000])
+    booted.indexer.escrows.set(reqId, { status: "captured", maxAmount: 500n, captured: 500n })
+    await sweepExact(booted.stack)
+    expect((await booted.stack.db.query("SELECT 1 FROM shared.refunds")).rows.length).toBe(1)
+  })
+
+  test("exact stays refused on chat, whose cost is not known first", async () => {
+    const booted = await bootStack()
+    const res = await booted.app.request("/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json", "payment-signature": await exactHeader(booted, keccak256(toBytes("exact-chat")), 1_000n) },
+      body: JSON.stringify({ model: "ofm-8b", messages: [{ role: "user", content: "x" }] }),
+    })
+    expect(res.status).toBe(400)
+  })
+})
+
+describe("the other schemes the 402 offers", () => {
+  test("a channel pays for embeddings, with the owed figure on the reply", async () => {
+    const booted = await bootStack()
+    const channelId = keccak256(toBytes("embed-channel"))
+    const row: ChannelChain = { payer: booted.buyer as Hex, deposit: 50_000_000n, claimed: 0n, lastSeq: 0n, expiry: BigInt(booted.stack.clock() + 86_400), challengeEndsAt: 0n, status: 1, closeRequested: false }
+    booted.indexer.channels.set(channelId, row)
+    const text = body()
+    const res = await embed(booted, { "x-offpeak-channel": channelId, "x-offpeak-channel-auth": await channelAuthHeader(buyer, { channelId, ts: booted.stack.clock(), body: text }) }, text)
+    expect(res.status).toBe(200)
+    const owed = BigInt(res.headers.get("x-offpeak-channel-owed")!)
+    const paid = (await records(booted)).rows[0]!
+    expect(owed).toBe(BigInt(paid.host_cost_micro) + BigInt(paid.fee_micro))
+    expect(paid.pay_mode).toBe(3)
+  })
+
+  test("upto pays for embeddings and captures only the cost", async () => {
+    const booted = await bootStack()
+    booted.facilitator.delayMs = 1
+    const reqId = keccak256(toBytes("embed-upto"))
+    const res = await embed(booted, { "payment-signature": await uptoHeader(booted.stack, buyer, reqId) })
+    expect(res.status).toBe(200)
+    const paid = (await records(booted)).rows[0]!
+    expect(paid.pay_mode).toBe(1)
+    expect(booted.facilitator.captured).toEqual([{ reqId, actual: BigInt(paid.host_cost_micro) + BigInt(paid.fee_micro) }])
+  })
+
+  test("prepaid still holds and captures, an unknown model is refused, and bad input says so", async () => {
+    const booted = await bootStack()
+    const auth = { authorization: `Bearer ${booted.key.token}` }
+    expect((await embed(booted, auth)).status).toBe(200)
+    expect((await records(booted)).rows[0]!.pay_mode).toBe(0)
+    expect((await embed(booted, auth, JSON.stringify({ model: "ofm-8b", input: "x" }))).status).toBe(404)
+    expect((await embed(booted, auth, JSON.stringify({ model: "ofm-embed", input: 7 }))).status).toBe(400)
+    expect((await embed(booted, auth, JSON.stringify({ model: "ofm-embed", input: Array.from({ length: 2049 }, () => "x") }))).status).toBe(400)
+    expect((await embed(booted, { ...auth, "x-offpeak-window": "1" })).status).toBe(400)
+  })
+})

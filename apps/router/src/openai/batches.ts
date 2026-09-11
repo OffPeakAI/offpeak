@@ -188,3 +188,147 @@ async function createJob(stack: Stack, intake: Intake): Promise<Response | null>
   const job = (await stack.db.query<JobRow>("SELECT * FROM serving.jobs WHERE id = $1", [id])).rows[0]!
   return Response.json(batchObject({ ...job, total: String(lines.length) }, plan.slots.map((slot) => slot.hour), intake.completionWindow), { status: intake.status, headers: { location: `/v1/batches/${id}` } })
 }
+
+function deadlineOf(stack: Stack, body: z.infer<typeof createBody>) {
+  if (body.metadata?.offpeak_deadline) return Math.floor(Date.parse(body.metadata.offpeak_deadline) / 1000)
+  if (body.completion_window === undefined || body.completion_window === "24h") return stack.clock() + DEFAULT_WINDOW_S
+  return null
+}
+
+export async function serveCreateBatch(stack: Stack, req: Request): Promise<Response> {
+  if (!stack.flags.night_jobs) return featureOff("Night jobs")
+  const payer = await auth(stack, req)
+  if (payer instanceof Response) return payer
+  if (payer.mode !== 0) return refuse("Night jobs are prepaid", "prepaid_only")
+  const body = createBody.safeParse(await req.json().catch(() => null))
+  if (!body.success) return body.error.issues.some((issue) => issue.path[0] === "metadata") ? refuse("metadata.offpeak_deadline must be an ISO 8601 time", "bad_deadline") : refuse("Unknown file", "bad_file")
+  const deadline = deadlineOf(stack, body.data)
+  if (deadline === null || deadline > stack.clock() + FORECAST_HOURS * 3600) return refuse("completion_window takes 24h, or metadata.offpeak_deadline within 7 days", "bad_deadline")
+  let cap: Cap | undefined
+  try {
+    cap = parseMaxPrice(req.headers.get("x-offpeak-max-price") ?? body.data.metadata?.offpeak_max_price)
+  } catch {
+    return refuse("X-Offpeak-Max-Price cannot be read", "bad_max_price")
+  }
+  const file = await readFileRow(stack, body.data.input_file_id)
+  if (!file || file.account_id !== payer.accountId) return refuse("Unknown file", "bad_file")
+  // Before the lines are read and tokenized, which is real work to do for a buyer with no money.
+  const broke = buyerRefused(stack, await stack.indexer.buyer(payer.wallet, stack.clock()))
+  if (broke) return broke
+  const lines = parseLines((await readFileBytes(stack.db, file.storage_key)).toString("utf8"))
+  if (lines instanceof Response) return lines
+  const model = stack.models.find((row) => row.name === lines[0]!.body.model && row.kind === "chat")
+  if (!model) return oai(404, "Unknown model", "invalid_request", "model_not_found")
+  const sized = lines.map((line, index) => sizeLine(line, index, model))
+  if (sized.some((line) => line === null)) return refuse("A line is longer than the model's context, or has a bad max_tokens", "bad_file")
+  const created = await createJob(stack, { payer, model, lines, sized: sized as BatchLine[], deadline, cap, waitForCap: false, inputFileId: file.id, completionWindow: body.data.completion_window ?? "24h", status: 200 })
+  return created ?? refuse("No hour fits the job before its deadline", "no_hours")
+}
+
+/** A chat request that can wait. Answers 202 with a job, or `null` when no hour fits and it must be served now or refused. */
+export async function intakeFlex(stack: Stack, payer: Prepaid, modelName: string, body: Record<string, unknown>, flexDeadline: number, cap?: Cap) {
+  const model = stack.models.find((row) => row.name === modelName && row.kind === "chat")
+  if (!model) return null
+  // Plans reach as far as the forecast does, so a later deadline is held to that.
+  const deadline = Math.min(flexDeadline, stack.clock() + FORECAST_HOURS * 3600)
+  const { stream: _stream, ...request } = body
+  const line: Line = { custom_id: "flex", method: "POST", url: "/v1/chat/completions", body: request as Line["body"] }
+  const sized = sizeLine(line, 0, model)
+  if (!sized) return null
+  const inputFileId = newFileId()
+  const text = JSON.stringify(line)
+  await insertFile(stack.db, { id: inputFileId, accountId: payer.accountId, purpose: "batch", bytes: Buffer.byteLength(text), sha256: createHash("sha256").update(text).digest("hex"), expiresAt: deadline + 3600 })
+  const created = await createJob(stack, { payer, model, lines: [line], sized: [sized], deadline, cap, waitForCap: true, inputFileId, completionWindow: "flex", status: 202 })
+  if (!created || !created.ok) await stack.db.query("DELETE FROM serving.files WHERE id = $1", [inputFileId])
+  return created
+}
+
+async function ownedJob(stack: Stack, req: Request, id: string) {
+  const payer = await auth(stack, req)
+  if (payer instanceof Response) return payer
+  const job = (await stack.db.query<JobRow>("SELECT * FROM serving.jobs WHERE id = $1", [id])).rows[0]
+  if (!job || payer.mode !== 0 || job.account_id !== payer.accountId) return oai(404, "Not found", "invalid_request", "not_found")
+  return job
+}
+
+async function viewJob(stack: Stack, job: JobRow) {
+  const counts = await stack.db.query<{ total: string; completed: string; failed: string }>(
+    "SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE status = 'done') AS completed, COUNT(*) FILTER (WHERE status = 'failed') AS failed FROM serving.job_lines WHERE job_id = $1",
+    [job.id],
+  )
+  const hours = await stack.db.query<{ hour: string }>("SELECT DISTINCT hour FROM serving.job_lines WHERE job_id = $1 ORDER BY hour", [job.id])
+  return batchObject({ ...job, ...counts.rows[0] }, hours.rows.map((row) => Number(row.hour)))
+}
+
+export async function serveGetBatch(stack: Stack, req: Request, id: string): Promise<Response> {
+  const job = await ownedJob(stack, req, id)
+  return job instanceof Response ? job : Response.json(await viewJob(stack, job))
+}
+
+export async function serveCancelBatch(stack: Stack, req: Request, id: string): Promise<Response> {
+  const job = await ownedJob(stack, req, id)
+  if (job instanceof Response) return job
+  await cancelJob(slotDeps(stack), job)
+  const fresh = (await stack.db.query<JobRow>("SELECT * FROM serving.jobs WHERE id = $1", [id])).rows[0]!
+  return Response.json(await viewJob(stack, fresh))
+}
+
+async function serveLine(stack: Stack, job: JobRow, line: LineRow, reqId: Hex, fromHold?: string): Promise<LineResult> {
+  const body = await stack.db.query<{ content: Uint8Array }>("SELECT content FROM serving.file_chunks WHERE storage_key = $1 AND seq = $2", [job.input_file_id, line.line_no])
+  const actor = await accountPayer(stack, job.account_id, job.fee_bps)
+  const stored = body.rows[0]
+  if (!stored || !actor) return { status: 410, body: { message: "The request is gone" }, costMicro: 0n, retry: false }
+  const { body: request } = JSON.parse(Buffer.from(stored.content).toString("utf8")) as Line
+  const res = await serveChat(stack, new Request("http://router/v1/chat/completions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...request, stream: false }) }), {
+    lockedPrice: { in: BigInt(job.locked_price_in), out: BigInt(job.locked_price_out) },
+    actor,
+    reqId,
+    fromHold,
+  })
+  const json = (await res.json()) as { offpeak_usage?: { record: { hostCostMicro: string; feeMicro: string } }; error?: unknown }
+  const record = json.offpeak_usage?.record
+  const costMicro = record ? BigInt(record.hostCostMicro) + BigInt(record.feeMicro) : 0n
+  return { status: res.status, body: res.status === 200 ? json : json.error, costMicro, retry: res.status === 402 || res.status === 403 || res.status === 429 || res.status >= 500 }
+}
+
+function slotDeps(stack: Stack): SlotDeps {
+  return {
+    db: stack.db,
+    clock: stack.clock,
+    livePrice: async (job) => {
+      const now = stack.clock()
+      const top = selectHost(await candidates(stack, job.model_digest, now, job.fee_bps), { sealed: false, canary: false, interactive: false })[0]
+      const priced = top ? hostPrice(stack, top, job.model_digest, now) : null
+      return priced ? priced.price : null
+    },
+    forecast: async (job, fromHour, count) => {
+      const buyer = await stack.indexer.buyer(job.wallet, stack.clock())
+      return { hours: await forecastFor(stack, job.model_digest, job.wallet, fromHour, count), hourlyCapMicro: holdView(stack, buyer).hourlyCap }
+    },
+    placeHold: async (job, amount) => {
+      const now = stack.clock()
+      const buyer = await stack.indexer.buyer(job.wallet, now)
+      const holdId = `slot_${randomBytes(8).toString("hex")}`
+      const placed = await stack.ledger.admit(job.wallet, amount, holdView(stack, buyer), holdId, now, HOUR_HOLD_TTL_S)
+      return placed.ok ? holdId : null
+    },
+    dropHold: (job, holdId) => stack.ledger.release(job.wallet, holdId),
+    serveLine: (job, line, reqId, fromHold) => serveLine(stack, job, line, reqId, fromHold),
+  }
+}
+
+export const dueNightSlots = (stack: Stack) => dueSlots(slotDeps(stack))
+
+/** With an hour, one call's worth of that slot, as the scheduler drives it. With none, everything queued, at once. */
+export async function runBatch(stack: Stack, id: string, raw?: unknown) {
+  const body = runBody.safeParse(raw ?? {})
+  const deps = slotDeps(stack)
+  if (body.success && body.data.hour !== undefined) return runSlot(deps, id, body.data.hour)
+  const total = { ran: 0, moved: 0, left: 0 }
+  for (;;) {
+    const step = await runSlot(deps, id)
+    total.ran += step.ran
+    total.left = step.left
+    if (step.left === 0 || step.ran === 0) return total
+  }
+}
