@@ -144,3 +144,119 @@ async function applyRange(deps: IngestDeps, from: bigint, to: bigint) {
   })
   return events
 }
+
+async function publishEvents(deps: IngestDeps, state: IngestState, events: ChainEvent[]) {
+  for (const e of events) {
+    const key = `${e.txHash}:${e.logIndex}`
+    if (state.fastLaned.delete(key)) continue
+    await deps.publish({ type: e.event, ...e.args, block: Number(e.blockNumber), txHash: e.txHash })
+  }
+}
+
+/** Tightening events reach the router from the head, ahead of confirmation. They are re-applied at `safe`. */
+async function fastLane(deps: IngestDeps, state: IngestState, from: bigint, head: bigint) {
+  if (from > head) return
+  const names = new Map(Object.entries(deps.contracts).map(([name, address]) => [address.toLowerCase(), name]))
+  const logs = await deps.reader.getLogs({ address: Object.values(deps.contracts), fromBlock: from, toBlock: head })
+  for (const log of logs) {
+    const decoded = decode(log, names)
+    if (!decoded || !isTightening(decoded)) continue
+    const key = `${decoded.txHash}:${decoded.logIndex}`
+    if (state.fastLaned.has(key)) continue
+    state.fastLaned.add(key)
+    await deps.publish({ type: decoded.event, ...decoded.args, block: Number(decoded.blockNumber), txHash: decoded.txHash })
+  }
+}
+
+/** Undoes what the indexer wrote into shared tables. Replay and reconciliation write back whatever survives. */
+async function clearDerivedWrites(tx: Db, forkBlock: bigint) {
+  const undone = await tx.query<{ hour: string }>("SELECT hour FROM chain.settlements WHERE block > $1", [forkBlock])
+  const hours = undone.rows.map((row) => row.hour)
+  await tx.query("UPDATE shared.usage_hours SET settle_tx = NULL, settled_at = NULL WHERE hour = ANY($1)", [hours])
+  await tx.query("UPDATE shared.usage_records SET settled_hour_tx = NULL WHERE hour = ANY($1)", [hours])
+  await tx.query("DELETE FROM chain.settlement_rejects WHERE hour = ANY($1)", [hours])
+  await tx.query("UPDATE shared.agent_payments SET drawn_hour = NULL WHERE drawn_hour = ANY($1)", [hours])
+  await tx.query("UPDATE shared.agent_payments SET written_off_hour = NULL WHERE written_off_hour = ANY($1)", [hours])
+  await tx.query("UPDATE shared.agent_payments SET collected_tx = NULL, collected_hour = NULL")
+  await tx.query("UPDATE shared.channel_state SET claimed = 0")
+  await tx.query("UPDATE shared.refunds SET paid_hour = NULL")
+  await tx.exec("UPDATE chain.refund_trees SET claimed = false")
+  await tx.exec("UPDATE chain.vault_state SET last_settled_hour = initial_settled_hour, usage_paused = false, settles_paused = false")
+}
+
+/** Drops events past the fork, rebuilds derived state by replay, and tells consumers. */
+async function rewind(deps: IngestDeps, forkBlock: bigint) {
+  const events = await deps.db.transaction(async (tx) => {
+    await clearDerivedWrites(tx, forkBlock)
+    await tx.query("DELETE FROM chain.events WHERE block_number > $1", [forkBlock])
+    for (const table of ["buyers", "hosts", "host_models", "host_status_log", "host_credits", "settlements", "roots", "refunds_paid", "collections", "signer_sets", "challenges", "channels", "channel_claims", "escrows", "orphan_writeoffs", "swept_payments", "windows", "window_holdings", "listings"]) {
+      await tx.exec(`DELETE FROM chain.${table}`)
+    }
+    const hash = await deps.reader.getBlock({ blockNumber: forkBlock })
+    await tx.query("UPDATE chain.cursor SET block = $1, block_hash = $2 WHERE id = $3", [forkBlock, hash.hash, CURSOR])
+    const kept = await tx.query<{
+      tx_hash: string
+      log_index: number
+      block_number: string
+      block_ts: string
+      contract: string
+      event: string
+      args: Record<string, unknown>
+    }>("SELECT * FROM chain.events ORDER BY block_number, log_index")
+    return kept.rows
+  })
+  await deps.db.transaction(async (tx) => {
+    for (const row of events) {
+      await applyEvent(tx, {
+        txHash: row.tx_hash,
+        logIndex: row.log_index,
+        blockNumber: BigInt(row.block_number),
+        blockTs: Number(row.block_ts),
+        contract: row.contract,
+        event: row.event,
+        args: row.args,
+      })
+    }
+  })
+  await deps.publish({ type: "Reorg", fromBlock: Number(forkBlock) })
+}
+
+/** Finds the last block whose hash the indexer can still vouch for. */
+async function findForkBlock(deps: IngestDeps, cursor: bigint) {
+  const seen = await deps.db.query<{ block_number: string; block_hash: string }>(
+    "SELECT DISTINCT block_number, block_hash FROM chain.events WHERE block_number <= $1 ORDER BY block_number DESC",
+    [cursor],
+  )
+  for (const row of seen.rows) {
+    const block = await deps.reader.getBlock({ blockNumber: BigInt(row.block_number) }).catch(() => null)
+    if (block?.hash === row.block_hash) return BigInt(row.block_number)
+  }
+  return 0n
+}
+
+/** One pass of the ingest loop. It returns the block it reached. */
+export async function tick(deps: IngestDeps, state: IngestState): Promise<bigint> {
+  const head = await deps.reader.getBlockNumber({ cacheTime: 0 })
+  const safe = head - BigInt(deps.confirmations - 1)
+  let cursor = await readCursor(deps.db)
+  if (!cursor) {
+    await seedVaultState(deps, 0n)
+  } else {
+    const onChain = await deps.reader.getBlock({ blockNumber: cursor.block }).catch(() => null)
+    if (onChain?.hash !== cursor.hash) {
+      await rewind(deps, await findForkBlock(deps, cursor.block))
+      // Whatever survives the fork comes through again from the rewound cursor, so nothing is held back.
+      state.fastLaned.clear()
+      cursor = await readCursor(deps.db)
+    }
+  }
+
+  let next = (cursor?.block ?? -1n) + 1n
+  while (next <= safe) {
+    const to = next + MAX_RANGE - 1n < safe ? next + MAX_RANGE - 1n : safe
+    await publishEvents(deps, state, await applyRange(deps, next, to))
+    next = to + 1n
+  }
+  await fastLane(deps, state, next, head)
+  return next - 1n
+}
