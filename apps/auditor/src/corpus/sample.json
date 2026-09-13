@@ -1,0 +1,51 @@
+{
+  "leads": ["", "", "", "Please help: ", "Quick question. ", "Hi! ", "Could you do this for me? ", "Hey, ", "I need a hand with something. ", "For work: "],
+  "tails": ["", "", "", " Thanks!", " Thank you.", " Keep it simple.", " No need for a long answer.", " Plain language, please.", " This is for a colleague.", " I need it soon."],
+  "systems": [
+    "You are a helpful assistant.",
+    "You are a concise assistant. Answer directly.",
+    "You help a small team with everyday writing and planning.",
+    "You are a careful technical assistant. Keep answers practical."
+  ],
+  "history": [
+    ["Can you help me with a few quick questions today?", "Of course. What would you like to know?"],
+    ["I have a couple of things to sort out before lunch.", "Happy to help. Start with whichever is most pressing."],
+    ["Thanks for the help earlier.", "You're welcome. What's next?"],
+    ["I'm working through a checklist this morning.", "Sounds good. Send the next item when you're ready."],
+    ["Quick one, then I'll leave you alone.", "No trouble at all. Go ahead."]
+  ],
+  "open": [
+    { "id": "summary-note", "template": "Summarise this note in two sentences: {note}", "vars": { "note": ["The bakery on Elm Street moved its opening time to seven because the morning bus route changed, and sales of coffee have since doubled.", "Our team finished the spring inventory two days early, but three shelves of paint were mislabelled and need a recount next week.", "The community pool will close for a month of tile repairs, so swim lessons move to the school gym hall for dry-land practice.", "Rain delayed the road resurfacing again, and the contractor now expects to finish the last section by the end of the month."] } },
+    { "id": "email-draft", "template": "Write a short, friendly email to {person} about {topic}.", "vars": { "person": ["a new neighbour", "my landlord", "our office manager", "a former colleague", "the school librarian"], "topic": ["rescheduling a meeting to next Tuesday", "a leak under the kitchen sink", "borrowing a projector for one afternoon", "thanking them for their help last week", "a parking space that keeps getting blocked"] } },
+    { "id": "explain-concept", "template": "Explain {concept} to someone who has never heard of it. Keep it under {n} words.", "vars": { "concept": ["compound interest on a savings account", "how a heat pump warms a house", "what a load balancer does", "why tides change through the month", "how a bicycle stays upright", "what version control is for"], "n": ["60", "80", "100", "150"] } },
+    { "id": "list-ideas", "template": "Give me {n} ideas for {goal}.", "vars": { "n": ["three", "four", "five", "six"], "goal": ["a rainy day with two small children", "using leftover roast vegetables", "a low-cost team outing", "improving a cluttered home office", "learning basic Spanish in ten minutes a day", "a birthday gift for someone who loves hiking"] } },
+    { "id": "code-function", "template": "Write a {language} function that {task}. Include one short usage example.", "vars": { "language": ["Python", "TypeScript", "Go", "Rust"], "task": ["removes duplicate entries from a list while keeping order", "checks whether a string is a valid date in YYYY-MM-DD form", "groups a list of records by a key", "retries a failing call up to three times with a delay", "counts how often each word appears in a text"] } },
+    { "id": "code-review", "template": "What is wrong with this {language} code, and how would you fix it?\n\n{code}", "vars": { "language": ["Python"], "code": ["def average(xs):\n    return sum(xs) / len(xs)\n\nprint(average([]))", "items = [1, 2, 3]\nfor i in range(len(items) + 1):\n    print(items[i])", "def add(x, cache={}):\n    cache[x] = True\n    return cache", "with open('data.txt') as f:\n    lines = f.readlines\nprint(len(lines))"] } },
+    { "id": "rewrite-tone", "template": "Rewrite this to sound more {tone}: {text}", "vars": { "tone": ["polite", "confident", "casual", "professional"], "text": ["Send me the report today.", "We cannot do that for you this quarter.", "I think maybe we could possibly try another vendor.", "Your invoice is late again."] } },
+    { "id": "compare-options", "template": "Compare {a} and {b} for {use}. Give a short recommendation at the end.", "vars": { "a": ["a laptop", "paper notebooks", "renting", "a shared spreadsheet"], "b": ["a tablet", "a notes app", "buying", "a small database"], "use": ["taking notes in lectures", "a family of four in a city", "tracking orders for a small shop"] } },
+    { "id": "plan-steps", "template": "Lay out a simple plan, as numbered steps, for {goal}.", "vars": { "goal": ["moving house within the same city", "preparing for a first half marathon", "launching a small newsletter", "repainting a bedroom over a weekend", "cleaning up an old photo collection"] } },
+    { "id": "translate", "template": "Translate this into {language}: {text}", "vars": { "language": ["French", "German", "Spanish", "Italian"], "text": ["Where is the nearest train station?", "I would like a table for two at eight.", "The meeting has been moved to Thursday.", "Could you please speak more slowly?"] } },
+    { "id": "data-extract", "template": "Pull the names and dates out of this text and list them: {text}", "vars": { "text": ["Maria joined on 3 March, and Tomas followed on 14 April.", "The lease signed by Priya on 9 June ends on 8 June next year.", "Sam's review is on 22 May, a week after Lena's on 15 May."] } },
+    { "id": "story-opening", "template": "Write the opening paragraph of a short story about {subject}.", "vars": { "subject": ["a lighthouse keeper who finds a letter", "a town where the clocks stopped", "two strangers sharing a delayed train", "a gardener who grows something unexpected"] } }
+  ],
+  "deterministic": [
+    { "id": "sum", "template": "What is {a} + {b}? Reply with the number only.", "vars": { "a": ["17", "23", "38", "46", "59", "64", "72", "85"], "b": ["14", "26", "31", "47", "52", "68", "73", "91"] } },
+    { "id": "product", "template": "What is {a} times {b}? Reply with the number only.", "vars": { "a": ["6", "7", "8", "9", "12", "15"], "b": ["7", "8", "9", "11", "12", "13"] } },
+    { "id": "capital", "template": "What is the capital of {country}? Reply with the city name only.", "vars": { "country": ["France", "Japan", "Canada", "Kenya", "Peru", "Norway", "Egypt", "Portugal", "Thailand", "Chile", "Greece", "Poland"] } },
+    { "id": "parity", "template": "Is {n} even or odd? Reply with one word.", "vars": { "n": ["128", "343", "1001", "2406", "5555", "7812", "919", "6060"] } },
+    { "id": "opposite", "template": "Give the opposite of the word \"{word}\". Reply with one word.", "vars": { "word": ["hot", "tall", "empty", "early", "north", "wet", "bright", "open", "fast", "heavy"] } },
+    { "id": "next-day", "template": "What day comes after {day}? Reply with the day only.", "vars": { "day": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"] } },
+    { "id": "larger", "template": "Which is larger, {a} or {b}? Reply with the number only.", "vars": { "a": ["9.11", "3.5", "120", "0.75", "48"], "b": ["9.9", "3.45", "119", "0.8", "84"] } },
+    { "id": "plural", "template": "What is the plural of \"{word}\"? Reply with one word.", "vars": { "word": ["mouse", "child", "city", "knife", "tooth", "leaf", "foot", "bus"] } },
+    { "id": "boil", "template": "At sea level, water boils at how many degrees {scale}? Reply with the number only.", "vars": { "scale": ["Celsius", "Fahrenheit"] } },
+    { "id": "colour-mix", "template": "Which colour do you get by mixing {a} and {b} paint? Reply with one word.", "vars": { "a": ["blue", "red"], "b": ["yellow", "white"] } },
+    { "id": "sentiment", "template": "Label this review as positive or negative, one word only: {text}", "vars": { "text": ["The soup was cold and the waiter ignored us.", "Lovely room, spotless, and the staff could not have been kinder.", "Broke after two days and support never answered.", "Great value, and it arrived a day early."] } },
+    { "id": "month-count", "template": "How many days are in {month} in a non-leap year? Reply with the number only.", "vars": { "month": ["January", "February", "April", "June", "August", "November"] } }
+  ],
+  "tools": [
+    { "type": "function", "function": { "name": "get_weather", "description": "Get the current weather for a city.", "parameters": { "type": "object", "properties": { "city": { "type": "string" } }, "required": ["city"] } } },
+    { "type": "function", "function": { "name": "search_notes", "description": "Search the user's notes.", "parameters": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] } } },
+    { "type": "function", "function": { "name": "create_event", "description": "Add an event to the calendar.", "parameters": { "type": "object", "properties": { "title": { "type": "string" }, "date": { "type": "string" } }, "required": ["title", "date"] } } },
+    { "type": "function", "function": { "name": "convert_currency", "description": "Convert an amount between currencies.", "parameters": { "type": "object", "properties": { "amount": { "type": "number" }, "from": { "type": "string" }, "to": { "type": "string" } }, "required": ["amount", "from", "to"] } } }
+  ]
+}
