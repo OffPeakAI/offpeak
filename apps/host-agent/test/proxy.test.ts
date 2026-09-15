@@ -258,3 +258,147 @@ describe("streaming over a real socket", () => {
     }
     expect(seen).toContain("data: [DONE]")
   })
+
+  test("a caller that hangs up stops vLLM, and the record covers what went out", async () => {
+    const row = await harness({ hold: new Promise<void>(() => {}), reply: () => ({ text: "first piece, then the rest of it" }) })
+    const url = listen(row.app)
+    const { res, reqId } = await signedChat(row, url)
+    const reader = res.body!.getReader()
+    await reader.read()
+    await reader.cancel()
+    for (let i = 0; i < 100 && row.engine.state.cancelled === 0; i++) await Bun.sleep(10)
+    expect(row.engine.state.cancelled).toBe(1)
+    const tokensIn = tokenizer.countChat({ messages: row.chatBody().messages })
+    const signed = await row.sign(row.record(reqId, { tokensIn, tokensOut: tokenizer.countText("first") }), { partial: true })
+    expect(signed.status).toBe(200)
+    expect(signed.body.hostCounts).toEqual({ tokensIn, tokensOut: tokenizer.countText("first") })
+  })
+})
+
+describe("non-streamed and embeddings calls", () => {
+  test("a plain completion is metered and signable", async () => {
+    const { serve, sign, record } = await harness()
+    const { res, reqId, body } = await serve({ stream: false, stream_options: undefined })
+    expect(res.status).toBe(200)
+    const reply = "Large language models are neural networks trained on text."
+    const counts = { tokensIn: tokenizer.countChat({ messages: body.messages }), tokensOut: tokenizer.countOutput(reply, undefined, "stop") }
+    const signed = await sign(record(reqId, counts))
+    expect(signed.status).toBe(200)
+    expect(signed.body.hostCounts).toEqual(counts)
+  })
+
+  test("embeddings are metered on input tokens alone", async () => {
+    const { post, sign, record, engine } = await harness()
+    const input = ["one sentence", "and another one"]
+    const { res, reqId } = await post("/offpeak/v1/embeddings", { model: MODEL, input, encoding_format: "float" })
+    expect(res.status).toBe(200)
+    expect(engine.requests[0]!.path).toBe("/v1/embeddings")
+    const tokensIn = tokenizer.countInputs(input)
+    const signed = await sign(record(reqId, { tokensIn, tokensOut: 0, priceOut: 0n }))
+    expect(signed.status).toBe(200)
+    expect(signed.body.hostCounts).toEqual({ tokensIn, tokensOut: 0 })
+  })
+
+  test("embeddings need the router's signature too", async () => {
+    const { post, engine } = await harness()
+    expect((await post("/offpeak/v1/embeddings", { model: MODEL, input: "x" }, { signer: buyer })).res.status).toBe(401)
+    expect(engine.requests).toHaveLength(0)
+  })
+})
+
+describe("info and health", () => {
+  test("info says what this host claims to run", async () => {
+    const { app } = await harness()
+    const info = (await (await app.request("/offpeak/v1/info")).json()) as Record<string, unknown>
+    expect(Object.keys(info).sort()).toEqual(["agentVersion", "gpuClass", "imageDigest", "modelDigests", "nightJobModels", "operator", "sealed"])
+    expect(info.sealed).toBe(false)
+  })
+
+  test("health reports the queue, and goes bad with the engine or the model files", async () => {
+    const row = await harness({ waiting: 3 })
+    expect(await (await row.app.request("/offpeak/v1/health")).json()).toEqual({ inflight: 0, queueDepth: 3, ok: true })
+    row.integrity.failed = "file differs"
+    expect(((await (await row.app.request("/offpeak/v1/health")).json()) as { ok: boolean }).ok).toBe(false)
+  })
+
+  test("an engine serving another model is not ready", async () => {
+    const { EngineWatch } = await import("../src/health.ts")
+    const row = await harness()
+    const wrongName = new EngineWatch([{ name: "other", engine: row.engine.url, vllmArgs: [] }])
+    expect((await wrongName.state()).ready).toBe(false)
+    const wrongLength = new EngineWatch([{ name: MODEL, engine: row.engine.url, vllmArgs: ["--max-model-len=4096"] }])
+    expect((await wrongLength.state()).ready).toBe(false)
+    const right = new EngineWatch([{ name: MODEL, engine: row.engine.url, vllmArgs: ["--max-model-len=8192"] }])
+    expect((await right.state()).ready).toBe(true)
+  })
+})
+
+describe("teacher-forcing score", () => {
+  const SCORE = "/offpeak/v1/score"
+  const audit = { signer: auditor, headerName: "x-offpeak-audit" }
+  const scoreBody = (over: Record<string, unknown> = {}) => ({ model: MODEL, messages: [{ role: "user", content: "Say something." }], output: "Hello there.", ...over })
+
+  test("scores each output token over the rendered prompt with max_tokens 1", async () => {
+    const { post, engine } = await harness()
+    const { res } = await post(SCORE, scoreBody(), audit)
+    expect(res.status).toBe(200)
+    const rendered = tokenizer.encode(tokenizer.render({ messages: scoreBody().messages }))
+    const answer = tokenizer.encode("Hello there.")
+    const sent = engine.requests[0]!
+    expect(sent.path).toBe("/v1/completions")
+    expect(sent.body.prompt).toEqual([...rendered, ...answer])
+    expect(sent.body.max_tokens).toBe(1)
+    expect(sent.body.prompt_logprobs).toBe(1)
+    const body = (await res.json()) as { tokens: number; ll_mean: number; logprobs: { id: number; token: string; logprob: number }[] }
+    expect(body.tokens).toBe(answer.length)
+    expect(body.logprobs.map((row) => row.id)).toEqual(answer)
+    const expected = answer.map((id) => -((id % 9) + 1) / 10)
+    expect(body.logprobs.map((row) => row.logprob)).toEqual(expected)
+    expect(body.ll_mean).toBeCloseTo(expected.reduce((sum, value) => sum + value, 0) / expected.length)
+  })
+
+  test("a plain string prompt reads as one user message", async () => {
+    const { post, engine } = await harness()
+    const { messages: _messages, ...rest } = scoreBody()
+    const { res } = await post(SCORE, { ...rest, prompt: "Say something." }, audit)
+    expect(res.status).toBe(200)
+    expect(engine.requests[0]!.body.prompt.slice(0, 5)).toEqual(tokenizer.encode(tokenizer.render({ messages: [{ role: "user", content: "Say something." }] })).slice(0, 5))
+  })
+
+  test("only the auditor key gets an answer", async () => {
+    const { post, engine } = await harness()
+    expect((await post(SCORE, scoreBody(), { headerName: "x-offpeak-audit" })).res.status).toBe(401)
+    expect((await post(SCORE, scoreBody(), { signer: buyer, headerName: "x-offpeak-audit" })).res.status).toBe(401)
+    expect((await post(SCORE, scoreBody(), { header: null })).res.status).toBe(401)
+    expect(engine.requests).toHaveLength(0)
+  })
+
+  test("the router's header does not open it", async () => {
+    const { post } = await harness()
+    expect((await post(SCORE, scoreBody(), { signer: auditor })).res.status).toBe(401)
+  })
+
+  test("a host that is not a reference host has no such route", async () => {
+    const { post } = await harness({ auditor: null })
+    expect((await post(SCORE, scoreBody(), audit)).res.status).toBe(404)
+  })
+
+  test("an old or repeated audit request is refused", async () => {
+    const { post, clock } = await harness()
+    expect((await post(SCORE, scoreBody(), { ...audit, ts: clock.now - 500 })).res.status).toBe(401)
+    const reqId = newReqId()
+    expect((await post(SCORE, scoreBody(), { ...audit, reqId })).res.status).toBe(200)
+    expect((await post(SCORE, scoreBody(), { ...audit, reqId })).res.status).toBe(401)
+  })
+
+  test("a prompt the template rejects is a 400", async () => {
+    const { post } = await harness({ model: { tokenizer: { ...tokenizer, render: () => { throw new Error("template refused") }, encode: tokenizer.encode.bind(tokenizer) } as never } })
+    expect((await post(SCORE, scoreBody(), audit)).res.status).toBe(400)
+  })
+
+  test("a body without an output is refused", async () => {
+    const { post } = await harness()
+    expect((await post(SCORE, { model: MODEL, messages: [{ role: "user", content: "x" }] }, audit)).res.status).toBe(400)
+    expect((await post(SCORE, { model: MODEL, output: "x" }, audit)).res.status).toBe(400)
+  })
+})

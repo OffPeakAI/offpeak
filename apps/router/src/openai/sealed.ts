@@ -311,3 +311,139 @@ function relay(ctx: Ctx, res: Response, control: AbortController, first: Uint8Ar
     { headers: { "content-type": HPKE_STREAM_CONTENT_TYPE, "cache-control": "no-cache", "x-offpeak-request": reqId, ...headers } },
   )
 }
+
+/** The client encrypted to one host's key, so no other host can serve this. There is nothing to fail over to. */
+async function chooseHost(stack: Stack, input: { model: ModelEntry; hostAddr: Hex; started: number; feeBps: number; windowHost?: string; holder: boolean }) {
+  const { model, hostAddr, started, feeBps, windowHost, holder } = input
+  const verified = verifiedHost(stack, hostAddr)
+  if (!verified || verified.transcript.bindings.modelDigest !== model.digest) return null
+  const rows = (await candidates(stack, model.digest, started, feeBps)).filter((row) => row.host.toLowerCase() === hostAddr).map((row) => ({ ...row, sealedOk: true }))
+  // A Window keeps its share of the host. Everyone else is served from what is left.
+  const open = holder ? rows : rows.filter((row) => row.util < 1 - (stack.windowShares.get(`${hostAddr}:${model.digest}`) ?? 0))
+  return selectHost(open, { sealed: true, windowHost, canary: false, interactive: true })[0] ?? null
+}
+
+/**
+ * A request the router cannot read. Admission, the hold and the capture are the ordinary ones. Only
+ * what the clear headers cannot say changes: tokens are estimated from ciphertext length, and the
+ * VM holds the sealed body to the same model and `max_tokens` the buyer was held to here.
+ */
+export async function serveSealed(stack: Stack, req: Request): Promise<Response> {
+  if (!stack.flags.sealed) return oai(501, "Sealed requests are not switched on yet", "invalid_request", "sealed_unavailable")
+  const attestNonce = req.headers.get("x-offpeak-attest-nonce")
+  if (attestNonce !== null) return relayAttest(stack, req.headers.get("x-offpeak-sealed-host"), attestNonce)
+  const started = stack.clock()
+  if (req.headers.has("x-offpeak-flex")) return oai(400, "Night jobs cannot be sealed", "invalid_request", "sealed_no_flex")
+  const head = headersSchema.safeParse({ model: req.headers.get("x-offpeak-model"), maxTokens: req.headers.get("x-offpeak-max-tokens"), host: req.headers.get("x-offpeak-sealed-host") })
+  if (!head.success) return oai(400, "X-Offpeak-Model, X-Offpeak-Max-Tokens and X-Offpeak-Sealed-Host are required", "invalid_request", "bad_sealed_headers")
+  const bytes = new Uint8Array(await req.arrayBuffer())
+  if (bytes.length > BODY_MAX_BYTES) return oai(413, "Body too large", "invalid_request", "body_too_large")
+  if (bytes.length < REQUEST_MIN_BYTES) return oai(400, "Sealed body is too short", "invalid_request", "bad_sealed_body")
+  const authed = await auth(stack, req)
+  if (authed instanceof Response) {
+    if (authed.status === 402 && ((await authed.clone().json()) as { error: { code: string } }).error.code === "payment_required") return paymentRequiredResponse(stack, 50_000n, false)
+    return authed
+  }
+  if (authed.mode === 2) return oai(400, "exact is for fixed-cost calls such as embeddings", "invalid_request", "exact_not_allowed")
+  const { maxTokens, host: hostAddr } = head.data
+  const model = stack.models.find((row) => row.name === head.data.model && row.kind === "chat")
+  if (!model) return oai(404, "Unknown model", "invalid_request", "model_not_found")
+  if (stack.production && !model.sealedBytesPerToken) return oai(503, "This model has no ciphertext length range yet", "capacity", "sealed_no_length_range")
+  let cap: ReturnType<typeof parseMaxPrice>
+  try {
+    cap = parseMaxPrice(req.headers.get("x-offpeak-max-price") ?? undefined)
+  } catch {
+    return oai(400, "X-Offpeak-Max-Price cannot be read", "invalid_request", "bad_max_price")
+  }
+  const tokensIn = inputTokenCeiling(bytes.length)
+  const resolved = await resolveWindow(stack, authed, req, tokensIn, maxTokens, model.digest)
+  if (resolved instanceof Response) return resolved
+  const windowRun = "reservedTokens" in resolved ? resolved : undefined
+  const payer = windowRun ? windowRun.payer : (resolved as Payer)
+  const feeBps = payer.mode === 4 ? 0 : payer.feeBps
+  const dropWindow = async () => {
+    if (windowRun) await stack.counters.add(windowRun.pendingKey, -windowRun.reservedTokens, 3 * 86_400)
+  }
+  const windowHost = payer.mode === 4 ? (await stack.indexer.window(payer.windowId.toString()))?.host.toLowerCase() : undefined
+  const flow = payer.mode === 4 ? stack.windowPerf.begin(payer.windowId) : undefined
+  const endFlow = async () => {
+    flow?.end()
+    if (payer.mode === 4) await noteWindowMinute(stack, payer.windowId).catch(() => undefined)
+  }
+  const refuse = async (res: Response) => {
+    await endFlow()
+    await dropWindow()
+    return res
+  }
+  const host = await chooseHost(stack, { model, hostAddr, started, feeBps, windowHost, holder: payer.mode === 4 })
+  const countsSigner = verifiedHost(stack, hostAddr)?.transcript.bindings.countsSigner
+  if (!host || !countsSigner) return refuse(oai(503, "That host is not available for sealed requests", "capacity", "sealed_host_unavailable", { next_forecast_hour: hourIndex(started) + 1 }))
+  const priced = hostPrice(stack, host, model.digest, started)
+  if (!priced) return refuse(oai(503, "No price", "capacity", "no_capacity"))
+  const capped = payer.mode === 4 ? undefined : cap
+  if (priceAboveCap(priced.price.in, priced.price.out, feeBps, capped)) {
+    const cheaper = await nextCheaper(stack, model.digest, feeBps, capped, started)
+    return refuse(
+      oai(429, "Live price is above the cap", "rate_limit", "price_above_cap", {
+        best_price: { in: buyerUnitPrice(priced.price.in, feeBps).toString(), out: buyerUnitPrice(priced.price.out, feeBps).toString() },
+        next_cheaper_hour: cheaper?.hour ?? null,
+        next_cheaper_price: cheaper ? { in: cheaper.in.toString(), out: cheaper.out.toString() } : null,
+      }),
+    )
+  }
+  const maxCost = quoteCost({ tokensIn, tokensOut: maxTokens, priceIn: priced.price.in, priceOut: priced.price.out, feeBps }).totalMicro
+  // A channel proof signs a text body, and hex of the ciphertext hashes back to the same bytes on both sides.
+  const pay = await authorize(stack, payer, maxCost, bytesToHex(bytes), windowRun).catch(async (err) => {
+    await endFlow()
+    await dropWindow()
+    throw err
+  })
+  if (pay instanceof Response) {
+    await endFlow()
+    return pay
+  }
+  const promptHash = keccak256(bytes)
+  const reqId = `0x${randomBytes(32).toString("hex")}` as Hex
+  const payload = sealedReqPayload({ bodyHash: promptHash, maxTokens, model: model.name })
+  const signed = await signRouterBody(stack.router, { reqId, ts: started, payload })
+  const control = new AbortController()
+  const startedAt = performance.now()
+  const timer = setTimeout(() => control.abort(), stack.ttftFailoverMs)
+  const failed = async (res: Response, healthy: boolean) => {
+    clearTimeout(timer)
+    control.abort()
+    if (!healthy) stack.load.noteResult(host.host, false)
+    // `healthy` means the host turned this request down, which is no demand either.
+    if (healthy) flow?.drop()
+    else await endFlow()
+    await release(stack, pay)
+    return res
+  }
+  const res = await stack.hosts
+    .request(host.host, host.endpoint, SEALED_CHAT_ROUTE, {
+      method: "POST",
+      headers: { "content-type": HPKE_CONTENT_TYPE, "x-offpeak-req": signed, "x-offpeak-model": model.name, "x-offpeak-max-tokens": String(maxTokens) },
+      body: bytes,
+      signal: control.signal,
+    })
+    .catch(() => null)
+  if (!res) return failed(oai(503, "Host failed before the first token", "engine", "no_capacity"), false)
+  if (!res.ok || !res.body) {
+    const code = agentError.safeParse(await res.json().catch(() => null)).data?.error.code ?? "sealed_refused"
+    // A request the host turned down says nothing about its health.
+    if (res.status < 500) return failed(oai(res.status, "The sealed host refused this request", "invalid_request", code), true)
+    return failed(oai(503, "Host failed before the first token", "engine", code), false)
+  }
+  const reader = res.body.getReader()
+  const opening = await reader.read().catch(() => null)
+  reader.releaseLock()
+  if (!opening?.value) return failed(oai(503, "Host failed before the first token", "engine", "no_capacity"), false)
+  clearTimeout(timer)
+  const ttftMs = Math.round(performance.now() - startedAt)
+  stack.load.noteTtft(host.host, ttftMs)
+  stack.load.noteResult(host.host, true)
+  stack.hostWaitMs?.push(ttftMs)
+  const ctx: Ctx = { stack, reqId, started, model, payer, pay, feeBps, maxTokens, host, countsSigner, priced, promptHash, requestBytes: bytes.length, ttftMs, flow }
+  const shown = payer.mode === 4 ? { in: 0n, out: 0n } : { in: buyerUnitPrice(priced.price.in, feeBps), out: buyerUnitPrice(priced.price.out, feeBps) }
+  return relay(ctx, res, control, opening.value, { "x-offpeak-price": `in=${shown.in},out=${shown.out}`, "x-offpeak-host": host.host })
+}
