@@ -174,3 +174,195 @@ function applyWindowLimits(rows: UsageRow[], input: HourInput, rejects: Reject[]
   }
   return rows.filter((row) => !excluded.has(row.req_id))
 }
+
+/**
+ * Past the gas limit the smallest buyers and draws wait out of the batch, so the hour lands and the
+ * exclusion is public. Whatever room is left goes to agent payments, which can simply wait an hour.
+ */
+function applyGasBudget(rows: UsageRow[], input: HourInput, rejects: Reject[]) {
+  const hosts = new Set(rows.filter((r) => r.pay_mode === 0).map((r) => r.host))
+  let left = GAS_BUDGET - GAS_BASE - hosts.size * GAS_CREDIT
+  const owed = new Map<string, bigint>()
+  for (const row of rows) {
+    if (row.pay_mode === 0) owed.set(row.payer, (owed.get(row.payer) ?? 0n) + BigInt(row.host_cost_micro) + BigInt(row.fee_micro))
+  }
+  const largestFirst = [...owed].sort(([a, x], [b, y]) => (x === y ? (a < b ? -1 : 1) : x > y ? -1 : 1))
+  const excluded = new Set<string>()
+  for (const [payer] of largestFirst) {
+    const gas = (input.buyers.get(payer)?.dayDebited ?? 0n) > 0n ? GAS_REPEAT_DEBIT : GAS_NEW_DEBIT
+    if (gas > left) excluded.add(payer)
+    else left -= gas
+  }
+  const draws = windowDrawsOf(rows).sort((a, b) => (a.tokens === b.tokens ? 0 : a.tokens > b.tokens ? -1 : 1))
+  const excludedDraws = new Set<string>()
+  draws.forEach((draw, i) => {
+    if (i >= MAX_WINDOW_DRAWS || GAS_WINDOW_DRAW > left) excludedDraws.add(windowKey(draw.windowId.toString(), draw.holder))
+    else left -= GAS_WINDOW_DRAW
+  })
+  const dropped = (row: UsageRow) =>
+    (row.pay_mode === 0 && excluded.has(row.payer)) || (row.pay_mode === 4 && excludedDraws.has(windowKey(row.window_id, row.payer)))
+  for (const row of rows) {
+    if (dropped(row)) rejects.push({ reqId: row.req_id, reason: "over_batch_capacity" })
+  }
+  return { kept: rows.filter((row) => !dropped(row)), gasLeft: left }
+}
+
+function debitsOf(rows: UsageRow[]): Debit[] {
+  const byBuyer = new Map<string, Debit>()
+  for (const row of rows) {
+    if (row.pay_mode !== 0) continue
+    const cost = BigInt(row.host_cost_micro) + BigInt(row.fee_micro)
+    const debit = byBuyer.get(row.payer) ?? { buyer: row.payer as Address, amount: 0n, lastTs: 0n }
+    debit.amount += cost
+    if (BigInt(row.ts) > debit.lastTs) debit.lastTs = BigInt(row.ts)
+    byBuyer.set(row.payer, debit)
+  }
+  return [...byBuyer.values()].sort((a, b) => (a.buyer < b.buyer ? -1 : 1))
+}
+
+function windowDrawsOf(rows: UsageRow[]): WindowDraw[] {
+  const draws = new Map<string, WindowDraw>()
+  for (const row of rows) {
+    if (row.pay_mode !== 4 || row.window_id === null) continue
+    const key = `${row.window_id}:${row.payer}`
+    const draw = draws.get(key) ?? { windowId: BigInt(row.window_id), holder: row.payer as Address, tokens: 0n }
+    draw.tokens += BigInt(row.tokens_in + row.tokens_out)
+    draws.set(key, draw)
+  }
+  return [...draws.values()].sort((a, b) =>
+    a.windowId === b.windowId ? (a.holder < b.holder ? -1 : 1) : a.windowId < b.windowId ? -1 : 1,
+  )
+}
+
+type Payout = { hostCredits: Map<string, bigint>; fees: bigint }
+
+function addRecord(payout: Payout, host: string, hostCost: bigint, fee: bigint) {
+  payout.hostCredits.set(host, (payout.hostCredits.get(host) ?? 0n) + hostCost)
+  payout.fees += fee
+}
+
+/**
+ * Every collected unit leaves the pool, so nothing strands there and no hour stalls. A payment that
+ * paid for an excluded record hands the difference back to its payer as a refund, and a host never
+ * gets paid for a record this hour excluded.
+ */
+function applyPayments(input: HourInput, payout: Payout, excluded: Set<string>, gasLeft: number) {
+  const drawn: Hex[] = []
+  const writtenOff: Hex[] = []
+  const orphans: string[] = []
+  const swept: Sweep[] = []
+  const refunds: PayerRefund[] = []
+  let agentPoolDraw = 0n
+  let reserveDraw = 0n
+  // A draw past the pool would revert the whole hour, so a bad row waits instead.
+  const poolCovers = (amount: bigint) => agentPoolDraw + amount <= input.agentPool
+  let creditRoom = gasLeft
+  // New hosts cost gas in this batch. A payment that does not fit stays undrawn until a later hour.
+  const roomFor = (hosts: string[]) => {
+    const fresh = new Set(hosts.filter((host) => !payout.hostCredits.has(host)))
+    if (fresh.size * GAS_CREDIT > creditRoom) return false
+    creditRoom -= fresh.size * GAS_CREDIT
+    return true
+  }
+  const ordered = [...input.payments].sort((a, b) => (a.paymentId < b.paymentId ? -1 : 1))
+  for (const payment of ordered) {
+    if (payment.lateCollection) {
+      if (!poolCovers(payment.amountMicro)) continue
+      agentPoolDraw += payment.amountMicro
+      payout.fees += payment.amountMicro
+      drawn.push(payment.paymentId)
+      if (payment.sweptFrom) swept.push({ paymentId: payment.paymentId, source: payment.sweptFrom, amount: payment.amountMicro })
+      continue
+    }
+    const covered = payment.covered.filter((c) => !excluded.has(c.reqId))
+    const cost = covered.reduce((sum, c) => sum + c.hostCost + c.fee, 0n)
+    if (!roomFor(covered.map((c) => c.host))) continue
+    if (payment.writeOff) {
+      if (reserveDraw + cost > input.protocolReserve) continue
+      reserveDraw += cost
+      writtenOff.push(payment.paymentId)
+      if (payment.orphanReqId) orphans.push(payment.orphanReqId)
+    } else {
+      const due = cost + payment.recoveredMicro
+      const shortfall = due > payment.amountMicro ? due - payment.amountMicro : 0n
+      if (reserveDraw + shortfall > input.protocolReserve || !poolCovers(payment.amountMicro)) continue
+      reserveDraw += shortfall
+      agentPoolDraw += payment.amountMicro
+      payout.fees += payment.recoveredMicro
+      drawn.push(payment.paymentId)
+      if (payment.amountMicro > due) {
+        const excess = payment.amountMicro - due
+        payout.fees += excess
+        refunds.push({ id: `agent-excess:${payment.paymentId}`, payer: payment.payer, amount: excess, reason: "excluded_record", reqIds: payment.reqIds })
+      }
+    }
+    for (const c of covered) addRecord(payout, c.host, c.hostCost, c.fee)
+  }
+  return { drawn, writtenOff, orphans, swept, refunds, agentPoolDraw, reserveDraw }
+}
+
+export function batchHashOf(b: SettleBatch): Hex {
+  return hashTypedData({
+    domain: domain("OffpeakSettlement", b.vault, Number(b.chainId)),
+    types: settleTypes,
+    primaryType: "SettleBatch",
+    message: b,
+  })
+}
+
+/** Pure over its input: every signer given the same hour produces the same batch hash. */
+export async function buildBatch(input: HourInput): Promise<BuiltHour> {
+  const rejects: Reject[] = []
+  const valid: UsageRow[] = []
+  for (const row of input.rows) {
+    const reason = await verifyRecord(row, input.ctx)
+    if (reason) rejects.push({ reqId: row.req_id, reason })
+    else valid.push(row)
+  }
+  const { kept, gasLeft } = applyGasBudget(applyWindowLimits(applyBuyerLimits(valid, input, rejects), input, rejects), input, rejects)
+  rejects.sort((a, b) => (a.reqId < b.reqId ? -1 : 1))
+
+  const payout: Payout = { hostCredits: new Map(), fees: 0n }
+  for (const row of kept) {
+    if (row.pay_mode === 0) addRecord(payout, row.host, BigInt(row.host_cost_micro), BigInt(row.fee_micro))
+  }
+  const excluded = new Set(rejects.map((r) => r.reqId))
+  const { drawn, writtenOff, orphans, swept, refunds, agentPoolDraw, reserveDraw } = applyPayments(input, payout, excluded, gasLeft)
+
+  const t = totalsOf(kept)
+  const root = merkleRoot(kept.map((row) => row.leaf as Hex))
+  const paymentIds = [...drawn, ...writtenOff].sort()
+  const b: SettleBatch = {
+    chainId: BigInt(input.chainId),
+    vault: input.vault,
+    hour: BigInt(input.hour),
+    root,
+    totalsHash: totalsHashOf(t),
+    debits: debitsOf(kept),
+    credits: [...payout.hostCredits]
+      .filter(([, amount]) => amount > 0n)
+      .map(([host, amount]) => ({ host: host as Address, amount }))
+      .sort((x, y) => (x.host < y.host ? -1 : 1)),
+    windowDraws: windowDrawsOf(kept),
+    fees: payout.fees,
+    agentPoolDraw,
+    reserveDraw,
+    agentPaymentsHash: keccak256(encodeAbiParameters([{ type: "bytes32[]" }], [paymentIds])),
+  }
+  return {
+    b,
+    t,
+    batchHash: batchHashOf(b),
+    rejects,
+    drawn,
+    writtenOff,
+    orphans,
+    swept,
+    refunds,
+    closeMatched: input.closeRoot === null || input.closeRoot === root,
+  }
+}
+
+export function readyAt(hour: number, graceSeconds: number): number {
+  return hourEnd(hour) + graceSeconds
+}

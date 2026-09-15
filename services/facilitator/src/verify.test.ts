@@ -132,3 +132,136 @@ describe("verify", () => {
     await refused(body, "amount_too_low")
     await refused(await uptoBody({ max: 49_999n }), "max_too_low")
   })
+
+  test("timing bounds are exact", async () => {
+    await refused(await uptoBody({ payload: { deadline: String(NOW + 29) } }), "deadline")
+    await refused(await uptoBody({ witness: { validBefore: BigInt(NOW + 59) } }), "valid_before")
+  })
+
+  test("a tampered witness recovers a stranger, never the signer", async () => {
+    const body = await uptoBody()
+    body.paymentPayload.payload.witness.resourceHash = keccak256(toBytes("other"))
+    const { deps, cache } = await setup()
+    const result = await verifyPayment(deps, cache, body)
+    expect(result.isValid).toBe(true)
+    expect(result.payer).not.toBe(OWNER)
+  })
+
+  test("a claimed payer must match what the signature recovers", async () => {
+    const claimed = anvilAccount(3).address
+    await refused(await uptoBody({ payload: { payer: claimed } }), "bad_signature")
+  })
+
+  test("a contract wallet passes through EIP-1271", async () => {
+    const wallet = anvilAccount(3).address
+    const { deps, cache, chain } = await setup({ walletAnswer: "0x1626ba7e" })
+    const body = await uptoBody({ payload: { payer: wallet } })
+    expect(await verifyPayment(deps, cache, body)).toEqual({ isValid: true, payer: wallet.toLowerCase() })
+    expect(chain.calls.isValidSignature).toBe(1)
+  })
+
+  test("a used Permit2 nonce is refused", async () => {
+    await refused(await uptoBody(), "nonce_used", { bitmap: 1n << 5n })
+  })
+
+  test("allowance, balance and the deny list each refuse", async () => {
+    await refused(await uptoBody(), "allowance", { allowance: 999_999n })
+    await refused(await uptoBody(), "balance", { balance: 999_999n })
+    await refused(await uptoBody(), "denied", {}, [OWNER])
+  })
+
+  test("a payload is accepted once, even before the chain sees it", async () => {
+    const { deps, cache } = await setup()
+    const body = await uptoBody()
+    expect((await verifyPayment(deps, cache, body)).isValid).toBe(true)
+    expect((await verifyPayment(deps, cache, body)).invalidReason).toBe("req_id_used")
+  })
+
+  test("a relay low on gas turns away upto, so the router offers channels only", async () => {
+    await refused(await uptoBody(), "facilitator_unavailable", { relay: 999n })
+  })
+
+  test("garbage is refused rather than thrown", async () => {
+    const body = await uptoBody()
+    body.paymentPayload.payload.deadline = "soon"
+    await refused(body, "malformed")
+  })
+
+  test("exact needs no minimum and signs its own witness", async () => {
+    const { deps, cache } = await setup()
+    const witness = { reqId: keccak256(toBytes("exact")), payee: VAULT, amount: 40_000n, validBefore: BigInt(NOW + 600), resourceHash: keccak256(toBytes("r")) }
+    const typed = {
+      domain: { name: "Permit2", chainId: 4663, verifyingContract: PERMIT2 as Address },
+      types: permitWitnessTypes("ExactWitness"),
+      primaryType: "PermitWitnessTransferFrom",
+      message: { permitted: { token: USDG, amount: 40_000n }, spender: ESCROW, nonce: 9n, deadline: BigInt(NOW + 600), witness },
+    } as never
+    const body: VerifyBody = {
+      paymentPayload: {
+        scheme: "exact",
+        payload: {
+          signature: await agent.signTypedData(typed),
+          witness: { ...witness, amount: "40000", validBefore: witness.validBefore.toString() },
+          permitted: { token: USDG, amount: "40000" },
+          spender: ESCROW,
+          nonce: "9",
+          deadline: String(NOW + 600),
+        },
+      },
+      paymentRequirements: { payTo: VAULT, asset: USDG, maxAmountRequired: "40000" },
+    }
+    expect(await verifyPayment(deps, cache, body)).toEqual({ isValid: true, payer: OWNER })
+  })
+})
+
+describe("read cache", () => {
+  test("a burst inside one block costs one read of each kind", async () => {
+    const { deps, chain } = await setup()
+    const cache = new ReadCache(deps.reader, 1_000)
+    const bodies = await Promise.all(Array.from({ length: 50 }, () => uptoBody()))
+    await Promise.all(bodies.map((body) => verifyPayment(deps, cache, body)))
+    expect(chain.calls.allowance).toBe(1)
+    expect(chain.calls.balanceOf).toBe(1)
+    expect(chain.calls.nonceBitmap).toBe(1)
+  })
+
+  test("a new block reads again", async () => {
+    const { deps, chain } = await setup()
+    const cache = new ReadCache(deps.reader, 0)
+    await verifyPayment(deps, cache, await uptoBody())
+    chain.block += 1n
+    await verifyPayment(deps, cache, await uptoBody())
+    expect(chain.calls.allowance).toBe(2)
+  })
+
+  test("verify stays inside its budget with a warm cache", async () => {
+    const { deps } = await setup()
+    const cache = new ReadCache(deps.reader, 1_000)
+    const bodies = await Promise.all(Array.from({ length: 100 }, () => uptoBody()))
+    const times: number[] = []
+    for (const body of bodies) {
+      const started = performance.now()
+      await verifyPayment(deps, cache, body)
+      times.push(performance.now() - started)
+    }
+    times.sort((a, b) => a - b)
+    expect(times[94]!).toBeLessThan(40)
+  })
+})
+
+describe("deny list", () => {
+  test("a failed refresh keeps the last good list", async () => {
+    let up = true
+    const server = Bun.serve({
+      port: 0,
+      fetch: () => (up ? Response.json([OWNER.toUpperCase().replace("0X", "0x")]) : new Response("down", { status: 500 })),
+    })
+    const list = new Denylist(`http://127.0.0.1:${server.port}/`)
+    await list.refresh()
+    expect(list.has(OWNER)).toBe(true)
+    up = false
+    await list.refresh()
+    expect(list.has(OWNER)).toBe(true)
+    server.stop(true)
+  })
+})
