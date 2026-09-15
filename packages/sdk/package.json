@@ -1,0 +1,17 @@
+{
+  "name": "@offpeak/sdk",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@hpke/core": "^1.7.0",
+    "@offpeak/abis": "workspace:*",
+    "@offpeak/shared": "workspace:*",
+    "openai": "^5.0.0",
+    "viem": "^2.38.0",
+    "zod": "^4.0.0"
+  }
+}
