@@ -163,3 +163,164 @@ export class ChatStream implements AsyncIterable<Record<string, unknown>> {
       await reader.cancel().catch(() => undefined)
     }
   }
+
+  private take(event: SseEvent) {
+    if (event.data === "[DONE]") return null
+    const data = eventJson(event)
+    if (!data) return null
+    if (event.event === "error") {
+      const { message, code } = (data as { error: { message?: string; code?: string } }).error
+      throw new OffpeakError(code ?? "stream_error", message ?? "Stream failed")
+    }
+    if (event.event === USAGE_EVENT) {
+      this.envelope = optionalEnvelope(data) ?? null
+      return null
+    }
+    if (event.event) return null
+    const chunk = data as { id?: string; choices?: { delta?: { content?: string }; finish_reason?: string | null }[] }
+    this.id = chunk.id ?? this.id
+    this.text += chunk.choices?.[0]?.delta?.content ?? ""
+    this.finishReason = chunk.choices?.[0]?.finish_reason ?? this.finishReason
+    return data
+  }
+
+  async final(): Promise<ChatResult> {
+    if (!this.consumed) for await (const _ of this) void _
+    if (!this.envelope) throw new OffpeakError("no_usage_record", "Stream ended without a usage record")
+    assertWithinCap(this.envelope, this.cap)
+    return {
+      id: this.id,
+      text: this.text,
+      finishReason: this.finishReason,
+      envelope: this.envelope,
+      price: this.res.headers.get("x-offpeak-price"),
+      host: this.res.headers.get("x-offpeak-host"),
+      channel: this.channel(),
+      completion: {},
+    }
+  }
+}
+
+export class Offpeak {
+  /** A configured `openai` client. Payment, vouchers and usage records work the same through it. */
+  readonly openai: OpenAI
+  readonly channels: Channels
+  readonly x402: X402
+  /** Client-side encryption to attested hosts. The sealed tier is not switched on yet. */
+  readonly sealed: SealedClient
+  private ctx: ClientContext
+  private apiKey?: string
+  private log = new Map<string, UsageEnvelope>()
+  private models = new Map<string, Promise<ModelFacts>>()
+  private registered = new Map<string, number>()
+
+  constructor(options: OffpeakOptions) {
+    const baseURL = z.url().parse(options.baseURL).replace(/\/+$/, "").replace(/\/v1$/, "")
+    this.apiKey = z.string().min(1).optional().parse(options.apiKey)
+    const uptoCap = z.bigint().positive().default(DEFAULT_UPTO_CAP_MICRO).parse(options.uptoCapMicro)
+    const send = options.fetch ?? ((input, init) => fetch(input, init))
+    this.ctx = {
+      baseURL,
+      fetch: send as typeof fetch,
+      signer: options.wallet ? toSigner(options.wallet) : null,
+      book: new AddressBook(options.deployment, options.router),
+      chain: chainAccess(options.wallet, options.rpcUrl, options.publicClient),
+      verify: (env, opts) => this.verifyUsage(env, opts),
+    }
+    this.channels = new Channels(this.ctx, options.channel)
+    this.x402 = new X402(this.ctx, uptoCap)
+    this.sealed = new SealedClient(this.ctx, options.sealed, (url, init) => this.dispatch(url, init))
+    this.openai = new OpenAI({
+      baseURL: `${baseURL}/v1`,
+      apiKey: this.apiKey ?? NO_KEY,
+      // A retried POST can pay twice.
+      maxRetries: 0,
+      fetch: ((input: RequestInfo | URL, init?: RequestInit) => this.dispatch(input, init, true)) as typeof fetch,
+    })
+  }
+
+  /** Runs a chat. Pays by channel, then API key, then `upto`, whichever this client is set up for. */
+  async chat(params: ChatParams & { stream: true; sealed?: undefined }, opts: ChatOptions & { sealed: true }): Promise<SealedStream>
+  async chat(params: ChatParams & { stream: true }, opts?: ChatOptions): Promise<ChatStream>
+  async chat(params: ChatParams, opts: ChatOptions & { sealed: true }): Promise<SealedResult>
+  async chat(params: ChatParams, opts?: ChatOptions): Promise<ChatResult | ChatQueued>
+  async chat(params: ChatParams, opts: ChatOptions = {}): Promise<ChatResult | ChatQueued | ChatStream | SealedResult | SealedStream> {
+    const body = chatParams.parse(params)
+    chatOptions.parse(opts)
+    if (opts.sealed) {
+      if (opts.flex !== undefined) throw new OffpeakError("sealed_no_flex", "Night jobs cannot be sealed")
+      const sealed = await this.sealed.chat(body as SealedParams, { headers: offpeakHeaders(opts) })
+      if (!body.stream) assertWithinCap((sealed as SealedResult).envelope, opts.maxPrice)
+      return sealed
+    }
+    const res = await this.dispatch(`${this.ctx.baseURL}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...offpeakHeaders(opts) },
+      body: JSON.stringify(body),
+    })
+    if (res.status === 202) return { queued: true, jobId: queued.parse(await res.json()).id }
+    if (!res.ok) throw await errorFrom(res)
+    if (body.stream) return new ChatStream(res, () => this.channels.snapshot(), opts.maxPrice)
+    const raw = (await res.json()) as Record<string, unknown>
+    const json = completion.parse(raw)
+    assertWithinCap(json.offpeak_usage, opts.maxPrice)
+    const choice = json.choices[0]!
+    return {
+      id: json.id,
+      text: choice.message.content ?? null,
+      toolCalls: choice.message.tool_calls ?? undefined,
+      finishReason: choice.finish_reason ?? null,
+      envelope: json.offpeak_usage,
+      price: res.headers.get("x-offpeak-price"),
+      host: res.headers.get("x-offpeak-host"),
+      channel: this.channels.snapshot(),
+      completion: raw,
+    }
+  }
+
+  /**
+   * Checks both signatures, the cost math and the leaf, plus your own recount when you pass one.
+   * A recount fetches the model's tokenizer from the router and checks it against the record's digest.
+   * With an RPC it also asks `HostRegistry` about the host, because anyone can sign as a key they made up.
+   */
+  async verifyUsage(env: UsageEnvelope, opts?: VerifyOptions & { host?: string }): Promise<VerifyReport> {
+    const ledger = this.ctx.book.contract("UsageLedger")
+    const router = this.ctx.book.routerSigner()
+    const check = (options: typeof opts) => verifyUsage(env, ledger, router, opts?.host ?? env.record.host, options)
+    const recount = opts?.recount
+    const report = await (!recount || env.sealed ? check(opts) : this.modelFacts(env.record.modelDigest).then((facts) => check({ ...opts, recount: { ...facts, ...recount } })))
+    return this.withRegistry(report, env)
+  }
+
+  private async withRegistry(report: VerifyReport, env: UsageEnvelope): Promise<VerifyReport> {
+    const reader = this.ctx.chain.reader()
+    if (!reader) return { ...report, notChecked: [...report.notChecked, "host_registry"] }
+    const known = await this.hostRegistered(reader, env.record.host, env.record.modelDigest).catch(() => null)
+    if (known === true) return { ...report, hostRegistered: true }
+    const reason = known === null ? "registry_unreadable" : "host_not_registered"
+    return { ...report, ok: false, hostRegistered: false, reasons: [...report.reasons, reason] }
+  }
+
+  private async hostRegistered(reader: PublicClient, host: Address, modelDigest: string) {
+    const key = `${host}:${modelDigest}`
+    if ((this.registered.get(key) ?? 0) > performance.now()) return true
+    const address = this.ctx.book.contract("HostRegistry")
+    const [view, models] = await Promise.all([
+      reader.readContract({ address, abi: hostRegistryAbi, functionName: "hostView", args: [host] }),
+      reader.readContract({ address, abi: hostRegistryAbi, functionName: "modelsOf", args: [host] }),
+    ])
+    const listed = view.status !== HOST_STATUS_NONE && models.some((digest) => digest.toLowerCase() === modelDigest.toLowerCase())
+    if (listed) this.registered.set(key, performance.now() + REGISTRY_CACHE_MS)
+    return listed
+  }
+
+  private modelFacts(digest: string) {
+    const known = this.models.get(digest)
+    if (known) return known
+    const loading = this.loadModelFacts(digest).catch((err) => {
+      this.models.delete(digest)
+      throw err
+    })
+    this.models.set(digest, loading)
+    return loading
+  }

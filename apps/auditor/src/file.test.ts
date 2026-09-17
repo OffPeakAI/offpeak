@@ -176,3 +176,176 @@ describe("the two-signal rule", () => {
     expect(flagged).toBeGreaterThan(1_900)
   })
 })
+
+type Sent = { functionName: string; args: readonly unknown[] }
+
+const signerKey = roleAccount("settlerC")
+
+/** Real gate and real database; the chain clients are stubs that record every write. Signing is real, so the bytes parse. */
+function stubDeps(db: Db, opts: { balance?: bigint; revert?: boolean } = {}) {
+  const writes: Sent[] = []
+  const signed: Hex[] = []
+  const broadcasts: Hex[] = []
+  const chain = {
+    nonce: 0,
+    /** How many nonces the chain has used. Past a transaction's own, that transaction can never land. */
+    taken: 0n,
+    receipt: false,
+    failBroadcast: null as string | null,
+    failSimulate: (_evidence: { samplesRoot: Hex }) => false,
+  }
+  const reader = {
+    readContract: async ({ functionName }: { functionName: string }) => (functionName === "verifyLeaf" ? true : functionName === "balanceOf" ? (opts.balance ?? 5_000_000_000n) : 10n ** 12n),
+    simulateContract: async (request: { args: [{ samplesRoot: Hex }] }) => {
+      if (chain.failSimulate(request.args[0])) throw new Error("would revert")
+      return { request }
+    },
+    getBlockNumber: async () => 100n,
+    getContractEvents: async () => [],
+    getTransactionCount: async () => chain.taken,
+    getTransactionReceipt: async ({ hash }: { hash: Hex }) => {
+      if (!chain.receipt) throw new TransactionReceiptNotFoundError({ hash })
+      return { status: "success", logs: [] }
+    },
+    waitForTransactionReceipt: async () => ({ status: opts.revert ? "reverted" : "success", logs: [] }),
+  }
+  const writer = {
+    prepareTransactionRequest: async (request: { to: Hex; data: Hex }) => ({ to: request.to, data: request.data, type: "eip1559", chainId: 4663, gas: 100_000n, maxFeePerGas: 1n, maxPriorityFeePerGas: 1n, nonce: chain.nonce++ }),
+    signTransaction: async (request: never) => {
+      const raw = await signerKey.signTransaction(request)
+      signed.push(raw)
+      return raw
+    },
+    sendRawTransaction: async ({ serializedTransaction }: { serializedTransaction: Hex }) => {
+      broadcasts.push(serializedTransaction)
+      if (chain.failBroadcast) {
+        const message = chain.failBroadcast
+        chain.failBroadcast = null
+        throw new Error(message)
+      }
+      writes.push(decodeFunctionData({ abi: AuditCourtAbi, data: parseTransaction(serializedTransaction).data! }) as Sent)
+      return keccak256(serializedTransaction)
+    },
+  }
+  return { deps: { db, reader, writer, account: { address: `0x${"cc".repeat(20)}` }, contracts: { AuditCourt: `0x${"dd".repeat(20)}`, MockUSDG: `0x${"ee".repeat(20)}` }, metrics: new Metrics(), env: "local" } as never, writes, signed, broadcasts, chain }
+}
+
+async function seedRecords(db: Db, bundle: { samples: { reqId: string; leaf: string }[]; host: string }) {
+  for (const sample of bundle.samples) {
+    await db.query(
+      `INSERT INTO shared.usage_records (req_id, hour, ts, payer, buyer_ref, host, model_digest, tokens_in, tokens_out, prompt_hash, output_hash, price_in, price_out, host_cost_micro, fee_micro, fee_bps, pay_mode, pay_ref, sheet_hash, router_sig, host_sig, leaf)
+       VALUES ($1,1,3600,'0xbb','0x0',$2,'0x0',1,1,'0x0','0x0',1,1,1,1,400,0,'0x0','0x0','0x0','0x0',$3) ON CONFLICT DO NOTHING`,
+      [sample.reqId, bundle.host, sample.leaf],
+    )
+  }
+}
+
+describe("filing", () => {
+  let db: Db
+
+  beforeEach(async () => {
+    db = await openDb()
+  })
+
+  test("a supported swap goes out once, and the bundle is stored by its root", async () => {
+    const bundle = swapBundle()
+    await seedRecords(db, bundle)
+    const { deps, writes } = stubDeps(db)
+    const first = await fileSwap(deps, bundle, 7)
+    expect(first).toMatchObject({ filed: true, root: evidenceRoot(bundle) })
+    expect(writes.map((w) => w.functionName)).toEqual(["challenge"])
+    const stored = await db.query<{ body: AuditBundle }>("SELECT body FROM shared.evidence_bundles WHERE samples_root = $1", [evidenceRoot(bundle)])
+    expect(evidenceRoot(stored.rows[0]!.body)).toBe(evidenceRoot(bundle))
+    expect(await fileSwap(deps, bundle, 7)).toEqual({ filed: false, reason: "already_filed" })
+    expect(writes).toHaveLength(1)
+  })
+
+  test("a flag with no second signal writes nothing at all", async () => {
+    const { zs, n } = flaggedWeek()
+    const bundle = bundleOf({ zs, first: n, replication: "none" })
+    await seedRecords(db, bundle)
+    const { deps, writes } = stubDeps(db)
+    expect(await fileSwap(deps, bundle, 7)).toEqual({ filed: false, reason: "second_signal_missing" })
+    expect(writes).toHaveLength(0)
+    expect((await db.query("SELECT 1 FROM serving.audit_filings")).rows).toHaveLength(0)
+    expect((await db.query("SELECT 1 FROM shared.evidence_bundles")).rows).toHaveLength(0)
+  })
+
+  test("canary failures past the auditor's threshold but under a ruling's share are not filed", async () => {
+    const { zs, n } = flaggedWeek()
+    const bundle = bundleOf({ zs, first: n, replication: "none", canaryFails: 5, threshold: 4 })
+    await seedRecords(db, bundle)
+    const { deps, writes } = stubDeps(db)
+    expect(await fileSwap(deps, bundle, 7)).toEqual({ filed: false, reason: "ruling_would_be_second_signal_missing" })
+    expect(writes).toHaveLength(0)
+  })
+
+  test("the database itself refuses a swap row without both signals", async () => {
+    const insert = (sequential: boolean, canary: boolean, replication: boolean) =>
+      db.query(
+        `INSERT INTO serving.audit_filings (id, host, model_digest, week, kind, samples_root, evidence, signal_sequential, signal_canary, signal_replication, status, from_block)
+         VALUES ('x','0xh','0xm',1,0,'0xr','{}'::jsonb,$1,$2,$3,'prepared',0)`,
+        [sequential, canary, replication],
+      )
+    await expect(insert(true, false, false)).rejects.toThrow("swap_needs_two_signals")
+    await expect(insert(false, true, true)).rejects.toThrow("swap_needs_two_signals")
+    await insert(true, false, true)
+  })
+
+  test("there is no way to file a kind 3 challenge", async () => {
+    const statement = db.query(
+      `INSERT INTO serving.audit_filings (id, host, model_digest, week, kind, samples_root, evidence, status, from_block) VALUES ('x','0xh','0xm',1,3,'0xr','{}'::jsonb,'prepared',0)`,
+    )
+    await expect(statement).rejects.toThrow()
+    const exported = await import("./file.ts")
+    expect(Object.keys(exported).filter((name) => /^file/.test(name)).sort()).toEqual(["fileMetering", "fileSwap", "fileThroughput"])
+    expect(Object.keys(exported)).not.toContain("submit")
+  })
+
+  test("off a local chain, nothing files until a hardware calibration matches the pin", async () => {
+    const bundle = swapBundle()
+    await seedRecords(db, bundle)
+    const { deps, writes } = stubDeps(db)
+    ;(deps as { env: string }).env = "mainnet"
+    expect(await fileSwap(deps, bundle, 7)).toEqual({ filed: false, reason: "not_calibrated" })
+    await db.query("INSERT INTO serving.audit_calibrations (id, model_digest, source, ready, report) VALUES ('sim',$1,'simulation',false,$2::jsonb)", [MODEL, JSON.stringify({ delta: 2.5, logA: 5 })])
+    expect(await fileSwap(deps, bundle, 7)).toEqual({ filed: false, reason: "not_calibrated" })
+    await db.query("INSERT INTO serving.audit_calibrations (id, model_digest, source, ready, report) VALUES ('other',$1,'hardware',true,$2::jsonb)", [MODEL, JSON.stringify({ delta: 3, logA: 5 })])
+    expect(await fileSwap(deps, bundle, 7)).toEqual({ filed: false, reason: "not_calibrated" })
+    await db.query("INSERT INTO serving.audit_calibrations (id, model_digest, source, ready, report) VALUES ('real',$1,'hardware',true,$2::jsonb)", [MODEL, JSON.stringify({ delta: 2.5, logA: 5 })])
+    expect((await fileSwap(deps, bundle, 7)).filed).toBe(true)
+    expect(writes).toHaveLength(1)
+  })
+
+  test("a leaf that does not prove stops the filing", async () => {
+    const bundle = swapBundle()
+    const { deps, writes } = stubDeps(db)
+    expect(await fileSwap(deps, bundle, 7)).toEqual({ filed: false, reason: "leaf_unproven" })
+    expect(writes).toHaveLength(0)
+  })
+
+  test("a bond under one challenge stops the filing", async () => {
+    const bundle = swapBundle()
+    await seedRecords(db, bundle)
+    const { deps, writes } = stubDeps(db, { balance: CHALLENGE_BOND - 1n })
+    expect(await fileSwap(deps, bundle, 7)).toEqual({ filed: false, reason: "bond_too_low" })
+    expect(writes).toHaveLength(0)
+  })
+
+  test("the low-bond alert fires under 1,000 USDG and clears at it", async () => {
+    const low = stubDeps(db, { balance: LOW_BOND_MICRO - 1n })
+    await checkBond(low.deps)
+    expect((low.deps as { metrics: Metrics }).metrics.get("auditor_bond_low")).toBe(1)
+    const fine = stubDeps(db, { balance: LOW_BOND_MICRO })
+    await checkBond(fine.deps)
+    expect((fine.deps as { metrics: Metrics }).metrics.get("auditor_bond_low")).toBe(0)
+  })
+
+  test("a revert is recorded and not retried as if it landed", async () => {
+    const bundle = swapBundle()
+    await seedRecords(db, bundle)
+    const { deps } = stubDeps(db, { revert: true })
+    expect(await fileSwap(deps, bundle, 7)).toEqual({ filed: false, reason: "reverted" })
+    const rows = await db.query<{ status: string }>("SELECT status FROM serving.audit_filings")
+    expect(rows.rows[0]!.status).toBe("failed")
+  })
