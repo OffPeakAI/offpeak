@@ -127,3 +127,139 @@ describe("offpeak-host verify", () => {
     const { deps } = setup()
     await expect(run(["verify"], { ...deps, gpu: async () => SMI.replace("H100 80GB HBM3", "L40S").replace("81559", "46068") })).rejects.toThrow("gpu class mismatch")
   })
+
+  test("a container on another image fails", async () => {
+    await expect(checkImage(IMAGE, async (args) => (args[0] === "image" ? "sha256:pinned" : "sha256:other"))).rejects.toThrow("not running the pinned image")
+    const { deps } = setup()
+    await expect(run(["verify"], { ...deps, docker: async () => Promise.reject(new Error("docker inspect failed")) })).rejects.toThrow("docker inspect failed")
+  })
+
+  test("--no-image skips only the image", async () => {
+    const { deps, lines } = setup()
+    await run(["verify", "--no-image"], { ...deps, docker: async () => Promise.reject(new Error("no docker here")) })
+    expect(lines.at(-1)).toBe("image not checked")
+  })
+})
+
+describe("offpeak-host register", () => {
+  const decodeRegister = (data: Hex) => decodeFunctionData({ abi: hostRegistryAbi, data }).args![0] as Record<string, unknown>
+
+  test("prints the calls and sends nothing by default", async () => {
+    const { deps, lines, sent, posts, digest } = setup()
+    await run(["register"], deps)
+    expect(sent).toHaveLength(0)
+    expect(posts).toHaveLength(0)
+    const [approve, register] = lines.slice(0, 2).map((line) => JSON.parse(line))
+    expect(approve.to).toBe(USDG)
+    expect(decodeFunctionData({ abi: erc20Abi, data: approve.data }).args).toEqual([REGISTRY, HOST_MIN_BOND])
+    expect(register.to).toBe(REGISTRY)
+    const params = decodeRegister(register.data)
+    expect(params.modelDigests).toEqual([digest])
+    expect(params.maxTps).toEqual([400])
+    expect(params.imageDigest).toBe(imageDigestFor({ image: IMAGE }))
+    expect(params.gpuClass).toBe(gpuClassOf("h100-80g-sxm"))
+    expect(params.endpointHash).toBe(keccak256(toBytes("https://host.example.net")))
+    expect(params.bondUsdg).toBe(HOST_MIN_BOND)
+    expect(params.bondOfpk).toBe(0n)
+    expect(lines.at(-1)).toContain("nothing sent")
+  })
+
+  test("--send approves, registers, then tells the router the endpoint", async () => {
+    const { deps, sent, posts } = setup()
+    await run(["register", "--send", "--bond-usdg", "3000000000", "--bond-ofpk", "7"], deps)
+    expect(sent.map((call) => call.to)).toEqual([USDG, OFPK, REGISTRY])
+    expect(decodeRegister(sent[2]!.data).bondUsdg).toBe(3_000_000_000n)
+    expect(decodeRegister(sent[2]!.data).bondOfpk).toBe(7n)
+    expect(posts).toHaveLength(1)
+    expect(posts[0]!.url).toBe(`${BASE_URL}/v1/hosts/register`)
+    const { operator, endpoint, sig } = posts[0]!.body
+    expect((await recoverPersonal(canonicalJson({ endpoint, operator }), sig)).toLowerCase()).toBe(host.address.toLowerCase())
+  })
+
+  test("the router's own calldata for this host matches", async () => {
+    const { registerCalldata } = await import("../../router/src/hosts-api/register.ts")
+    const { deps, lines, digest } = setup()
+    await run(["register"], deps)
+    const mine = JSON.parse(lines[1]!).data
+    const theirs = registerCalldata(REGISTRY as Hex, { operator: host.address, models: [{ digest, maxTps: 400 }], imageDigest: imageDigestFor({ image: IMAGE }), gpuClass: gpuClassOf("h100-80g-sxm"), endpoint: "https://host.example.net" })
+    expect(mine).toBe(theirs.data)
+  })
+
+  test("a bad amount is refused", async () => {
+    const { deps } = setup()
+    await expect(run(["register", "--bond-usdg", "1.5"], deps)).rejects.toThrow("whole number")
+  })
+})
+
+describe("offpeak-host price-sheet set", () => {
+  test("signs, posts, then keeps the sheet for the agent", async () => {
+    const { root, deps, posts, lines, digest } = setup()
+    await run(["price-sheet", "set", "--file", sheetFile(root)], deps)
+    expect(posts[0]!.url).toBe(`${BASE_URL}/v1/hosts/price-sheet`)
+    const { sheet, sig } = posts[0]!.body
+    expect(sheet.modelDigest).toBe(digest)
+    expect(sheet.host).toBe(host.address.toLowerCase())
+    const parsed = sheetFromJson(sheet)
+    const signer = await recoverTypedDataAddress({ ...sheetTypedData(parsed, REGISTRY), signature: sig } as never)
+    expect(signer.toLowerCase()).toBe(host.address.toLowerCase())
+    const hash = sheetHashOf(parsed, REGISTRY)
+    expect(readdirSync(join(root, "data/sheets"))).toEqual([`${hash}.json`])
+    expect(lines.at(-1)).toBe(`sheet ${hash} in force from ${NOW + 7200}`)
+  })
+
+  test.each([
+    ["a floor above 60% of the lowest base", { floorIn: 120_001 }, "floor_above_0_6_min_base"],
+    ["a sheet starting too soon", { validFrom: NOW + 3599 }, "valid_from_too_soon"],
+    ["a zero base", { baseOut: [...Array(167).fill(800_000), 0] }, "base_not_positive"],
+  ])("%s never leaves the machine", async (_name, over, error) => {
+    const { root, deps, posts } = setup()
+    await expect(run(["price-sheet", "set", "--file", sheetFile(root, over)], deps)).rejects.toThrow(error)
+    expect(posts).toHaveLength(0)
+  })
+
+  test("the floor rule is exact at 60%", async () => {
+    const { root, deps, posts } = setup()
+    await run(["price-sheet", "set", "--file", sheetFile(root, { floorIn: 120_000 })], deps)
+    expect(posts).toHaveLength(1)
+  })
+
+  test("a short week and an unknown model are refused", async () => {
+    const { root, deps } = setup()
+    await expect(run(["price-sheet", "set", "--file", sheetFile(root, { baseIn: [1, 2] })], deps)).rejects.toThrow()
+    await expect(run(["price-sheet", "set", "--file", sheetFile(root, { model: "other" })], deps)).rejects.toThrow("no model other")
+  })
+
+  test("a sheet the router refuses is not kept", async () => {
+    const { root, deps } = setup()
+    const refusing = (async () => Response.json({ ok: false, error: "nonce_not_increasing" })) as never
+    await expect(run(["price-sheet", "set", "--file", sheetFile(root)], { ...deps, fetcher: refusing })).rejects.toThrow("nonce_not_increasing")
+    expect(existsSync(join(root, "data/sheets")) ? readdirSync(join(root, "data/sheets")) : []).toEqual([])
+  })
+})
+
+describe("offpeak-host credits and exit", () => {
+  test("credits shows what the registry holds", async () => {
+    const { deps, lines } = setup()
+    await run(["credits"], deps)
+    expect(lines).toEqual(["releasable 1500 µUSDG", "pending 250 µUSDG"])
+  })
+
+  test("withdraw and exit print first and send only on request", async () => {
+    const { deps, sent, lines } = setup()
+    await run(["credits", "withdraw"], deps)
+    await run(["exit"], deps)
+    expect(sent).toHaveLength(0)
+    expect(lines.some((line) => line.includes("7-day"))).toBe(true)
+    await run(["credits", "withdraw", "--send"], deps)
+    await run(["exit", "--send"], deps)
+    await run(["exit", "--finalize", "--send"], deps)
+    expect(sent.map((call) => decodeFunctionData({ abi: hostRegistryAbi, data: call.data }).functionName)).toEqual(["withdrawCredits", "exit", "finalizeExit"])
+    expect(sent.every((call) => call.to === REGISTRY)).toBe(true)
+  })
+})
+
+test("no command prints the usage", async () => {
+  const lines: string[] = []
+  await run([], { env: {}, print: (line) => lines.push(line) })
+  expect(lines[0]).toContain("usage: offpeak-host")
+})

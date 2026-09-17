@@ -133,3 +133,159 @@ async function broadcast(deps: FilingDeps, signed: Hex) {
     if (!ALREADY_THERE.test(String(err))) throw err
   })
 }
+
+/**
+ * `AuditCourt.challenge` takes a new bond every call, so nothing here may send one twice. The hash and
+ * the signed bytes are on disk before anything leaves: a crash after that can only resend these same
+ * bytes, whose nonce lets the chain take them once.
+ */
+async function send(deps: FilingDeps, id: string, evidence: EvidenceArgs, root: Hex): Promise<Filed | Refusal> {
+  const court = deps.contracts.AuditCourt as Address
+  await approveBond(deps, court)
+  await deps.reader.simulateContract({ address: court, abi: AuditCourtAbi, functionName: "challenge", args: [evidence], account: deps.account })
+  const data = encodeFunctionData({ abi: AuditCourtAbi, functionName: "challenge", args: [evidence as never] })
+  const prepared = await deps.writer.prepareTransactionRequest({ account: deps.account, chain: deps.writer.chain, to: court, data })
+  const signed = await deps.writer.signTransaction(prepared as never)
+  const hash = keccak256(signed)
+  await deps.db.query("UPDATE serving.audit_filings SET status = 'sent', tx_hash = $2, signed_tx = $3 WHERE id = $1", [id, hash, signed])
+  await broadcast(deps, signed)
+  return confirm(deps, id, hash, root)
+}
+
+async function confirm(deps: FilingDeps, id: string, hash: Hex, root: Hex): Promise<Filed | Refusal> {
+  const receipt = await deps.reader.waitForTransactionReceipt({ hash })
+  if (receipt.status !== "success") {
+    await deps.db.query("UPDATE serving.audit_filings SET status = 'failed', error = 'reverted' WHERE id = $1", [id])
+    return refuse("reverted")
+  }
+  const challengeId = challengeIdOf(receipt.logs as never)
+  await deps.db.query("UPDATE serving.audit_filings SET status = 'filed', challenge_id = $2 WHERE id = $1", [id, challengeId])
+  deps.metrics.inc("auditor_challenges_filed")
+  log(SERVICE, "challenge_filed", { id, challengeId, root, tx: hash })
+  return { filed: true, challengeId: challengeId ?? "", txHash: hash, root, duplicate: false }
+}
+
+type Signals = { sequential: boolean; canary: boolean; replication: boolean }
+
+/**
+ * The only path to `AuditCourt.challenge`, and private to this file. The row goes in first, so its
+ * checks and unique key run before any money moves. Kind 3 has no path: canary results are half of
+ * a swap case, never a filing of their own.
+ */
+async function submit(deps: FilingDeps, input: { kind: typeof KIND_SWAP | typeof KIND_METERING | typeof KIND_THROUGHPUT; bundle: EvidenceBundle; week: number; statistic: number; threshold: number; testId: string; signals?: Signals }): Promise<Filed | Refusal> {
+  const { kind, bundle, week } = input
+  const signals = input.signals ?? { sequential: false, canary: false, replication: false }
+  if (!(await leavesProven(deps as never, bundle))) return refuse("leaf_unproven")
+  if ((await checkBond(deps)) < CHALLENGE_BOND) return refuse("bond_too_low")
+  const root = evidenceRoot(bundle)
+  const evidence: EvidenceArgs = {
+    host: bundle.host as Address,
+    kind,
+    modelDigest: bundle.modelDigest,
+    samplesRoot: root,
+    sampleCount: bundle.samples.length,
+    testId: testIdHash(input.testId),
+    statistic: scaleStatistic(input.statistic),
+    threshold: scaleStatistic(input.threshold),
+    uri: evidenceUri(root),
+  }
+  const ruled = decideRuling(bundle, { host: bundle.host, kind, samplesRoot: root, sampleCount: bundle.samples.length, testId: evidence.testId, statistic: evidence.statistic, threshold: evidence.threshold }, true)
+  const expected = kind === KIND_SWAP ? OUTCOME_SWAP : OUTCOME_BREACH
+  // Throughput rulings are not built yet, so that path files only when an operator turns it on.
+  if (kind !== KIND_THROUGHPUT && ruled.outcome !== expected) return refuse(`ruling_would_be_${ruled.reason}`)
+  await storeBundle(deps.db, bundle)
+
+  const id = `${bundle.host}:${bundle.modelDigest}:${week}:${kind}`
+  const head = await deps.reader.getBlockNumber()
+  const inserted = await deps.db.query(
+    `INSERT INTO serving.audit_filings (id, host, model_digest, week, kind, samples_root, evidence, signal_sequential, signal_canary, signal_replication, status, from_block)
+     VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,'prepared',$11) ON CONFLICT DO NOTHING RETURNING id`,
+    [id, bundle.host.toLowerCase(), bundle.modelDigest, week, kind, root, jsonEvidence(evidence), signals.sequential, signals.canary, signals.replication, head.toString()],
+  )
+  if (inserted.rows.length === 0) return refuse("already_filed")
+  try {
+    return await send(deps, id, evidence, root)
+  } catch (err) {
+    log(SERVICE, "filing_interrupted", { id, error: String(err) })
+    deps.metrics.inc("auditor_filing_errors")
+    return refuse("interrupted")
+  }
+}
+
+/** Files a swap only when the bundle itself shows both signals. */
+export async function fileSwap(deps: FilingDeps, bundle: AuditBundle, week: number): Promise<Filed | Refusal> {
+  if (deps.env !== "local" && !(await filingCalibrated(deps.db, bundle.modelDigest))) return refuse("not_calibrated")
+  const signals = swapSignals(bundle)
+  if (signals.reason) return refuse(signals.reason)
+  const { statistic, threshold } = score(bundle.samples, bundle.baseline)
+  return submit(deps, { kind: KIND_SWAP, bundle, week, statistic, threshold, testId: TEST_ID, signals })
+}
+
+/** Sustained disagreement: the share of flagged records, against the share a ruling needs. */
+export async function fileMetering(deps: FilingDeps, bundle: EvidenceBundle, week: number): Promise<Filed | Refusal> {
+  const flagged = bundle.samples.filter((s) => s.meteringFlag).length
+  return submit(deps, { kind: KIND_METERING, bundle, week, statistic: flagged / bundle.samples.length, threshold: 0.05, testId: bundle.testId })
+}
+
+/** Only after a host disputes a performance post, with below-minimum seconds as the statistic. */
+export async function fileThroughput(deps: FilingDeps, bundle: EvidenceBundle, week: number, measured: { belowSeconds: number; thresholdSeconds: number }): Promise<Filed | Refusal> {
+  return submit(deps, { kind: KIND_THROUGHPUT, bundle, week, statistic: measured.belowSeconds, threshold: measured.thresholdSeconds, testId: bundle.testId })
+}
+
+type FilingRow = { id: string; samples_root: Hex; evidence: Record<string, unknown>; status: string; tx_hash: Hex | null; signed_tx: Hex | null; from_block: string }
+
+const LOG_PAGE = 5_000n
+
+async function findOnChain(deps: FilingDeps, row: FilingRow) {
+  const head = await deps.reader.getBlockNumber()
+  for (let from = BigInt(row.from_block); from <= head; from += LOG_PAGE) {
+    const logs = await deps.reader.getContractEvents({ address: deps.contracts.AuditCourt as Address, abi: AuditCourtAbi, eventName: "EvidenceFiled", fromBlock: from, toBlock: from + LOG_PAGE - 1n > head ? head : from + LOG_PAGE - 1n })
+    const hit = logs.find((entry) => (entry.args as { samplesRoot?: string }).samplesRoot === row.samples_root)
+    if (hit) return hit.transactionHash
+  }
+  return null
+}
+
+async function receiptFor(deps: FilingDeps, hash: Hex) {
+  try {
+    return await deps.reader.getTransactionReceipt({ hash })
+  } catch (err) {
+    if (err instanceof TransactionReceiptNotFoundError) return null
+    throw err
+  }
+}
+
+/** The bytes have not landed. If their nonce has gone to something else they never can, so only then is a new send safe. */
+async function resume(deps: FilingDeps, row: FilingRow, hash: Hex, signed: Hex) {
+  const taken = await deps.reader.getTransactionCount({ address: deps.account.address, blockTag: "latest" })
+  if (taken > (parseTransaction(signed).nonce ?? 0)) {
+    const landed = await findOnChain(deps, row)
+    return landed ? confirm(deps, row.id, landed, row.samples_root) : send(deps, row.id, fromJson(row.evidence), row.samples_root)
+  }
+  await broadcast(deps, signed)
+  return confirm(deps, row.id, hash, row.samples_root)
+}
+
+async function reconcile(deps: FilingDeps, row: FilingRow) {
+  if (row.tx_hash) {
+    if (await receiptFor(deps, row.tx_hash)) return confirm(deps, row.id, row.tx_hash, row.samples_root)
+    return row.signed_tx ? resume(deps, row, row.tx_hash, row.signed_tx) : confirm(deps, row.id, row.tx_hash, row.samples_root)
+  }
+  const landed = await findOnChain(deps, row)
+  return landed ? confirm(deps, row.id, landed, row.samples_root) : send(deps, row.id, fromJson(row.evidence), row.samples_root)
+}
+
+/** After a crash: confirm what went out, and send only what is proven not to have. One filing's trouble stays with that filing. */
+export async function reconcileFilings(deps: FilingDeps) {
+  const rows = await deps.db.query<FilingRow>("SELECT id, samples_root, evidence, status, tx_hash, signed_tx, from_block FROM serving.audit_filings WHERE status IN ('prepared', 'sent') ORDER BY created_at")
+  for (const row of rows.rows) {
+    try {
+      await reconcile(deps, row)
+    } catch (err) {
+      log(SERVICE, "reconcile_failed", { id: row.id, error: String(err) })
+      deps.metrics.inc("auditor_filing_errors")
+    }
+  }
+  return rows.rows.length
+}
+
