@@ -197,3 +197,200 @@ describe("op.sealed.hosts refuses a transcript that fails", () => {
     })
     expect(reasons).toContain("quote_format")
   })
+
+  test("a quote the parser cannot read", async () => {
+    expect(await refusedFor(await rig(), { transcript: (t) => void (t.quote = "0x00") })).toContain("quote_format")
+  })
+
+  test("a transcript past its age", async () => {
+    expect(await refusedFor(await rig(), { transcript: (t) => void (t.verifiedAt = 1_000) })).toContain("stale")
+  })
+
+  test("a transcript dated in the future", async () => {
+    expect(await refusedFor(await rig(), { transcript: (t) => void (t.verifiedAt = Math.floor(Date.now() / 1000) + 86_400) })).toContain("stale")
+  })
+
+  test("two quotes from different VMs", async () => {
+    const other = { ...FAKE_TD, mrtd: fakeMeasurement(0xc1) }
+    expect(await refusedFor(await rig(), { transcript: (t) => void (t.quote = requote(t.bindings, t.nonce, other)) })).toContain("measurement")
+  })
+
+  test("a list that lies about which host a transcript is for", async () => {
+    const booted = await rig()
+    const { op } = client(booted, { transcript: (t) => void (t.host = `0x${"99".repeat(20)}`) })
+    expect((await op.sealed.check(MODEL)).length).toBe(1)
+    expect(await op.sealed.hosts(MODEL)).toEqual([])
+  })
+
+  test("the client's own allow-list overrules the router's yes", async () => {
+    const booted = await rig()
+    const measurements: Measurement[] = [{ imageDigest: booted.imageDigest, configHash: booted.sealed.bootBindings.configHash, mrtd: fakeMeasurement(0x01), rtmrs: FAKE_TD.rtmrs }]
+    const { op } = client(booted, {}, { ...TRUST_ROUTER, measurements })
+    expect((await op.sealed.check(MODEL))[0]!.reasons).toContain("measurement")
+  })
+
+  test("the client's own pin overrules the router's name for a model", async () => {
+    const booted = await rig()
+    const { op } = client(booted, {}, { ...TRUST_ROUTER, modelDigests: { [MODEL]: `0x${"77".repeat(32)}` } })
+    expect((await op.sealed.check(MODEL))[0]!.reasons).toContain("model_pin")
+  })
+
+  test("a host list that cannot be read stops the call", async () => {
+    const booted = await rig()
+    const { op } = client(booted, { transcript: (t) => void (t.v = 2 as never) })
+    await expect(op.sealed.hosts(MODEL)).rejects.toMatchObject({ code: "sealed_bad_transcript" })
+  })
+})
+
+describe("the default", () => {
+  test("a client with no verifier of its own refuses, rather than taking the router's word", async () => {
+    const booted = await rig()
+    const { op, posts } = client(booted, {}, null)
+    await expect(op.sealed.hosts(MODEL)).rejects.toMatchObject({ code: "sealed_verifier_required" })
+    await expect(op.sealed.chat(ask("must not leave"))).rejects.toMatchObject({ code: "sealed_verifier_required" })
+    expect(posts).toEqual([])
+  })
+
+  test("a router that forges a transcript and swaps the key never sees the prompt", async () => {
+    const booted = await rig()
+    const swapped = `0x${"66".repeat(32)}` as Hex
+    const forge = (t: Pick<Transcript, "bindings" | "boot" | "quote"> & { hpkePublicKey?: Hex }, nonce: Hex) => {
+      t.bindings.hpkePublicKey = swapped
+      t.boot.bindings.hpkePublicKey = swapped
+      if (t.hpkePublicKey) t.hpkePublicKey = swapped
+      const bad = hexToBytes(requote(t.bindings, nonce))
+      bad[bad.length - 1]! ^= 1
+      t.quote = bytesToHex(bad)
+    }
+    const hook = { transcript: (t: Transcript) => forge(t, t.nonce), attest: (reply: AttestReply) => forge(reply, reply.nonce) }
+    const reader = { readContract: async ({ functionName }: { functionName: string }) => (functionName === "hostView" ? { attestationRef: booted.sealed.attestationRef, imageDigest: booted.imageDigest } : [booted.modelDigest]) } as unknown as PublicClient
+    const own = { verifierUrl: booted.dcap.url, gpuVerifierUrl: booted.gpu.url, modelDigests: { [MODEL]: booted.modelDigest }, measurements: [{ imageDigest: booted.imageDigest, configHash: booted.sealed.bootBindings.configHash, mrtd: FAKE_TD.mrtd, rtmrs: FAKE_TD.rtmrs }] }
+    const { op, posts } = client(booted, hook, own, { publicClient: reader })
+    expect((await op.sealed.check(MODEL))[0]!.reasons).toContain("quote_verifier")
+    await expect(op.sealed.chat(ask("must not leave"))).rejects.toMatchObject({ code: "sealed_no_host" })
+    expect(posts).toEqual([])
+  })
+})
+
+describe("trustRouterVerification: false", () => {
+  const reader = (booted: Rig, over: { attestationRef?: Hex } = {}) =>
+    ({
+      readContract: async ({ functionName }: { functionName: string }) =>
+        functionName === "hostView" ? { attestationRef: over.attestationRef ?? booted.sealed.attestationRef, imageDigest: booted.imageDigest } : [booted.modelDigest],
+    }) as unknown as PublicClient
+
+  const own = (booted: Rig, over: Partial<SealedOptions> = {}): SealedOptions => ({
+    trustRouterVerification: false,
+    verifierUrl: booted.dcap.url,
+    gpuVerifierUrl: booted.gpu.url,
+    measurements: [{ imageDigest: booted.imageDigest, configHash: booted.sealed.bootBindings.configHash, mrtd: FAKE_TD.mrtd, rtmrs: FAKE_TD.rtmrs }],
+    modelDigests: { [MODEL]: booted.modelDigest },
+    ...over,
+  })
+
+  test("needs the client's own verifier, GPU service and allow-list before it will start", async () => {
+    const booted = await rig()
+    expect(() => client(booted, {}, { trustRouterVerification: false })).toThrow(OffpeakError)
+    expect(() => client(booted, {}, own(booted, { verifierUrl: undefined }))).toThrow(OffpeakError)
+    expect(() => client(booted, {}, own(booted, { gpuVerifierUrl: undefined }))).toThrow(OffpeakError)
+    expect(() => client(booted, {}, own(booted, { measurements: undefined }))).toThrow(OffpeakError)
+    expect(() => client(booted, {}, own(booted, { modelDigests: undefined }))).toThrow(OffpeakError)
+  })
+
+  test("passes on the client's own services and the chain's record", async () => {
+    const booted = await rig()
+    const { op } = client(booted, {}, own(booted), { publicClient: reader(booted) })
+    expect((await op.sealed.chat(ask("own verifier"))).text).toBe("Served in the sealed VM.")
+  })
+
+  test("ignores every claim the router makes", async () => {
+    const booted = await rig()
+    const hook = { transcript: setVerdict({ quoteVerified: false, tcbStatus: "Revoked", allowListed: false, gpuResult: false }) }
+    const { op } = client(booted, hook, own(booted), { publicClient: reader(booted) })
+    expect((await op.sealed.hosts(MODEL)).length).toBe(1)
+  })
+
+  test("takes a fresh quote under its own nonce, and its own clock dates it", async () => {
+    const booted = await rig()
+    const before = Math.floor(Date.now() / 1000)
+    const listed: Transcript[] = []
+    const asked: AttestReply[] = []
+    const hook = { transcript: (t: Transcript) => void listed.push(t), attest: (reply: AttestReply) => void asked.push(reply) }
+    const { op } = client(booted, hook, own(booted, { maxAgeSeconds: 60 }), { publicClient: reader(booted) })
+    const [host] = await op.sealed.hosts(MODEL)
+    expect(asked.length).toBe(1)
+    expect(host!.transcript.nonce).toBe(asked[0]!.nonce)
+    expect(host!.transcript.nonce).not.toBe(listed[0]!.nonce)
+    expect(host!.transcript.quote).not.toBe(listed[0]!.quote)
+    expect(host!.verifiedAt).toBeGreaterThanOrEqual(before)
+    expect(host!.verifiedAt).toBeLessThanOrEqual(Math.floor(Date.now() / 1000))
+  })
+
+  test("the router's date means nothing: an old transcript dated tomorrow does not get past maxAgeSeconds", async () => {
+    const booted = await rig()
+    const tomorrow = Math.floor(Date.now() / 1000) + 86_400
+    const { op } = client(booted, { transcript: (t) => void (t.verifiedAt = tomorrow) }, own(booted, { maxAgeSeconds: 60 }), { publicClient: reader(booted) })
+    const [host] = await op.sealed.hosts(MODEL)
+    expect(host!.verifiedAt).toBeLessThan(tomorrow)
+  })
+
+  test("a quote the router saved from earlier cannot answer this client's nonce", async () => {
+    const booted = await rig()
+    const old = (await (await booted.hostApps.get(booted.host)!.request(`/offpeak/v1/attest?nonce=0x${"ee".repeat(32)}`)).json()) as AttestReply
+    const replayed = { attest: (reply: AttestReply) => void Object.assign(reply, old) }
+    expect((await client(booted, replayed, own(booted), { publicClient: reader(booted) }).op.sealed.check(MODEL))[0]!.reasons).toEqual(["no_attestation"])
+    const relabelled = { attest: (reply: AttestReply) => void Object.assign(reply, { ...old, nonce: reply.nonce }) }
+    expect((await client(booted, relabelled, own(booted), { publicClient: reader(booted) }).op.sealed.check(MODEL))[0]!.reasons).toContain("bindings")
+  })
+
+  test("a router that will not relay the quote refuses the host", async () => {
+    const booted = await rig()
+    const hosts = booted.stack.hosts
+    booted.stack.hosts = { request: (host, endpoint, path, init) => (path.includes("attest?nonce") ? Promise.resolve(new Response("no", { status: 500 })) : hosts.request(host, endpoint, path, init)) }
+    const { op, posts } = client(booted, {}, own(booted), { publicClient: reader(booted) })
+    expect((await op.sealed.check(MODEL))[0]!.reasons).toEqual(["no_attestation"])
+    await expect(op.sealed.chat(ask("must not leave"))).rejects.toMatchObject({ code: "sealed_no_host" })
+    expect(posts).toEqual([])
+  })
+
+  test("a host with another config cannot pass, however good its quotes", async () => {
+    const booted = await rig()
+    const measurements = own(booted).measurements!.map((row) => ({ ...row, configHash: `0x${"ee".repeat(32)}` as Hex }))
+    const { op } = client(booted, {}, own(booted, { measurements }), { publicClient: reader(booted) })
+    expect((await op.sealed.check(MODEL))[0]!.reasons).toContain("measurement")
+  })
+
+  test("a model name with no pin, or the wrong one, refuses the host", async () => {
+    const booted = await rig()
+    const none = client(booted, {}, own(booted, { modelDigests: {} }), { publicClient: reader(booted) })
+    expect((await none.op.sealed.check(MODEL))[0]!.reasons).toContain("model_pin")
+    const other = client(booted, {}, own(booted, { modelDigests: { [MODEL]: `0x${"77".repeat(32)}` } }), { publicClient: reader(booted) })
+    expect((await other.op.sealed.check(MODEL))[0]!.reasons).toContain("model_pin")
+  })
+
+  test("the client's verifier decides: a bad TCB there refuses a host the router passed", async () => {
+    const booted = await rig()
+    booted.dcap.state.tcbStatus = "OutOfDate"
+    const { op } = client(booted, {}, own(booted), { publicClient: reader(booted) })
+    expect((await op.sealed.check(MODEL))[0]!.reasons).toContain("tcb_status")
+  })
+
+  test("a verifier that does not answer refuses the host", async () => {
+    const booted = await rig()
+    booted.dcap.state.down = true
+    const { op } = client(booted, {}, own(booted), { publicClient: reader(booted) })
+    expect((await op.sealed.check(MODEL))[0]!.reasons).toContain("quote_verifier")
+  })
+
+  test("a GPU service that says no refuses the host", async () => {
+    const booted = await rig()
+    booted.gpu.state.result = false
+    const { op } = client(booted, {}, own(booted), { publicClient: reader(booted) })
+    expect((await op.sealed.check(MODEL))[0]!.reasons).toContain("gpu")
+  })
+
+  test("the chain's ref decides, not the one the router printed", async () => {
+    const booted = await rig()
+    const { op } = client(booted, {}, own(booted), { publicClient: reader(booted, { attestationRef: `0x${"44".repeat(32)}` }) })
+    expect((await op.sealed.check(MODEL))[0]!.reasons).toContain("attestation_ref")
+  })
