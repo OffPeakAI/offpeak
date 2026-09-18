@@ -1,0 +1,15 @@
+{
+  "name": "@offpeak/mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.0",
+    "@offpeak/sdk": "workspace:*",
+    "@offpeak/shared": "workspace:*",
+    "zod": "^4.0.0"
+  }
+}
