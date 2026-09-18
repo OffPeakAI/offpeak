@@ -421,3 +421,247 @@ describe("windows", () => {
     expect(plan.approval).toMatchObject({ amount: "624000", spender: booted.stack.windowMarket })
     expect(decodeFunctionData({ abi: windowMarketAbi, data: plan.tx.data }).args).toEqual([7n, 3n, 208_000n])
   })
+
+  test("the resale fee uses the seller's cost basis from the chain", async () => {
+    const booted = await bootStack()
+    addWindow(booted)
+    booted.indexer.holders.set(`7:${booted.buyer}`, { balance: 5n, lockedPartial: 0n, drawnTokens: 0n, costBasis: 208_000n })
+    const session = await sessionFor(booted, booted.buyer)
+    const sale = (await mutate(booted, "windows.listTx", { id: "7", units: "2", pricePerUnit: "300000" }, session)).data as { feeMicro: string; tx: { data: Hex } }
+    expect(sale.feeMicro).toBe("24400")
+    expect(sale.feeMicro).toBe(windowResaleFeeMicro(600_000n, 416_000n).toString())
+    expect(decodeFunctionData({ abi: windowMarketAbi, data: sale.tx.data }).args).toEqual([7n, 2n, 300_000n])
+    expect((await mutate(booted, "windows.listTx", { id: "7", units: "6", pricePerUnit: "300000" }, session)).error?.message).toBe("exceeds_holding")
+    expect((await mutate(booted, "windows.listTx", { id: "7", units: "1", pricePerUnit: "300000", costBasis: "1" }, session)).status).toBe(400)
+  })
+
+  test("cancel stops at the start and at the holding", async () => {
+    const booted = await bootStack()
+    addWindow(booted)
+    booted.indexer.holders.set(`7:${booted.buyer}`, { balance: 5n, lockedPartial: 0n, drawnTokens: 0n, costBasis: 208_000n })
+    const session = await sessionFor(booted, booted.buyer)
+    expect((await mutate(booted, "windows.cancelTx", { id: "7", units: "6" }, session)).error?.message).toBe("exceeds_holding")
+    expect((await mutate(booted, "windows.cancelTx", { id: "7", units: "5" }, session)).status).toBe(200)
+    booted.stack.setClock(booted.stack.clock() + 3_600)
+    expect((await mutate(booted, "windows.cancelTx", { id: "7", units: "5" }, session)).error?.message).toBe("window_started")
+  })
+
+  test("the claim follows the Window's outcome", async () => {
+    const booted = await bootStack()
+    const now = booted.stack.clock()
+    addWindow(booted, { t0: now - 7_200, t1: now - 3_600, failed: true })
+    booted.indexer.holders.set(`7:${booted.buyer}`, { balance: 1n, lockedPartial: 0n, drawnTokens: 0n, costBasis: 208_000n })
+    const session = await sessionFor(booted, booted.buyer)
+    const failed = (await mutate(booted, "windows.claimTx", { id: "7" }, session)).data as { kind: string; tx: { data: Hex } }
+    expect(failed.kind).toBe("failure")
+    expect(decodeFunctionData({ abi: windowMarketAbi, data: failed.tx.data }).functionName).toBe("claimFailure")
+    addWindow(booted, { t0: now - 7_200, t1: now - 3_600 })
+    const expired = (await mutate(booted, "windows.claimTx", { id: "7" }, session)).data as { tx: { data: Hex } }
+    expect(decodeFunctionData({ abi: windowMarketAbi, data: expired.tx.data }).functionName).toBe("claimExpired")
+    addWindow(booted, { t1: now + 10 })
+    expect((await mutate(booted, "windows.claimTx", { id: "7" }, session)).error?.message).toBe("window_not_ended")
+  })
+
+  test("holdings belong to the session wallet", async () => {
+    const booted = await bootStack()
+    addWindow(booted)
+    booted.indexer.holders.set(`7:${booted.buyer}`, { balance: 5n, lockedPartial: 0n, drawnTokens: 0n, costBasis: 208_000n })
+    expect(((await query(booted, "windows.holdings", undefined, await sessionFor(booted, booted.buyer))).data as { id: string }[])[0]?.id).toBe("7")
+    expect((await query(booted, "windows.holdings", undefined, await sessionFor(booted, OTHER))).data).toEqual([])
+  })
+
+  test("nothing moves while Windows are switched off", async () => {
+    const booted = await bootStack()
+    addWindow(booted)
+    booted.stack.flags.windows = false
+    const session = await sessionFor(booted, booted.buyer)
+    expect((await mutate(booted, "windows.buyPlan", { id: "7", units: "1", maxBuyerPricePerUnit: "1" }, session)).status).toBe(412)
+    expect((await mutate(booted, "windows.claimTx", { id: "7" }, session)).status).toBe(412)
+  })
+})
+
+describe("disputes", () => {
+  test("a dispute opens on your own record and stays yours", async () => {
+    const booted = await bootStack()
+    const { offpeak_usage: envelope } = await chat(booted)
+    const mine = await sessionFor(booted, booted.buyer)
+    const theirs = await sessionFor(booted, OTHER)
+    const reqIds = [envelope.record.reqId]
+    expect((await mutate(booted, "disputes.open", { reqIds, reason: "count looks high" }, theirs)).error?.message).toBe("unknown_request")
+    expect((await mutate(booted, "disputes.open", { reqIds, reason: "count looks high" }, mine)).data).toMatchObject({ status: "decided" })
+    expect(((await query(booted, "disputes.list", undefined, mine)).data as unknown[]).length).toBe(1)
+    expect((await query(booted, "disputes.list", undefined, theirs)).data).toEqual([])
+    booted.stack.setClock(booted.stack.clock() + 604_801)
+    expect((await mutate(booted, "disputes.open", { reqIds, reason: "late" }, mine)).error?.message).toBe("dispute_window")
+  })
+})
+
+describe("hosts", () => {
+  test("the board has a row per host and names the cheapest", async () => {
+    const booted = await bootStack({ secondHost: true })
+    await booted.stack.db.query("INSERT INTO serving.host_stats (host, day, served_tokens, billed_host_micro, base_value_micro, effective_discount_bps) VALUES ($1, to_timestamp($2)::date, 1, 700, 1000, 3000)", [booted.host, booted.stack.clock()])
+    const { data } = await query(booted, "hosts.board", { model: "ofm-8b" })
+    const board = data as {
+      now: { in: string; out: string; host: string }
+      hosts: { host: string; live: { in: string }; base: { in: string }; floor: { in: string }; bond: string; status: number; effective_discount_30d_bps: number | null; sealed: boolean }[]
+      next168h: { hour: number; forecast_in: string }[]
+    }
+    expect(board.hosts).toHaveLength(2)
+    expect(board.now.host).toBe(booted.host)
+    const cheap = board.hosts.find((row) => row.host === booted.host)!
+    const dear = board.hosts.find((row) => row.host !== booted.host)!
+    expect(cheap).toMatchObject({ bond: "2000000000", status: 2, sealed: false, effective_discount_30d_bps: 3000 })
+    expect(cheap.live.in).toBe("104000")
+    expect(cheap.base.in).toBe("208000")
+    expect(cheap.floor.in).toBe("104000")
+    expect(dear.effective_discount_30d_bps).toBeNull()
+    expect(board.now.in).toBe(cheap.live.in)
+  })
+
+  test("the forecast is the next 168 hours from now, in order", async () => {
+    const booted = await bootStack()
+    const { data } = await query(booted, "hosts.board", { model: "ofm-8b" })
+    const { next168h } = data as { next168h: { hour: number; forecast_in: string }[] }
+    const start = hourIndex(booted.stack.clock())
+    expect(next168h).toHaveLength(168)
+    expect(next168h[0]!.hour).toBe(start)
+    expect(next168h[167]!.hour).toBe(start + 167)
+    expect(next168h[0]!.forecast_in).toBe("145600")
+  })
+
+  test("history moves the forecast off the default load", async () => {
+    const booted = await bootStack()
+    const start = hourIndex(booted.stack.clock())
+    await booted.stack.db.query("INSERT INTO serving.host_load (host, model_digest, ts, util, ttft_p95_ms, inflight, healthy) VALUES ($1,$2,to_timestamp($3),0.8,10,0,true)", [booted.host, booted.modelDigest, (start - 168) * 3_600])
+    const { data } = await query(booted, "hosts.board", { model: "ofm-8b" })
+    const board = data as { forecastFromHistory: boolean; next168h: { forecast_in: string }[] }
+    expect(board.forecastFromHistory).toBe(true)
+    expect(board.next168h[0]!.forecast_in).toBe("249600")
+    expect(board.next168h[1]!.forecast_in).toBe("145600")
+  })
+
+  test("a host outside Active is listed but is not the cheapest", async () => {
+    const booted = await bootStack({ secondHost: true })
+    booted.indexer.hosts.get(booted.host)!.status = HOST_STATUS.Probation
+    const { data } = await query(booted, "hosts.board", { model: "ofm-8b" })
+    const board = data as { now: { host: string }; hosts: unknown[] }
+    expect(board.hosts).toHaveLength(2)
+    expect(board.now.host).not.toBe(booted.host)
+  })
+
+  test("an unknown model is a 404, and a model with no sheets is an empty board", async () => {
+    const booted = await bootStack()
+    expect((await query(booted, "hosts.board", { model: "nope" })).status).toBe(404)
+    booted.stack.sheets.length = 0
+    expect((await query(booted, "hosts.board", { model: "ofm-8b" })).data).toMatchObject({ now: null, hosts: [], next168h: [] })
+  })
+
+  test("payouts and the host view read the session wallet", async () => {
+    const booted = await bootStack()
+    const row = booted.indexer.hosts.get(booted.host)!
+    row.releasableCredits = 7_000_000n
+    row.pendingCredits = 3_000_000n
+    await chat(booted)
+    const session = await sessionFor(booted, booted.host)
+    const payouts = (await query(booted, "hosts.payouts", undefined, session)).data as { releasable: string; pending: string; served: { tokens: string; records: number }[] }
+    expect(payouts).toMatchObject({ releasable: "7000000", pending: "3000000" })
+    expect(payouts.served[0]?.records).toBe(1)
+    expect(((await query(booted, "hosts.me", undefined, session)).data as { host: { status: number } }).host.status).toBe(2)
+    const stranger = await sessionFor(booted, OTHER)
+    expect((await query(booted, "hosts.me", undefined, stranger)).data).toMatchObject({ host: null })
+    expect((await query(booted, "hosts.payouts", undefined, stranger)).data).toMatchObject({ releasable: "0", served: [] })
+    expect((await mutate(booted, "hosts.withdrawCreditsTx", undefined, stranger)).status).toBe(404)
+    const sent = (await mutate(booted, "hosts.withdrawCreditsTx", undefined, session)).data as { to: string }
+    expect(sent.to).toBe(booted.stack.registry)
+  })
+
+  test("registration binds the session wallet, its signature and the minimum bond", async () => {
+    const booted = await bootStack()
+    const operator = roleAccount("host")
+    const session = await sessionFor(booted, operator.address.toLowerCase())
+    const endpoint = "https://host.example"
+    const sig = await operator.signMessage({ message: canonicalJson({ endpoint, operator: operator.address.toLowerCase() }) })
+    const body = { endpoint, models: [{ digest: booted.modelDigest, maxTps: 100 }], imageDigest: booted.imageDigest, gpuClass: "h100-80g-sxm", bondUsdg: HOST_MIN_BOND.toString(), sig }
+    expect((await mutate(booted, "hosts.registerPlan", { ...body, bondUsdg: "1" }, session)).error?.message).toBe("bond_below_minimum")
+    const stranger = await sessionFor(booted, OTHER)
+    expect((await mutate(booted, "hosts.registerPlan", body, stranger)).error?.message).toBe("bad_signature")
+    const plan = (await mutate(booted, "hosts.registerPlan", body, session)).data as { approval: { spender: string; amount: string }; tx: { to: string; data: Hex } }
+    expect(plan.approval).toMatchObject({ spender: booted.stack.registry, amount: HOST_MIN_BOND.toString() })
+    const [params] = decodeFunctionData({ abi: hostRegistryAbi, data: plan.tx.data }).args as unknown as [{ endpointHash: Hex; bondUsdg: bigint }]
+    expect(params.endpointHash).toBe(keccak256(toBytes(endpoint)))
+    expect(params.bondUsdg).toBe(HOST_MIN_BOND)
+    expect((await mutate(booted, "hosts.registerPlan", { ...body, gpuClass: "not-a-gpu" }, session)).status).toBe(400)
+  })
+
+  test("only the challenged host responds, and only inside 24 hours", async () => {
+    const booted = await bootStack()
+    booted.indexer.challenges.push({ host: booted.host, id: "4", status: "filed", kind: 2, filedAt: booted.stack.clock() })
+    const session = await sessionFor(booted, booted.host)
+    const listed = (await query(booted, "hosts.challenges", undefined, session)).data as { challenges: { id: string; respondBy: number }[] }
+    expect(listed.challenges[0]?.respondBy).toBe(booted.stack.clock() + 86_400)
+    expect((await mutate(booted, "hosts.respondTx", { challengeId: "4", response: "our counts" }, await sessionFor(booted, OTHER))).status).toBe(404)
+    const sent = (await mutate(booted, "hosts.respondTx", { challengeId: "4", response: "our counts" }, session)).data as { responseHash: Hex; tx: { to: string; data: Hex } }
+    expect(sent.tx.to).toBe(booted.stack.auditCourt!)
+    expect(decodeFunctionData({ abi: auditCourtAbi, data: sent.tx.data }).args).toEqual([4n, keccak256(toBytes("our counts"))])
+    booted.stack.setClock(booted.stack.clock() + 86_401)
+    expect((await mutate(booted, "hosts.respondTx", { challengeId: "4", response: "late" }, session)).error?.message).toBe("response_window_closed")
+  })
+
+  test("activation waits for the end of probation", async () => {
+    const booted = await bootStack()
+    const row = booted.indexer.hosts.get(booted.host)!
+    row.status = HOST_STATUS.Probation
+    row.probationEnds = BigInt(booted.stack.clock() + 10)
+    const session = await sessionFor(booted, booted.host)
+    expect((await mutate(booted, "hosts.activateTx", undefined, session)).error?.message).toBe("probation_running")
+    booted.stack.setClock(booted.stack.clock() + 10)
+    expect((await mutate(booted, "hosts.activateTx", undefined, session)).status).toBe(200)
+  })
+})
+
+describe("the static web app", () => {
+  function site() {
+    const dist = mkdtempSync(join(tmpdir(), "offpeak-web-"))
+    mkdirSync(join(dist, "assets"))
+    writeFileSync(join(dist, "index.html"), "<!doctype html><title>OFFPEAK</title>")
+    writeFileSync(join(dist, "assets", "app-abc.js"), "console.log(1)")
+    writeFileSync(join(dist, "..", "offpeak-secret.txt"), "secret")
+    const app = new Hono()
+    app.get("/v1/status", (c) => c.json({ ok: true }))
+    mountWeb(app, dist)
+    return app
+  }
+
+  test("serves pages, assets and the page fallback with a tight policy", async () => {
+    const app = site()
+    const home = await app.request("/")
+    expect(home.status).toBe(200)
+    expect(await home.text()).toContain("OFFPEAK")
+    expect(home.headers.get("content-security-policy")).toContain("default-src 'self'")
+    expect(home.headers.get("content-security-policy")).toContain("frame-ancestors 'none'")
+    expect(home.headers.get("x-content-type-options")).toBe("nosniff")
+    expect(home.headers.get("cache-control")).toBe("no-cache")
+    expect(await (await app.request("/dashboard")).text()).toContain("OFFPEAK")
+    const asset = await app.request("/assets/app-abc.js")
+    expect(asset.headers.get("cache-control")).toContain("immutable")
+    expect(asset.headers.get("content-type")).toContain("javascript")
+  })
+
+  test("never answers an API path with the page, and never leaves the build folder", async () => {
+    const app = site()
+    expect((await app.request("/v1/status")).status).toBe(200)
+    expect((await app.request("/v1/nope")).status).toBe(404)
+    expect((await app.request("/trpc/nope")).status).toBe(404)
+    expect((await app.request("/assets/missing.js")).status).toBe(404)
+    expect((await app.request("/%2e%2e/offpeak-secret.txt")).status).toBe(404)
+    expect((await app.request("/..%2Foffpeak-secret.txt")).status).toBe(404)
+    expect((await app.request("/%ff")).status).toBe(404)
+  })
+
+  test("the router itself falls through to the page after its API routes", async () => {
+    const booted = await bootStack()
+    booted.stack.webDist = "/nonexistent"
+    expect((await booted.app.request("/v1/status")).status).toBe(200)
+    expect((await booted.app.request("/trpc/account.network")).status).toBe(200)
+  })
+})
