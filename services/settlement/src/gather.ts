@@ -165,3 +165,121 @@ async function readOrphans(db: Db, hour: number): Promise<PaymentRow[]> {
     }
   })
 }
+
+/**
+ * A router crash between collecting and writing its row leaves money nothing would draw. After a day
+ * it joins fees, the same as a late collection, since the records it paid for wrote off from the reserve.
+ */
+async function readStranded(db: Db, hour: number): Promise<PaymentRow[]> {
+  const rows = await db.query<{ source: string; payer: string; amount: string }>(
+    `SELECT e.req_id AS source, e.payer, e.captured AS amount
+     FROM chain.escrows e JOIN chain.collections c ON c.payment_id = e.req_id
+     WHERE c.hour <= $1 AND e.captured > 0
+       AND NOT EXISTS (SELECT 1 FROM shared.agent_payments p WHERE p.payment_id = e.req_id)
+       AND NOT EXISTS (SELECT 1 FROM chain.swept_payments s WHERE s.source = e.req_id)
+     UNION ALL
+     SELECT c.channel_id, c.payer, c.claimed - rowed.total - swept.total
+     FROM chain.channels c
+     CROSS JOIN LATERAL (
+       SELECT COALESCE(SUM(p.amount_micro), 0) AS total FROM shared.agent_payments p
+       WHERE lower(p.channel_id) = c.channel_id AND p.collected_tx IS NOT NULL
+     ) rowed
+     CROSS JOIN LATERAL (SELECT COALESCE(SUM(s.amount), 0) AS total FROM chain.swept_payments s WHERE s.source = c.channel_id) swept
+     WHERE c.last_claim_at > 0 AND c.last_claim_at <= $2 AND c.claimed > rowed.total + swept.total`,
+    [hour - WRITE_OFF_AFTER_HOURS, hourStart(hour - WRITE_OFF_AFTER_HOURS)],
+  )
+  return rows.rows.map((r) => ({
+    paymentId: keccak256(toBytes(`swept:${r.source}:${hour}`)),
+    payer: r.payer as Address,
+    amountMicro: BigInt(r.amount),
+    reqIds: [],
+    covered: [],
+    writeOff: false,
+    recoveredMicro: 0n,
+    lateCollection: true,
+    sweptFrom: r.source,
+  }))
+}
+
+async function statusReader(db: Db, hosts: string[]): Promise<VerifyContext["hostServingAt"]> {
+  const logs = await db.query<{ host: string; ts: string; status: number }>(
+    "SELECT host, ts, status FROM chain.host_status_log WHERE host = ANY($1) ORDER BY seq",
+    [hosts],
+  )
+  return (host, ts) => {
+    let status = 0
+    for (const log of logs.rows) {
+      if (log.host === host.toLowerCase() && Number(log.ts) <= ts) status = Number(log.status)
+    }
+    return status === 1 || status === 2
+  }
+}
+
+/** Reads everything an hour's batch depends on, or says what it is still waiting for. */
+export async function gatherHour(deps: GatherDeps, hour: number): Promise<Gathered> {
+  const head = await deps.reader.getBlock({ blockTag: "latest" })
+  const now = Number(head.timestamp)
+  if (now < hourEnd(hour) + HOUR_CLOSE_GRACE_S) return { waiting: "hour_not_ready" }
+
+  const closes = await deps.db.query<{ root: string }>("SELECT root FROM shared.usage_hours WHERE hour = $1", [hour])
+  const closeRoot = closes.rows[0]?.root ?? null
+  if (closeRoot === null && now < hourEnd(hour) + CLOSE_FALLBACK_S) return { waiting: "router_close" }
+
+  const pin = await pinBlock(deps, hour)
+  if (pin === null) return { waiting: "pin_block" }
+  const cursor = await deps.db.query<{ block: string }>("SELECT block FROM chain.cursor WHERE id = 'main'")
+  if (BigInt(cursor.rows[0]?.block ?? -1) < pin) return { waiting: "indexer" }
+  const indexed = await deps.db.query<{ last_settled_hour: string }>("SELECT last_settled_hour FROM chain.vault_state")
+  if (Number(indexed.rows[0]?.last_settled_hour ?? -1) < hour - 1) return { waiting: "indexer" }
+
+  const { rows } = await deps.db.query<UsageRow>(
+    "SELECT * FROM shared.usage_records WHERE hour = $1 AND status = 'final' ORDER BY req_id ASC",
+    [hour],
+  )
+  const prepaid = [...new Set(rows.filter((r) => r.pay_mode === 0).map((r) => r.payer))]
+  const allPayers = [...new Set(rows.map((r) => r.payer))]
+  const facts = await chunked(prepaid, (payer) => buyerFacts(deps, payer as Address, hour, pin))
+  const hooks = deps.contracts.OfpkHooks
+  const discounts = await chunked(allPayers, (payer) =>
+    hooks
+      ? deps.reader.readContract({
+          address: hooks,
+          abi: OfpkHooksAbi,
+          functionName: "feeDiscountBps",
+          args: [payer as Address],
+          blockNumber: pin,
+        })
+      : Promise.resolve(0),
+  )
+  const discountByPayer = new Map(allPayers.map((payer, i) => [payer, discounts[i]!]))
+  // A refund after the pin can shrink the reserve. Signers converge on the lower figure once it lands.
+  const reserveAt = (blockNumber?: bigint) =>
+    deps.reader.readContract({ address: deps.contracts.OffpeakVault!, abi: OffpeakVaultAbi, functionName: "protocolReserve", blockNumber })
+  const [pinnedReserve, latestReserve, agentPool] = await Promise.all([
+    reserveAt(pin),
+    reserveAt(),
+    deps.reader.readContract({ address: deps.contracts.OffpeakVault!, abi: OffpeakVaultAbi, functionName: "agentPool", blockNumber: pin }),
+  ])
+  const protocolReserve = pinnedReserve < latestReserve ? pinnedReserve : latestReserve
+  return {
+    pin,
+    input: {
+      hour,
+      chainId: deps.chainId,
+      vault: deps.contracts.OffpeakVault!,
+      rows,
+      buyers: new Map(prepaid.map((payer, i) => [payer, facts[i]!])),
+      payments: [...(await readPayments(deps.db, hour)), ...(await readOrphans(deps.db, hour)), ...(await readStranded(deps.db, hour))],
+      protocolReserve,
+      agentPool,
+      windows: await windowFacts(deps, rows, pin),
+      closeRoot,
+      ctx: {
+        routerAddress: deps.routerAddress,
+        usageLedger: deps.contracts.UsageLedger!,
+        hostServingAt: await statusReader(deps.db, [...new Set(rows.map((r) => r.host))]),
+        discountBps: (payer) => discountByPayer.get(payer) ?? 0,
+      },
+    },
+  }
+}
