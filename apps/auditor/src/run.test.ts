@@ -182,3 +182,168 @@ describe("scoring", () => {
     expect((await scorePending(deps(db, { chain: noRef as never, clock: () => NOW + 61 }))).canaries).toBe(1)
     expect((await db.query<{ req_id: string }>("SELECT req_id FROM serving.audit_scores")).rows.map((row) => row.req_id)).toEqual(["0xnew"])
   })
+
+  test("a sample that keeps failing cannot keep newer samples out", async () => {
+    await reference(db)
+    await storedSample("0x1", { output: "fills-the-context" })
+    await storedSample("0x2")
+    const d = deps(db, { fetcher: async (_url, init) => (String(init.body).includes("fills-the-context") ? new Response("no", { status: 400 }) : Response.json(LOGPROBS)) })
+    expect((await scorePending(d)).samples).toBe(1)
+    const rows = await db.query<{ req_id: string; score_attempts: number }>("SELECT req_id, score_attempts FROM serving.audit_samples ORDER BY req_id")
+    expect(rows.rows).toEqual([{ req_id: "0x1", score_attempts: 1 }, { req_id: "0x2", score_attempts: 0 }])
+  })
+
+  test("a request with parameters calibration never saw is not scored, so it cannot move z", async () => {
+    await reference(db)
+    await baseline(db)
+    await db.query(
+      `INSERT INTO serving.canary_runs (id, host, expected, output, req_id, model_digest, prompt_id, body, wallet, tokens_out, ts)
+       VALUES ('c1',$1,'[]'::jsonb,'w1 w2','0xc1',$2,'p',$3::jsonb,$4,2,$5)`,
+      [HOST, MODEL, JSON.stringify({ ...content, presence_penalty: 2 }), WALLET, NOW],
+    )
+    let calls = 0
+    const d = deps(db, { fetcher: async () => (calls++, Response.json(LOGPROBS)) })
+    await scorePending(d)
+    expect(calls).toBe(0)
+    expect((await db.query("SELECT 1 FROM serving.audit_scores")).rows).toHaveLength(0)
+    expect((await db.query<{ scored: boolean }>("SELECT scored_at IS NOT NULL AS scored FROM serving.canary_runs")).rows[0]!.scored).toBe(true)
+    expect(d.metrics.get("auditor_uncalibrated_params")).toBe(1)
+  })
+
+  test("canaries are scored the same way, with their own source", async () => {
+    await reference(db)
+    await db.query(
+      `INSERT INTO serving.canary_runs (id, host, expected, output, req_id, model_digest, prompt_id, body, wallet, tokens_out, ts)
+       VALUES ('c1',$1,'[]'::jsonb,'w1 w2','0xc1',$2,'p',$3::jsonb,$4,2,$5)`,
+      [HOST, MODEL, JSON.stringify(content), WALLET, NOW],
+    )
+    expect((await scorePending(deps(db))).canaries).toBe(1)
+    const rows = await db.query<{ source: string }>("SELECT source FROM serving.audit_scores")
+    expect(rows.rows[0]!.source).toBe("canary")
+  })
+
+  test("a host missing from the chain view is skipped", async () => {
+    await reference(db)
+    await storedSample("0x1")
+    expect((await scorePending(deps(db, { chain: { host: async () => null, hostList: async () => [], proof: async () => null } as never }))).samples).toBe(0)
+  })
+})
+
+describe("the weekly run", () => {
+  test("too few samples never flags, whatever they look like", async () => {
+    await insertScores(db, Array.from({ length: 199 }, () => -8))
+    expect(await runSequential(deps(db, { clock: () => START + 5_000 }))).toEqual({ pairs: 1, flagged: 0 })
+  })
+
+  test("a crossing raises the canary rate for a week and stays recorded", async () => {
+    await insertScores(db, flaggedZs())
+    const clock = () => START + 5_000
+    expect(await runSequential(deps(db, { clock }))).toMatchObject({ flagged: 1 })
+    const first = await db.query<{ state: string; boost_until: string; stopped_at: number; llr: number }>("SELECT state, boost_until, stopped_at, llr FROM serving.audit_runs")
+    expect(first.rows[0]!.state).toBe("flagged")
+    expect(Number(first.rows[0]!.boost_until)).toBe(clock() + 604_800)
+    await insertScores(db, Array.from({ length: 400 }, () => 1), START + 6_000)
+    await runSequential(deps(db, { clock: () => START + 7_000 }))
+    const later = await db.query<{ flagged: boolean; stopped_at: number; state: string }>("SELECT flagged, stopped_at, state FROM serving.audit_runs")
+    expect(later.rows[0]).toMatchObject({ flagged: true, state: "flagged", stopped_at: first.rows[0]!.stopped_at })
+  })
+
+  test("a score landing late cannot pass as a response the flag never read", async () => {
+    await reference(db, "0xref")
+    await reference(db, "0xsecond")
+    await baseline(db)
+    await insertScores(db, flaggedZs())
+    await runSequential(deps(db, { clock: () => START + 5_000 }))
+    const stopped = Number((await db.query<{ stopped_ts: string }>("SELECT stopped_ts FROM serving.audit_runs")).rows[0]!.stopped_ts)
+    const canary = async (reqId: string, ts: number, output: string) => {
+      await db.query("INSERT INTO serving.audit_scores (req_id, host, model_digest, bucket, ll_mean, z, ref_host, source, ts) VALUES ($1,$2,$3,'b',-9,-9,'0xref','canary',$4)", [reqId, HOST, MODEL, ts])
+      await db.query("INSERT INTO serving.canary_runs (id, host, expected, output, req_id, model_digest, prompt_id, body, wallet, tokens_out, ts) VALUES ($1,$2,'[]'::jsonb,$3,$1,$4,'p',$5::jsonb,$6,2,$7)", [reqId, HOST, output, MODEL, JSON.stringify(content), WALLET, ts])
+    }
+    await canary("0xlate", stopped - 5, "late-reply")
+    await canary("0xfresh", stopped + 5_000, "fresh-reply")
+    const key = baselineId({ modelDigest: MODEL, gpuClass: "0xgpu", imageDigest: "0ximage", tempBucket: "(0.5,1]", lenBucket: "<=64" })
+    await db.query("UPDATE serving.audit_scores SET bucket = $1", [key])
+    const replicated: string[] = []
+    const d = deps(db, { clock: () => START + 20_000, fetcher: async (_url, init) => (replicated.push(String(init.body)), Response.json(LOGPROBS)) })
+    await advanceFlagged(d)
+    expect(replicated.join()).toContain("fresh-reply")
+    expect(replicated.join()).not.toContain("late-reply")
+  })
+
+  test("a second reference host's failure costs that response, not the run", async () => {
+    await reference(db, "0xref")
+    await reference(db, "0xsecond")
+    await baseline(db)
+    await insertScores(db, flaggedZs())
+    await runSequential(deps(db, { clock: () => START + 5_000 }))
+    const stopped = Number((await db.query<{ stopped_ts: string }>("SELECT stopped_ts FROM serving.audit_runs")).rows[0]!.stopped_ts)
+    const key = baselineId({ modelDigest: MODEL, gpuClass: "0xgpu", imageDigest: "0ximage", tempBucket: "(0.5,1]", lenBucket: "<=64" })
+    for (const [i, output] of ["refused-reply", "good-reply"].entries()) {
+      const reqId = `0xfresh${i}`
+      await db.query("INSERT INTO serving.audit_scores (req_id, host, model_digest, bucket, ll_mean, z, ref_host, source, ts) VALUES ($1,$2,$3,$4,-9,-9,'0xref','canary',$5)", [reqId, HOST, MODEL, key, stopped + 100 + i])
+      await db.query("INSERT INTO serving.canary_runs (id, host, expected, output, req_id, model_digest, prompt_id, body, wallet, tokens_out, ts) VALUES ($1,$2,'[]'::jsonb,$3,$1,$4,'p',$5::jsonb,$6,2,$7)", [reqId, HOST, output, MODEL, JSON.stringify(content), WALLET, stopped + 100 + i])
+    }
+    const d = deps(db, { clock: () => START + 20_000, fetcher: async (_url, init) => (String(init.body).includes("refused-reply") ? new Response("too long", { status: 400 }) : Response.json(LOGPROBS)) })
+    await advanceFlagged(d)
+    expect((await db.query<{ req_id: string }>("SELECT req_id FROM serving.audit_replications")).rows.map((row) => row.req_id)).toEqual(["0xfresh1"])
+  })
+
+  test("one run that cannot move does not stop the next", async () => {
+    await insertScores(db, flaggedZs())
+    await runSequential(deps(db, { clock: () => START + 5_000 }))
+    const other = `0x${"bb".repeat(20)}`
+    await db.query("UPDATE serving.audit_runs SET stopped_ts = $1", [START + 5_000])
+    await db.query("INSERT INTO serving.audit_runs (host, model_digest, week, n, llr, threshold, flagged, stopped_ts, boost_until, state) VALUES ($1,$2,$3,200,9,5,true,$4,$5,'flagged')", [other, MODEL, WEEK, START, START + 10_000])
+    const d = deps(db, { clock: () => START + 20_000, chain: { host: async () => hostView(), hostList: async () => [hostView()], proof: async () => null } as never })
+    expect(await advanceFlagged(d)).toContainEqual({ host: other, result: "no_second_signal" })
+  })
+
+  test("an honest week is open and unflagged", async () => {
+    await insertScores(db, simulateWeek(mulberry32(2), 300, 0, 2.5).map((row) => row.z))
+    await runSequential(deps(db, { clock: () => START + 5_000 }))
+    const rows = await db.query<{ state: string; flagged: boolean; n: number }>("SELECT state, flagged, n FROM serving.audit_runs")
+    expect(rows.rows[0]).toEqual({ state: "open", flagged: false, n: 300 })
+  })
+
+  test("a flag with no second signal by the end of the boost closes, and nothing is filed", async () => {
+    await insertScores(db, flaggedZs())
+    await runSequential(deps(db, { clock: () => START + 5_000 }))
+    const expired = deps(db, { clock: () => START + 5_000 + 604_801 })
+    expect(await advanceFlagged(expired)).toEqual([{ host: HOST, result: "no_second_signal" }])
+    expect((await db.query<{ state: string }>("SELECT state FROM serving.audit_runs")).rows[0]!.state).toBe("cleared")
+    expect((await db.query("SELECT 1 FROM serving.audit_filings")).rows).toHaveLength(0)
+    expect(await advanceFlagged(expired)).toEqual([])
+  })
+
+  test("a run waits while its proofs are not settled, and files nothing", async () => {
+    await reference(db)
+    await insertScores(db, flaggedZs())
+    await runSequential(deps(db, { clock: () => START + 5_000 }))
+    expect(await advanceFlagged(deps(db, { clock: () => START + 20_000 }))).toEqual([{ host: HOST, result: "test_not_flagged" }])
+    expect((await db.query<{ state: string }>("SELECT state FROM serving.audit_runs")).rows[0]!.state).toBe("flagged")
+  })
+})
+
+describe("metering", () => {
+  const week = WEEK - 1
+  const weekStart = weekStartOf(week)
+
+  async function flag(reqId: string, reason: string, at: number) {
+    await db.query("INSERT INTO serving.metering_flags (req_id, host, router_counts, host_counts, reason, created_at) VALUES ($1,$2,'{}'::jsonb,'{}'::jsonb,$3,to_timestamp($4))", [reqId, HOST, reason, at])
+  }
+
+  test("a burst inside one hour is not sustained", async () => {
+    for (let i = 0; i < 100; i++) {
+      await insertRecord(db, `0x${i}`, { ts: weekStart + i })
+      if (i < 30) await flag(`0x${i}`, "counts", weekStart + i)
+    }
+    expect(await runMetering(deps(db), week)).toEqual([])
+  })
+
+  test("flags from the router's own side never count against a host", async () => {
+    for (let i = 0; i < 100; i++) {
+      await insertRecord(db, `0x${i}`, { ts: weekStart + i * 3_600 })
+      await flag(`0x${i}`, i % 2 ? "bill_failed" : "over_hold", weekStart + i * 3_600)
+    }
+    expect(await runMetering(deps(db), week)).toEqual([])
+  })

@@ -162,3 +162,148 @@ async function scoreCanaries(deps: AuditDeps, pass: ScorePass) {
   }
   return done
 }
+
+export async function scorePending(deps: AuditDeps) {
+  const pass: ScorePass = { references: await loadReferences(deps.db), baselines: await loadBaselines(deps.db), hosts: new Map() }
+  return { samples: await scoreSamples(deps, pass), canaries: await scoreCanaries(deps, pass) }
+}
+
+type RunRow = { host: string; model_digest: string; week: number; stopped_ts: string; boost_until: string; state: string }
+
+/** Reads each host-model's week in arrival order. A crossing stays recorded once it happens. */
+export async function runSequential(deps: AuditDeps) {
+  const now = deps.clock()
+  const week = weekIndex(now)
+  const start = weekStartOf(week)
+  const pairs = await deps.db.query<{ host: string; model_digest: string }>("SELECT DISTINCT host, model_digest FROM serving.audit_scores WHERE ts >= $1 AND z IS NOT NULL", [start])
+  let flagged = 0
+  for (const { host, model_digest: modelDigest } of pairs.rows) {
+    const scores = await loadRunScores(deps.db, host, modelDigest, start, start + WEEK_S)
+    const baseline = publishedBaseline(modelDigest)
+    const read = scan(scores, baseline)
+    await deps.db.query(
+      `INSERT INTO serving.audit_runs (host, model_digest, week, n, llr, threshold, flagged, stopped_at, stopped_ts, boost_until, state)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       ON CONFLICT (host, model_digest, week) DO UPDATE SET n = EXCLUDED.n,
+         llr = CASE WHEN serving.audit_runs.flagged THEN serving.audit_runs.llr ELSE EXCLUDED.llr END,
+         threshold = EXCLUDED.threshold,
+         flagged = serving.audit_runs.flagged OR EXCLUDED.flagged,
+         stopped_at = COALESCE(serving.audit_runs.stopped_at, EXCLUDED.stopped_at),
+         stopped_ts = COALESCE(serving.audit_runs.stopped_ts, EXCLUDED.stopped_ts),
+         boost_until = COALESCE(serving.audit_runs.boost_until, EXCLUDED.boost_until),
+         state = CASE WHEN serving.audit_runs.state = 'open' THEN EXCLUDED.state ELSE serving.audit_runs.state END`,
+      [host, modelDigest, week, scores.length, read.statistic, read.threshold, read.flagged, read.flagged ? read.n : null, read.flagged ? scores[read.n - 1]!.ts : null, read.flagged ? now + BOOST_S : null, read.flagged ? "flagged" : "open"],
+    )
+    if (read.flagged) {
+      flagged++
+      deps.metrics.inc("auditor_flags")
+      log(SERVICE, "sequential_flag", { host, modelDigest, week, n: read.n, statistic: read.statistic })
+    }
+  }
+  return { pairs: pairs.rows.length, flagged }
+}
+
+/** A second reference host scores responses after the crossing, so it reads data the flag never saw. */
+async function replicate(deps: AuditDeps, run: RunRow, fresh: readonly RunScores[], primary: string) {
+  const facts = await deps.chain.host(run.host)
+  if (!facts) return
+  const second = referencesFor(await loadReferences(deps.db), { host: run.host, modelDigest: run.model_digest, gpuClass: facts.gpuClass }).find((reference) => reference.host !== primary)
+  if (!second) {
+    deps.metrics.inc("auditor_no_second_reference")
+    return
+  }
+  const baselines = await loadBaselines(deps.db, run.model_digest)
+  let done = 0
+  let failed = 0
+  for (const row of fresh.filter((score) => score.replicaZ === null)) {
+    if (done >= REPLICATE_BATCH || failed >= REPLICATE_FAILURE_LIMIT) return
+    try {
+      const input = await bodyFor(deps, row)
+      // The baseline behind the first score, so a refit in between cannot split the pair.
+      const baseline = row.mu !== null && row.sigma !== null ? { mu: row.mu, sigma: row.sigma } : baselines.get(row.bucket)
+      const model = modelName(deps, run.model_digest)
+      if (!input || !baseline || !model) continue
+      const ll = await scoreOnReference(deps.fetcher, deps.account as never, second, { ...input, model })
+      await deps.db.query("INSERT INTO serving.audit_replications (req_id, ref_host, ll_mean, z) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING", [row.reqId, second.host, ll, standardise(ll, baseline)])
+      done++
+    } catch (err) {
+      failed++
+      log(SERVICE, "replicate_failed", { reqId: row.reqId, error: err instanceof Error ? err.message : "unknown" })
+    }
+  }
+}
+
+async function bodyFor(deps: AuditDeps, row: RunScores): Promise<Omit<ScoreInput, "model"> | null> {
+  if (row.source === "canary") {
+    const rows = await deps.db.query<{ body: Record<string, unknown>; output: string }>("SELECT body, output FROM serving.canary_runs WHERE req_id = $1", [row.reqId])
+    const found = rows.rows[0]
+    return found ? { messages: found.body.messages, tools: found.body.tools, output: found.output } : null
+  }
+  const samples = await deps.db.query<{ req_id: string; host: string; model_digest: string; enc_body: string; day_key_id: string; ts: string }>("SELECT req_id, host, model_digest, enc_body, day_key_id, ts FROM serving.audit_samples WHERE req_id = $1", [row.reqId])
+  const sample = samples.rows[0]
+  const content = sample ? await openSample(deps.db, deps.kek, sample) : null
+  return content ? { messages: content.body.messages, tools: content.body.tools, output: content.text } : null
+}
+
+async function deterministicFails(deps: Pick<AuditDeps, "db">, reqIds: readonly string[]) {
+  const rows = await deps.db.query<{ req_id: string; passed: boolean }>("SELECT req_id, passed FROM serving.canary_runs WHERE deterministic AND req_id = ANY($1::text[])", [reqIds])
+  return { judged: rows.rows.length, fails: new Set(rows.rows.filter((row) => !row.passed).map((row) => row.req_id)) }
+}
+
+async function openSwapChallenge(deps: Pick<AuditDeps, "db">, run: RunRow) {
+  const rows = await deps.db.query("SELECT 1 FROM serving.audit_filings WHERE host = $1 AND model_digest = $2 AND kind = 0 AND outcome IS NULL AND status <> 'failed' LIMIT 1", [run.host, run.model_digest])
+  return rows.rows.length > 0
+}
+
+/**
+ * Takes a flagged run towards a filing. It needs more data than the flag: fresh responses replicated
+ * on a second reference host, or canary failures past their threshold. If neither arrives while the
+ * canary rate is up, the run closes and nothing is filed.
+ */
+export async function advanceFlagged(deps: AuditDeps) {
+  const now = deps.clock()
+  const runs = await deps.db.query<RunRow>("SELECT host, model_digest, week, stopped_ts, boost_until, state FROM serving.audit_runs WHERE state = 'flagged' ORDER BY week")
+  const outcomes: { host: string; result: string }[] = []
+  for (const run of runs.rows) {
+    try {
+      const result = await advanceRun(deps, run, now)
+      if (result) outcomes.push({ host: run.host, result })
+    } catch (err) {
+      deps.metrics.inc("auditor_filing_errors")
+      log(SERVICE, "advance_failed", { host: run.host, modelDigest: run.model_digest, week: run.week, error: err instanceof Error ? err.message : "unknown" })
+    }
+  }
+  return outcomes
+}
+
+async function advanceRun(deps: AuditDeps, run: RunRow, now: number) {
+  if (Number(run.boost_until) <= now) {
+    await deps.db.query("UPDATE serving.audit_runs SET state = 'cleared' WHERE host = $1 AND model_digest = $2 AND week = $3", [run.host, run.model_digest, run.week])
+    log(SERVICE, "flag_closed_unconfirmed", { host: run.host, modelDigest: run.model_digest, week: run.week })
+    return "no_second_signal"
+  }
+  if (await openSwapChallenge(deps, run)) return null
+  if (Number(run.stopped_ts) > now - SETTLE_LAG_S) return null
+  // Split by time: a score landing late cannot move a response the flag read into the fresh side.
+  const seen = (rows: readonly RunScores[]) => rows.filter((row) => row.ts <= Number(run.stopped_ts))
+  const unseen = (rows: readonly RunScores[]) => rows.filter((row) => row.ts > Number(run.stopped_ts))
+  const window = await loadRunScores(deps.db, run.host, run.model_digest, weekStartOf(run.week), now - SETTLE_LAG_S)
+  await replicate(deps, run, unseen(window), seen(window)[0]!.refHost)
+  const scored = await loadRunScores(deps.db, run.host, run.model_digest, weekStartOf(run.week), now - SETTLE_LAG_S)
+  const reqIds = scored.map((row) => row.reqId)
+  const { judged, fails } = await deterministicFails(deps, reqIds)
+  const threshold = judged > 0 ? canaryThreshold(judged, await honestCanaryFailRate(deps, run.model_digest)) : 0
+  const { bundle } = await buildSwapBundle(deps, {
+    host: run.host as Hex,
+    modelDigest: run.model_digest as Hex,
+    first: seen(scored),
+    fresh: unseen(scored),
+    canaryFails: fails,
+    canaryThreshold: threshold,
+  })
+  const result = await fileSwap(deps, bundle, run.week)
+  if (result.filed) {
+    await deps.db.query("UPDATE serving.audit_runs SET state = 'filed', filed_challenge_id = $4 WHERE host = $1 AND model_digest = $2 AND week = $3", [run.host, run.model_digest, run.week, result.challengeId])
+  }
+  return result.filed ? "filed" : result.reason
+}
