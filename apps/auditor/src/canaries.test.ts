@@ -334,3 +334,140 @@ describe("planning", () => {
     expect(await sendCanary(deps, { host: booted.host, modelDigest: booted.modelDigest })).toBeNull()
     expect(await refreshAccepted(deps, booted.modelDigest)).toBe(0)
   })
+
+  const score = (db: Db, reqId: string, host: string, modelDigest: string, ts: number, z: number | null) =>
+    db.query("INSERT INTO serving.audit_scores (req_id, host, model_digest, bucket, ll_mean, z, ref_host, source, ts) VALUES ($1,$2,$3,'b',-1,$4,'0xr','canary',$5)", [reqId, host, modelDigest, z, ts])
+
+  test("a score with no z yet does not count towards the weekly minimum", async () => {
+    const booted = await stackWithTap()
+    const deps = depsFor(booted, await canaryAccount(booted))
+    const start = 1_762_128_000
+    const only = { hostList: async () => [...(await booted.stack.indexer.hostList())].filter((row) => row.operator.toLowerCase() === booted.host), host: booted.stack.indexer.host, proof: booted.stack.indexer.proof }
+    for (let i = 0; i < MIN_AUDITED_PER_WEEK; i++) await score(booted.stack.db, `0xn${i}`, booted.host, booted.modelDigest, start + i, null)
+    deps.chain = only as never
+    let planned = 0
+    for (let hour = 0; hour < 24; hour++) planned += (await planCanaries(deps, start + hour * 3_600)).length
+    expect(planned).toBeGreaterThan(0)
+    await booted.stack.db.query("UPDATE serving.audit_scores SET z = 0")
+    let after = 0
+    for (let hour = 0; hour < 24; hour++) after += (await planCanaries(deps, start + hour * 3_600)).length
+    expect(after).toBe(0)
+  }, 60_000)
+
+  test("one opted-in buyer's samples fill only their quota of the minimum", async () => {
+    const booted = await stackWithTap()
+    const deps = depsFor(booted, await canaryAccount(booted))
+    const only = { hostList: async () => [...(await booted.stack.indexer.hostList())].filter((row) => row.operator.toLowerCase() === booted.host), host: booted.stack.indexer.host, proof: booted.stack.indexer.proof }
+    deps.chain = only as never
+    const start = 1_762_128_000
+    for (let i = 0; i < MIN_AUDITED_PER_WEEK; i++) {
+      const reqId = `0xb${i}`
+      await booted.stack.db.query("INSERT INTO serving.audit_scores (req_id, host, model_digest, bucket, ll_mean, z, ref_host, source, ts) VALUES ($1,$2,$3,'b',-1,0,'0xr','sample',$4)", [reqId, booted.host, booted.modelDigest, start + i])
+      await booted.stack.db.query(
+        `INSERT INTO shared.usage_records (req_id, hour, ts, payer, buyer_ref, host, model_digest, tokens_in, tokens_out, prompt_hash, output_hash, price_in, price_out, host_cost_micro, fee_micro, fee_bps, pay_mode, pay_ref, sheet_hash, router_sig, host_sig, leaf)
+         VALUES ($1,$6,$2,'0xonebuyer','0x0',$3,$4,1,1,'0x0','0x0',1,1,1,1,400,0,'0x0','0x0','0x0','0x0',$5)`,
+        [reqId, start + i, booted.host, booted.modelDigest, `0xleaf${i}`, Math.floor((start + i) / 3_600)],
+      )
+    }
+    let planned = 0
+    for (let hour = 0; hour < 24; hour++) planned += (await planCanaries(deps, start + hour * 3_600)).length
+    expect(planned).toBeGreaterThan(5)
+  }, 60_000)
+
+  test("a quiet flagged host is planned enough fresh scores to replicate before its boost ends", async () => {
+    const booted = await stackWithTap()
+    const deps = depsFor(booted, await canaryAccount(booted))
+    const only = { hostList: async () => [...(await booted.stack.indexer.hostList())].filter((row) => row.operator.toLowerCase() === booted.host), host: booted.stack.indexer.host, proof: booted.stack.indexer.proof }
+    deps.chain = only as never
+    const start = 1_762_128_000 + 3_600
+    const week = weekIndex(start)
+    const db = booted.stack.db
+    const { minN } = publishedBaseline(booted.modelDigest)
+    let fresh = 0
+    for (let run = 0; run < 12; run++) {
+      deps.rng = mulberry32(100 + run)
+      await db.query("DELETE FROM serving.audit_runs")
+      await db.query("DELETE FROM serving.audit_scores")
+      for (let i = 0; i < MIN_AUDITED_PER_WEEK; i++) await score(db, `0xold${i}`, booted.host, booted.modelDigest, start - 10_000 + i, 0)
+      await db.query("INSERT INTO serving.audit_runs (host, model_digest, week, n, llr, threshold, flagged, stopped_ts, boost_until, state) VALUES ($1,$2,$3,200,9,5,true,$4,$5,'flagged')", [booted.host, booted.modelDigest, week, start - 5_000, start + 604_800])
+      let total = 0
+      for (let hour = 0; hour < 168 - 3; hour++) {
+        const now = start + hour * 3_600
+        const plans = await planCanaries(deps, now)
+        for (const [i, plan] of plans.entries()) await score(db, `0xf${run}-${hour}-${i}`, plan.host, plan.modelDigest, now + plan.delayS, 0)
+        total += plans.length
+      }
+      if (total >= minN) fresh++
+    }
+    expect(fresh).toBe(12)
+  }, 180_000)
+})
+
+describe("accepted answers", () => {
+  test("formatting does not fail an honest answer", () => {
+    expect(normaliseAnswer("  Paris.\n")).toBe("paris")
+    expect(answerAccepted(["paris"], "PARIS!")).toBe(true)
+    expect(answerAccepted(["paris"], "Lyon")).toBe(false)
+  })
+
+  test("an empty set accepts nothing", () => {
+    expect(answerAccepted([], "paris")).toBe(false)
+  })
+
+  test("the threshold sits above what honest failure reaches, and honest noise cannot reach it", () => {
+    expect(canaryThreshold(100, 0.01, 0.001)).toBe(6)
+    const rng = mulberry32(3)
+    const threshold = canaryThreshold(100, 0.01, 0.001)
+    let over = 0
+    for (let run = 0; run < 20_000; run++) {
+      let fails = 0
+      for (let i = 0; i < 100; i++) if (rng() < 0.01) fails++
+      if (fails >= threshold) over++
+    }
+    expect(over / 20_000).toBeLessThanOrEqual(0.0015)
+  })
+
+  test("answer sets come from what reference hosts actually said", async () => {
+    const booted = await stackWithTap()
+    const deps = depsFor(booted, await canaryAccount(booted))
+    await booted.stack.db.query("INSERT INTO serving.audit_reference_hosts (host, model_digest, endpoint, gpu_class, image_digest) VALUES ($1,$2,'http://host.local','0xg','0xi')", [booted.host, booted.modelDigest])
+    const pool = deterministicPool(corpus, mulberry32(1)).slice(0, 3)
+    expect(await refreshAccepted(deps, booted.modelDigest, pool)).toBe(3)
+    const rows = await booted.stack.db.query<{ accepted: string[]; prompt_id: string }>("SELECT accepted, prompt_id FROM serving.canary_expected ORDER BY prompt_id")
+    expect(rows.rows).toHaveLength(3)
+    for (const row of rows.rows) expect(row.accepted.length).toBeGreaterThan(0)
+  })
+
+  test("a reference host's own answer passes, and a swapped one fails", async () => {
+    const booted = await stackWithTap()
+    const deps = depsFor(booted, await canaryAccount(booted), 21)
+    const prompt = { promptId: "sum:9", messages: [{ role: "user", content: "What is 2 + 2? Reply with the number only." }] }
+    await booted.stack.db.query("INSERT INTO serving.audit_reference_hosts (host, model_digest, endpoint, gpu_class, image_digest) VALUES ($1,$2,'http://host.local','0xg','0xi')", [booted.host, booted.modelDigest])
+    await refreshAccepted(deps, booted.modelDigest, [prompt])
+    deps.rng = () => 0.1
+    const sent = await sendCanary(deps, { host: booted.host, modelDigest: booted.modelDigest })
+    expect(sent?.passed).toBe(true)
+    await booted.stack.db.query("UPDATE serving.canary_expected SET accepted = '[\"something else\"]'::jsonb")
+    expect((await sendCanary(deps, { host: booted.host, modelDigest: booted.modelDigest }))?.passed).toBe(false)
+    const runs = await booted.stack.db.query<{ deterministic: boolean; output: string; expected: string[] }>("SELECT deterministic, output, expected FROM serving.canary_runs ORDER BY ts")
+    expect(runs.rows.every((row) => row.deterministic && row.output.length > 0)).toBe(true)
+  })
+
+  test("an account past its daily limit is not used", async () => {
+    const booted = await stackWithTap()
+    const account = { ...(await canaryAccount(booted)), dailyLimit: 1 }
+    const deps = depsFor(booted, account)
+    expect(await sendCanary(deps, { host: booted.host, modelDigest: booted.modelDigest })).not.toBeNull()
+    expect(await sendCanary(deps, { host: booted.host, modelDigest: booted.modelDigest })).toBeNull()
+  })
+
+  test("a reply from any host but the target is an error", async () => {
+    const booted = await stackWithTap()
+    const account = await canaryAccount(booted)
+    const second = [...booted.indexer.hosts.keys()].find((host) => host !== booted.host)!
+    const deps = depsFor(booted, account)
+    const real = deps.fetcher
+    deps.fetcher = (url, init) => real(url, { ...init, headers: { ...(init.headers as object), "x-offpeak-canary-host": second } })
+    await expect(sendCanary(deps, { host: booted.host, modelDigest: booted.modelDigest })).rejects.toThrow("another host")
+  })
+})

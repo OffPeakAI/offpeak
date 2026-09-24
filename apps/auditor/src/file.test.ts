@@ -349,3 +349,201 @@ describe("filing", () => {
     const rows = await db.query<{ status: string }>("SELECT status FROM serving.audit_filings")
     expect(rows.rows[0]!.status).toBe("failed")
   })
+
+  test("a metering bundle under a ruling's share is not filed", async () => {
+    const bundle = { ...swapBundle(), testId: "metering-v1", samples: swapBundle().samples.map((s, i) => ({ ...s, refAgrees: false, meteringFlag: i < 10 })) }
+    await seedRecords(db, bundle)
+    const { deps, writes } = stubDeps(db)
+    expect(await fileMetering(deps, bundle, 7)).toMatchObject({ filed: false })
+    expect(writes).toHaveLength(0)
+  })
+
+  test("a metering bundle at a ruling's share is filed as kind 2", async () => {
+    const samples = swapBundle().samples.map((s, i) => ({ ...s, refAgrees: false, meteringFlag: i < 40 }))
+    const bundle = { ...swapBundle(), testId: "metering-v1", samples }
+    await seedRecords(db, bundle)
+    const { deps, writes } = stubDeps(db)
+    expect((await fileMetering(deps, bundle, 7)).filed).toBe(true)
+    expect((writes[0] as unknown as { args: [{ kind: number }] }).args[0].kind).toBe(2)
+  })
+
+  test("a throughput filing is kind 1 and records the measured seconds", async () => {
+    const bundle = { ...swapBundle(), testId: "window-throughput-v1", samples: swapBundle().samples.map((s) => ({ ...s, refAgrees: false })) }
+    await seedRecords(db, bundle)
+    const { deps, writes } = stubDeps(db)
+    expect((await fileThroughput(deps, bundle, 7, { belowSeconds: 600, thresholdSeconds: 300 })).filed).toBe(true)
+    expect((writes[0] as unknown as { args: [{ kind: number; statistic: bigint }] }).args[0]).toMatchObject({ kind: 1, statistic: 600_000_000n })
+  })
+})
+
+describe("sending a challenge once", () => {
+  let db: Db
+
+  beforeEach(async () => {
+    db = await openDb()
+  })
+
+  async function filed(week = 7) {
+    const bundle = swapBundle()
+    await seedRecords(db, bundle)
+    return bundle
+  }
+
+  const row = async () => (await db.query<{ status: string; tx_hash: Hex | null; signed_tx: Hex | null }>("SELECT status, tx_hash, signed_tx FROM serving.audit_filings")).rows[0]!
+
+  test("the hash is on disk before the transaction leaves", async () => {
+    const stub = stubDeps(db)
+    stub.chain.failBroadcast = "connection lost"
+    expect(await fileSwap(stub.deps, await filed(), 7)).toEqual({ filed: false, reason: "interrupted" })
+    const stored = await row()
+    expect(stored.status).toBe("sent")
+    expect(stored.tx_hash).toBe(keccak256(stub.broadcasts[0]!))
+    expect(stored.signed_tx).toBe(stub.broadcasts[0]!)
+  })
+
+  test("a crash just after the broadcast cannot pay a second bond", async () => {
+    const stub = stubDeps(db)
+    stub.chain.failBroadcast = "connection lost"
+    await fileSwap(stub.deps, await filed(), 7)
+    // The node did take it. It sits pending, so no log and no receipt can show that yet.
+    await reconcileFilings(stub.deps)
+    await reconcileFilings(stub.deps)
+    expect(stub.signed).toHaveLength(1)
+    expect(new Set(stub.broadcasts).size).toBe(1)
+    expect((await row()).status).toBe("filed")
+  })
+
+  test("a node that already holds the transaction counts as sent", async () => {
+    const stub = stubDeps(db)
+    stub.chain.failBroadcast = "connection lost"
+    await fileSwap(stub.deps, await filed(), 7)
+    stub.chain.failBroadcast = "already known"
+    await reconcileFilings(stub.deps)
+    expect((await row()).status).toBe("filed")
+    expect(stub.signed).toHaveLength(1)
+  })
+
+  test("a transaction with a receipt is confirmed, not sent again", async () => {
+    const stub = stubDeps(db)
+    stub.chain.failBroadcast = "connection lost"
+    await fileSwap(stub.deps, await filed(), 7)
+    stub.chain.receipt = true
+    const before = stub.broadcasts.length
+    await reconcileFilings(stub.deps)
+    expect(stub.broadcasts).toHaveLength(before)
+    expect((await row()).status).toBe("filed")
+  })
+
+  test("only a nonce spent on something else frees the filing for a new signature", async () => {
+    const stub = stubDeps(db)
+    stub.chain.failBroadcast = "connection lost"
+    await fileSwap(stub.deps, await filed(), 7)
+    stub.chain.taken = 1n
+    await reconcileFilings(stub.deps)
+    expect(stub.signed).toHaveLength(2)
+    expect((await row()).status).toBe("filed")
+  })
+
+  test("one simulation failure neither throws nor stops the next filing", async () => {
+    const stub = stubDeps(db)
+    const insert = (id: string, root: string, week: number) =>
+      db.query(
+        `INSERT INTO serving.audit_filings (id, host, model_digest, week, kind, samples_root, evidence, signal_sequential, signal_replication, status, from_block)
+         VALUES ($1,$2,$3,$4,0,$5,$6::jsonb,true,true,'prepared',0)`,
+        [id, HOST, MODEL, week, root, JSON.stringify({ host: HOST, kind: 0, modelDigest: MODEL, samplesRoot: root, sampleCount: 1, testId: LEAF, statistic: "1", threshold: "1", uri: "offpeak://evidence/x" })],
+      )
+    const bad = keccak256(toBytes("bad"))
+    await insert("first", bad, 1)
+    await insert("second", keccak256(toBytes("good")), 2)
+    stub.chain.failSimulate = (evidence) => evidence.samplesRoot === bad
+    expect(await reconcileFilings(stub.deps)).toBe(2)
+    const rows = await db.query<{ id: string; status: string }>("SELECT id, status FROM serving.audit_filings ORDER BY id")
+    expect(rows.rows).toEqual([{ id: "first", status: "prepared" }, { id: "second", status: "filed" }])
+    expect((stub.deps as { metrics: Metrics }).metrics.get("auditor_filing_errors")).toBe(1)
+  })
+})
+
+describe("what a host can recheck", () => {
+  test("a bundle carries the mu, sigma and baseline version behind every z", async () => {
+    const db = await openDb()
+    const ll = -3.1
+    const baseline = { mu: -2, sigma: 0.5, version: "v7" }
+    const z = (ll - baseline.mu) / baseline.sigma
+    await db.query("INSERT INTO serving.audit_baselines (model_digest, gpu_class, image_digest, temp_bucket, len_bucket, mu, sigma, n, version) VALUES ($1,'g','i','0','<=64',$2,$3,500,$4)", [MODEL, baseline.mu, baseline.sigma, baseline.version])
+    await db.query("INSERT INTO serving.audit_scores (req_id, host, model_digest, bucket, ll_mean, z, ref_host, source, ts, gpu_class, image_digest, temp_bucket, len_bucket, baseline_version) VALUES ($1,$2,$3,'b',$4,$5,$6,'canary',10,'g','i','0','<=64',$7)", [idOf(0), HOST, MODEL, ll, z, REF_A, baseline.version])
+    await db.query("INSERT INTO serving.audit_replications (req_id, ref_host, ll_mean, z) VALUES ($1,$2,-3,-2)", [idOf(0), REF_B])
+    const first = await loadRunScores(db, HOST, MODEL, 0, 100)
+    const proofs = { proof: async () => ({ hour: 1, leaf: LEAF, proof: [LEAF], root: LEAF, txHash: LEAF }) }
+    const { bundle } = await buildSwapBundle({ db, chain: proofs as never }, { host: HOST, modelDigest: MODEL, first, fresh: [], canaryFails: new Set(), canaryThreshold: 0 })
+    const [score] = bundle.attachments.scores
+    expect(score).toMatchObject({ ll, z, mu: baseline.mu, sigma: baseline.sigma, baselineVersion: "v7", replicaRef: REF_B, replicaLl: -3, replicaZ: -2 })
+    expect((score!.ll - score!.mu!) / score!.sigma!).toBeCloseTo(score!.z, 10)
+    expect((score!.replicaLl! - score!.mu!) / score!.sigma!).toBeCloseTo(score!.replicaZ!, 10)
+  })
+
+  test("a bundle commits to the mu and sigma, so changing one changes the root", () => {
+    const bundle = swapBundle()
+    const row = { reqId: idOf(0), source: "canary", refHost: REF_A, ll: -2, z: -1, mu: 0, sigma: 2, baselineVersion: "v1", bucket: "b", replicaRef: null, replicaLl: null, replicaZ: null }
+    const one = { ...bundle, attachments: { ...bundle.attachments, scores: [row] } }
+    const other = { ...bundle, attachments: { ...bundle.attachments, scores: [{ ...row, sigma: 3 }] } }
+    expect(evidenceRoot(one)).not.toBe(evidenceRoot(other))
+  })
+})
+
+describe("one buyer inside a bundle", () => {
+  test("the auditor and a ruling read the same capped statistic", () => {
+    const honest = simulateWeek(mulberry32(5), 200, 0, PUBLISHED_BASELINE.delta).map((row) => row.z)
+    const zs = [...honest, ...Array.from({ length: 40 }, () => -9)]
+    const bundle = bundleOf({ zs, first: zs.length, replication: "none", canaryFails: 30, threshold: 10 })
+    expect(swapSignals(bundle).sequential).toBe(true)
+    const framed = { ...bundle, samples: bundle.samples.map((s, i) => (i >= 200 ? { ...s, payer: "one-buyer" } : s)) }
+    expect(swapSignals(framed).sequential).toBe(false)
+    expect(decideRuling(framed, factsFor(framed), true).reason).toBe("test_not_flagged")
+  })
+})
+
+describe("building a bundle", () => {
+  const run = (i: number, over: Partial<RunScores> = {}): RunScores => ({ reqId: idOf(i), source: "canary", refHost: REF_A, ll: -2, z: -1, mu: null, sigma: null, baselineVersion: null, bucket: "b", replicaRef: null, replicaLl: null, replicaZ: null, ts: 100 + i, payer: null, ...over })
+  const proofs = (missing: Set<string> = new Set()) => ({ proof: async (reqId: string) => (missing.has(reqId) ? null : { hour: 1, leaf: LEAF, proof: [LEAF], root: LEAF, txHash: LEAF }) })
+
+  test("refAgrees marks exactly the replicated responses, and only when replication flagged", async () => {
+    const db = await openDb()
+    const { zs, n } = flaggedWeek()
+    const first = zs.slice(0, n).map((z, i) => run(i, { z }))
+    const fresh = zs.slice(n).map((z, i) => run(n + i, { z, replicaRef: REF_B, replicaZ: z }))
+    const { bundle } = await buildSwapBundle({ db, chain: proofs() as never }, { host: HOST, modelDigest: MODEL, first, fresh, canaryFails: new Set(), canaryThreshold: 0 })
+    expect(bundle.samples.filter((s) => s.refAgrees).map((s) => s.reqId)).toEqual(fresh.map((row) => row.reqId as Hex))
+    expect(swapSignals(bundle).reason).toBeNull()
+    const unflagged = fresh.map((row) => ({ ...row, replicaZ: 1 }))
+    const { bundle: quiet } = await buildSwapBundle({ db, chain: proofs() as never }, { host: HOST, modelDigest: MODEL, first, fresh: unflagged, canaryFails: new Set(), canaryThreshold: 0 })
+    expect(quiet.samples.some((s) => s.refAgrees)).toBe(false)
+  })
+
+  test("a record not settled yet stays out and is counted", async () => {
+    const db = await openDb()
+    const first = Array.from({ length: 4 }, (_v, i) => run(i))
+    const { bundle, missing } = await buildSwapBundle({ db, chain: proofs(new Set([idOf(1)])) as never }, { host: HOST, modelDigest: MODEL, first, fresh: [], canaryFails: new Set(), canaryThreshold: 0 })
+    expect(missing).toBe(1)
+    expect(bundle.samples.map((s) => s.reqId)).toEqual([idOf(0), idOf(2), idOf(3)])
+    expect(bundle.attachments.firstRun).toBe(3)
+  })
+
+  test("a buyer's sample is in the bundle as hashes, never as text", async () => {
+    const db = await openDb()
+    await db.query("INSERT INTO serving.audit_samples (req_id, host, model_digest, enc_body, day_key_id, expires_at) VALUES ($1,'0xh','0xm','sealed-bytes','day-1',now() + interval '1 hour')", [idOf(0)])
+    await seedRecords(db, { samples: [{ reqId: idOf(0), leaf: LEAF }], host: HOST })
+    const { bundle } = await buildSwapBundle({ db, chain: proofs() as never }, { host: HOST, modelDigest: MODEL, first: [run(0, { source: "sample" })], fresh: [], canaryFails: new Set(), canaryThreshold: 0 })
+    expect(bundle.attachments.buyerSamples).toEqual([{ reqId: idOf(0), promptHash: "0x0", outputHash: "0x0", encryptedBodyHeld: true }])
+    expect(JSON.stringify(bundle)).not.toContain("sealed-bytes")
+    expect(canaryThreshold(10, 0.01)).toBeGreaterThan(0)
+  })
+
+  test("the root survives storage in jsonb, where key order and number text can change", async () => {
+    const db = await openDb()
+    const bundle = swapBundle()
+    await db.query("INSERT INTO shared.evidence_bundles (samples_root, body) VALUES ($1,$2::jsonb)", [evidenceRoot(bundle), JSON.stringify(bundle)])
+    const stored = await db.query<{ body: AuditBundle }>("SELECT body FROM shared.evidence_bundles")
+    expect(evidenceRoot(stored.rows[0]!.body)).toBe(evidenceRoot(bundle))
+    expect(decideRuling(stored.rows[0]!.body, factsFor(bundle), true).outcome).toBe(OUTCOME_SWAP)
+  })
+})

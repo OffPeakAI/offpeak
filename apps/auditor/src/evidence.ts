@@ -81,3 +81,101 @@ export async function loadRunScores(db: Db, host: string, modelDigest: string, f
     payer: r.payer ? payerTag(r.payer, host, modelDigest) : null,
   }))
 }
+
+type Proved = Pick<EvidenceSample, "reqId" | "hour" | "leaf" | "proof">
+
+/** Merkle proofs against posted roots. A record not settled yet has none, and stays out for now. */
+export async function proveSamples(deps: Pick<AuditDeps, "chain">, reqIds: readonly string[]) {
+  const proved = new Map<string, Proved>()
+  for (const reqId of reqIds) {
+    const proof = await deps.chain.proof(reqId)
+    if (proof) proved.set(reqId, { reqId: reqId as Hex, hour: proof.hour, leaf: proof.leaf as Hex, proof: proof.proof as Hex[] })
+  }
+  return proved
+}
+
+async function canaryDetails(db: Db, reqIds: readonly string[]) {
+  const rows = await db.query<{ req_id: string; prompt_id: string; deterministic: boolean; body: unknown; output: string; expected: string[] }>(
+    "SELECT req_id, prompt_id, deterministic, body, output, expected FROM serving.canary_runs WHERE req_id = ANY($1::text[]) ORDER BY req_id",
+    [reqIds],
+  )
+  return rows.rows.map((r): CanaryDetail => ({ reqId: r.req_id, promptId: r.prompt_id, deterministic: r.deterministic, body: r.body, output: r.output, accepted: r.expected }))
+}
+
+/**
+ * Buyer samples go in as hashes. A body is reachable only while its 72 h last: bundles never copy
+ * one, so a challenge cannot stretch the retention promise.
+ */
+async function buyerDetails(db: Db, reqIds: readonly string[]) {
+  const rows = await db.query<{ req_id: string; prompt_hash: string; output_hash: string; held: boolean }>(
+    `SELECT u.req_id, u.prompt_hash, u.output_hash, EXISTS (SELECT 1 FROM serving.audit_samples a WHERE a.req_id = u.req_id) AS held
+     FROM shared.usage_records u WHERE u.req_id = ANY($1::text[]) ORDER BY u.req_id`,
+    [reqIds],
+  )
+  return rows.rows.map((r): BuyerDetail => ({ reqId: r.req_id, promptHash: r.prompt_hash, outputHash: r.output_hash, encryptedBodyHeld: r.held }))
+}
+
+export type SwapCase = {
+  host: Hex
+  modelDigest: Hex
+  /** Responses up to the crossing. */
+  first: RunScores[]
+  /** Later responses, every one also scored by a second reference host. */
+  fresh: RunScores[]
+  /** Deterministic canary results over both spans. */
+  canaryFails: ReadonlySet<string>
+  canaryThreshold: number
+}
+
+/**
+ * Builds the bundle a ruling recomputes. `z` is always the primary reference host's score. The
+ * replication sits in the attachments, and `refAgrees` marks only responses it actually covers.
+ */
+export async function buildSwapBundle(deps: Pick<AuditDeps, "db" | "chain">, swap: SwapCase): Promise<{ bundle: AuditBundle; missing: number }> {
+  const all = [...swap.first, ...swap.fresh]
+  const proved = await proveSamples(deps, all.map((row) => row.reqId))
+  const kept = (rows: readonly RunScores[]) => rows.filter((row) => proved.has(row.reqId))
+  const first = kept(swap.first)
+  const fresh = kept(swap.fresh)
+  const scores = [...first, ...fresh]
+  const primaryRef = swap.first[0]?.refHost ?? ""
+  const replicaRef = fresh.find((row) => row.replicaRef !== null)?.replicaRef ?? null
+  const replicated = fresh.filter((row) => row.replicaRef === replicaRef && row.replicaZ !== null)
+  const replication = replicaRef && replicated.length > 0 ? { primaryRef, refHost: replicaRef, reqIds: replicated.map((r) => r.reqId), zs: replicated.map((r) => r.replicaZ!) } : null
+  const baseline = publishedBaseline(swap.modelDigest)
+  const signalled = replication && score(replicated.map((r) => ({ z: r.replicaZ!, payer: r.payer })), baseline).flagged ? new Set(replication.reqIds) : new Set<string>()
+  const samples: EvidenceSample[] = scores.map((row) => ({
+    ...proved.get(row.reqId)!,
+    z: row.z,
+    payer: row.payer,
+    canaryFail: swap.canaryFails.has(row.reqId),
+    refAgrees: signalled.has(row.reqId),
+    meteringFlag: false,
+  }))
+  const reqIds = scores.map((row) => row.reqId)
+  const bundle: AuditBundle = {
+    v: 1,
+    host: swap.host,
+    modelDigest: swap.modelDigest,
+    testId: TEST_ID,
+    testVersion: TEST_VERSION,
+    baseline: { ...baseline },
+    samples,
+    attachments: {
+      firstRun: first.length,
+      scores: scores.map(({ ts: _ts, payer: _payer, ...row }) => row),
+      canaries: await canaryDetails(deps.db, reqIds),
+      buyerSamples: await buyerDetails(deps.db, scores.filter((row) => row.source === "sample").map((row) => row.reqId)),
+      replication,
+      canaryThreshold: swap.canaryThreshold,
+    },
+  }
+  return { bundle, missing: all.length - scores.length }
+}
+
+/** Stored by content, in the table ruling processes read. */
+export async function storeBundle(db: Db, bundle: EvidenceBundle) {
+  const root = evidenceRoot(bundle)
+  await db.query("INSERT INTO shared.evidence_bundles (samples_root, body) VALUES ($1,$2::jsonb) ON CONFLICT (samples_root) DO NOTHING", [root, JSON.stringify(bundle)])
+  return root
+}
