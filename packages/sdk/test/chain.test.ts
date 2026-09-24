@@ -148,3 +148,122 @@ describe("opening a channel", () => {
     expect((await op.channels.close()).mode).toBe("cooperative")
   }, 40_000)
 })
+
+describe("cooperative close", () => {
+  test("pays the router what vouchers cover and refunds the rest from the payer's own transaction", async () => {
+    const op = client()
+    const before = await usdgOf(agent.address)
+    const vault = await usdgOf(contract("OffpeakVault"))
+    const { id, spent } = await openAndSpend(op)
+    const result = await op.channels.close()
+    expect(result).toMatchObject({ mode: "cooperative", channelId: id, finalCumulative: spent })
+    const tx = await reader.getTransaction({ hash: result.txHash })
+    expect(tx.from.toLowerCase()).toBe(agent.address.toLowerCase())
+    expect(tx.to?.toLowerCase()).toBe(contract("ChannelManager").toLowerCase())
+    expect(await channelOf(id)).toMatchObject({ status: 3, claimed: spent })
+    expect(await usdgOf(agent.address)).toBe(before - spent)
+    expect(await usdgOf(contract("OffpeakVault"))).toBe(vault + spent)
+    expect(op.channels.snapshot()).toBeNull()
+  })
+
+  test("closes an unused channel for nothing", async () => {
+    const op = client()
+    const before = await usdgOf(agent.address)
+    const { channelId } = await op.channels.open(2n * USDG, nowish() + 7 * 3600)
+    expect(await op.channels.close()).toMatchObject({ mode: "cooperative", finalCumulative: 0n })
+    expect((await channelOf(channelId)).status).toBe(3)
+    expect(await usdgOf(agent.address)).toBe(before)
+  })
+
+  test("the close request carries a payer proof over its own body, with amounts as decimal strings", async () => {
+    let proofOk = false
+    let sent: { finalCumulative: unknown; deadline: unknown } | null = null
+    const op = client(async (req, id) => {
+      const body = await req.clone().text()
+      sent = JSON.parse(body)
+      const proof = JSON.parse(Buffer.from(req.headers.get("x-offpeak-channel-auth")!, "base64url").toString()) as { ts: number; nonce: string; sig: Hex }
+      const message = channelAuthMessage({ channelId: id, ts: proof.ts, nonce: proof.nonce, bodyHash: keccak256(toBytes(body)) })
+      proofOk = (await recoverPersonal(message, proof.sig)).toLowerCase() === agent.address.toLowerCase()
+      return booted.app.fetch(req)
+    })
+    const { spent } = await openAndSpend(op)
+    expect((await op.channels.close()).mode).toBe("cooperative")
+    expect(proofOk).toBe(true)
+    expect(sent!.finalCumulative).toBe(spent.toString())
+    expect(sent!.deadline).toMatch(/^\d+$/)
+  })
+
+  test("a router with no payee key refuses, and the close falls back to the challenge path", async () => {
+    const op = client()
+    const { id } = await openAndSpend(op)
+    const key = booted.stack.payee
+    booted.stack.payee = undefined
+    const result = await op.channels.close().finally(() => {
+      booted.stack.payee = key
+    })
+    expect(challenged(result).reason).toContain("Cooperative close is not available")
+    expect((await channelOf(id)).status).toBe(2)
+  })
+
+  test("the contract refuses a close signed by anyone but its payee", async () => {
+    const op = client()
+    const { id } = await openAndSpend(op)
+    const [key, address] = [booted.stack.payee, booted.stack.channelPayee]
+    booted.stack.payee = stranger as never
+    booted.stack.channelPayee = stranger.address
+    const result = await op.channels.close().finally(() => {
+      booted.stack.payee = key
+      booted.stack.channelPayee = address
+    })
+    expect(challenged(result).reason).toContain("would not go through")
+    expect((await channelOf(id)).status).toBe(2)
+  })
+
+  test("a final voucher still queued goes out before the close is signed", async () => {
+    let drop = true
+    const close = inProcess(booted.app)
+    const op = client(undefined, {
+      fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).endsWith("/voucher") && drop) throw new Error("connection lost")
+        return close(input, init)
+      }) as typeof fetch,
+    })
+    const { id, spent } = await openAndSpend(op)
+    drop = false
+    await op.channels.close()
+    expect((await channelRow(booted, id))?.cumulative).toBe(spent)
+  })
+
+  test("autoVoucher off still closes on everything verified", async () => {
+    const op = client(undefined, { channel: { autoVoucher: false } })
+    const { id, spent } = await openAndSpend(op)
+    expect(await channelRow(booted, id)).toBeNull()
+    expect(await op.channels.close()).toMatchObject({ mode: "cooperative", finalCumulative: spent })
+    expect((await channelOf(id)).claimed).toBe(spent)
+  })
+
+  test("a close while a request runs is refused", async () => {
+    const op = client()
+    await op.channels.open(2n * USDG, nowish() + 7 * 3600)
+    const { ticket } = await op.channels.begin("{}")
+    await expect(op.channels.close()).rejects.toMatchObject({ code: "channel_busy" })
+    await op.channels.finish(ticket, { delivered: false })
+    expect((await op.channels.close()).mode).toBe("cooperative")
+  })
+})
+
+describe("close falls back to requestClose and says so", () => {
+  const expectFallback = async (close: CloseHandler, reason: string) => {
+    const op = client(close)
+    const { id, spent } = await openAndSpend(op)
+    const result = challenged(await op.channels.close())
+    expect(result.reason).toContain(reason)
+    expect(result.notice).toContain("requestClose")
+    expect(result.finalCumulative).toBe(spent)
+    const view = await channelOf(id)
+    expect(view.status).toBe(2)
+    expect(view.claimed).toBe(0n)
+    expect(result.challengeEndsAt).toBe(Number(view.challengeEndsAt))
+    expect(result.challengeEndsAt).toBeGreaterThan(nowish() + 7000)
+    return { op, id, result }
+  }
