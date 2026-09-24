@@ -86,3 +86,83 @@ export class MockIndexer implements ChainReader {
   async windowList() {
     return [...this.windows.values()]
   }
+
+  async holder(id: string, addr: string): Promise<HolderView | null> {
+    return this.holders.get(`${id}:${addr.toLowerCase()}`) ?? null
+  }
+
+  async ofpkOf(addr: string) {
+    return this.ofpk.get(addr.toLowerCase()) ?? null
+  }
+
+  async proof(reqId: string) {
+    return this.proofs.get(reqId) ?? null
+  }
+
+  async challengesOf(host: string) {
+    return this.challenges
+      .filter((row) => row.host === host.toLowerCase())
+      .map((row) => ({ id: row.id, host: row.host, kind: row.kind, state: row.state ?? 1, slashBps: 0, filedAt: row.filedAt ?? 0, reviewEndsAt: 0 }))
+  }
+
+  /** Overrides a buyer view. Amounts arrive as decimal strings, the way the indexer API sends them. */
+  setBuyer(addr: string, overrides: Record<string, unknown>) {
+    const key = addr.toLowerCase()
+    const view: Record<string, unknown> = { ...(this.buyers.get(key) ?? emptyBuyer()) }
+    for (const [field, value] of Object.entries(overrides)) {
+      if (!(field in view)) continue
+      view[field] = field === "usagePaused" ? Boolean(value) : BigInt(value as string)
+    }
+    this.buyers.set(key, view as BuyerView)
+  }
+
+  subscribe(fn: (msg: ChainPush) => void) {
+    this.listeners.add(fn)
+    return () => this.listeners.delete(fn)
+  }
+
+  emit(msg: ChainPush) {
+    if (msg.type === "WithdrawAllRequested") {
+      const buyer = this.buyers.get(String(msg.buyer).toLowerCase())
+      if (buyer) {
+        buyer.withdrawRequestedAt = BigInt(msg.requestedAt as number)
+        buyer.withdrawDueAt = BigInt(msg.dueAt as number)
+      }
+    }
+    if (msg.type === "CapsChangeRequested") {
+      const buyer = this.buyers.get(String(msg.buyer).toLowerCase())
+      if (buyer) {
+        buyer.pendingHourlyCap = BigInt(msg.hourlyCap as string)
+        buyer.pendingDailyCap = BigInt(msg.dailyCap as string)
+        buyer.capsEffectiveAfterHour = BigInt(msg.effectiveAfterHour as string)
+      }
+    }
+    if (msg.type === "Paused") {
+      for (const buyer of this.buyers.values()) buyer.usagePaused = Boolean(msg.usagePaused)
+    }
+    if (msg.type === "CloseRequested") {
+      const ch = this.channels.get(String(msg.channelId).toLowerCase())
+      if (ch) {
+        ch.closeRequested = true
+        ch.status = 2
+        ch.challengeEndsAt = BigInt(msg.challengeEndsAt as number)
+      }
+    }
+    if (msg.type === "HostStatusChanged") {
+      const host = this.hosts.get(String(msg.host).toLowerCase())
+      if (host) {
+        host.status = Number(msg.status) as HostView["status"]
+        host.routable = host.status === HOST_STATUS.Active
+      }
+    }
+    if (msg.type === "Authorized" || msg.type === "AuthorizeFailed" || msg.type === "ExactSettled" || msg.type === "Captured") {
+      const row = this.escrows.get(String(msg.reqId)) ?? { status: "none" as const, maxAmount: 0n, captured: 0n }
+      if (msg.type === "Authorized") row.status = "authorized"
+      if (msg.type === "Captured") row.status = "captured"
+      if (msg.type === "ExactSettled") row.status = "captured"
+      this.escrows.set(String(msg.reqId), row)
+    }
+    this.head.block += 1
+    for (const fn of this.listeners) fn(msg)
+  }
+}
