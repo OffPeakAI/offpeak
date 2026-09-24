@@ -147,3 +147,179 @@ export class Channels {
     this.active = ch
     return this.snapshot()!
   }
+
+  /**
+   * With no argument, signs and sends what the verified records cover. With `owed`, you take the
+   * router's number yourself, past what this client could check, up to the deposit.
+   */
+  async voucher(owed?: Micro): Promise<VoucherReceipt | null> {
+    const ch = this.current()
+    return this.serial(async () => {
+      const verified = ch.verified
+      if (owed !== undefined) {
+        z.bigint().parse(owed)
+        if (owed <= ch.signed) throw new OffpeakError("bad_voucher", "A voucher must raise the cumulative amount")
+        if (owed > ch.deposit) throw new OffpeakError("bad_voucher", "A voucher cannot pass the deposit")
+        if (owed > ch.verified) ch.verified = owed
+        ch.reported.push(owed)
+        ch.refused = null
+      }
+      await this.signLatest(ch)
+      const receipt = ch.outbox
+      if (!receipt) return null
+      try {
+        await this.deliver(ch, receipt, true)
+      } catch (err) {
+        // A refused figure must not stay behind as headroom for the next `owed`.
+        if (ch.outbox === null) ch.verified = verified
+        throw err
+      }
+      return receipt
+    })
+  }
+
+  /**
+   * Ends the channel with the router's agreement and your own transaction. If the router refuses, or its
+   * answer does not hold up, it sends `requestClose` instead and the result says so. That path keeps the
+   * deposit locked for the 2-hour challenge period.
+   */
+  async close(): Promise<CloseResult> {
+    const ch = this.current()
+    const { reader, writer } = this.chain()
+    if (ch.inFlight > 0) throw new OffpeakError("channel_busy", "Requests are still running on this channel")
+    await assertChain(writer)
+    await this.serial(async () => {
+      await this.signLatest(ch)
+      if (ch.outbox) await this.deliver(ch, ch.outbox, false)
+    })
+    const finalCumulative = ch.signed
+    const together = await this.closeTogether(ch, finalCumulative, reader, writer)
+    if ("txHash" in together) {
+      this.active = null
+      return { mode: "cooperative", channelId: ch.id, txHash: together.txHash, finalCumulative }
+    }
+    const manager = this.ctx.book.contract("ChannelManager")
+    const txHash = await this.send(reader, writer, manager, ChannelManagerAbi, "requestClose", [ch.id]).catch(() => {
+      throw new OffpeakError("close_failed", `Cooperative close did not go through (${together.refused}), and requestClose failed too`)
+    })
+    const view = await reader.readContract({ address: manager, abi: ChannelManagerAbi, functionName: "channelView", args: [ch.id] })
+    this.active = null
+    const challengeEndsAt = Number(view.challengeEndsAt)
+    return {
+      mode: "challenge",
+      channelId: ch.id,
+      txHash,
+      finalCumulative,
+      challengeEndsAt,
+      reason: together.refused,
+      notice: `Cooperative close did not go through (${together.refused}). requestClose was sent instead, so the deposit stays locked until the challenge period ends at ${new Date(challengeEndsAt * 1000).toISOString()}.`,
+    }
+  }
+
+  /** Headers for one paid request. Each call makes a new proof, so a retry never replays one. */
+  async begin(body: string, cap?: MaxPrice): Promise<{ ticket: Ticket; headers: Record<string, string> }> {
+    const ch = await this.ready()
+    const headers: Record<string, string> = { "x-offpeak-channel": ch.id, "x-offpeak-channel-auth": await this.proof(ch, body) }
+    if (ch.outbox) headers["x-offpeak-voucher"] = encodeVoucher(ch.outbox)
+    ch.inFlight += 1
+    return { ticket: { channel: ch, voucher: ch.outbox, cap }, headers }
+  }
+
+  /** Takes what a response reported. Any voucher waits until the record behind it checks out. */
+  async finish(ticket: Ticket, done: Finished) {
+    const ch = ticket.channel
+    await this.serial(async () => {
+      ch.inFlight -= 1
+      if (ticket.voucher && ticket.voucher === ch.outbox && (done.delivered || done.voucherRefused)) {
+        ticket.voucher.delivered = done.delivered
+        ch.outbox = null
+        if (done.delivered) ch.accepted = ticket.voucher.cumulative
+        else ch.signed = ch.accepted
+      }
+      // The caller already has its answer. A voucher that fails here shows in `snapshot()`, and the credit limit stops further spend.
+      try {
+        if (done.envelope) await this.count(ch, done.envelope, ticket.cap)
+        if (done.owed !== undefined) ch.reported.push(done.owed)
+        if (!this.auto) return
+        await this.signLatest(ch)
+        if (ch.outbox) await this.deliver(ch, ch.outbox, false)
+      } catch (err) {
+        ch.refused ??= `Voucher not signed: ${err instanceof Error ? err.message : "wallet error"}`
+      }
+    })
+  }
+
+  private async ready(): Promise<Active> {
+    if (this.active) return this.active
+    this.starting ??= this.start().finally(() => {
+      this.starting = null
+    })
+    return this.starting
+  }
+
+  private async start(): Promise<Active> {
+    const { config } = this
+    if (config?.id) await this.attach(config.id, config.known)
+    else if (config?.deposit) await this.open(config.deposit, nowSeconds() + (config.expirySeconds ?? CHANNEL_MIN_LIFETIME_S * 2))
+    if (!this.active) throw new OffpeakError("no_channel", "No channel is open")
+    return this.active
+  }
+
+  private fresh(id: Hex, deposit: Micro, expiry: number, seq: bigint, owed: Micro): Active {
+    return { id, deposit, expiry, seq, signed: owed, accepted: owed, verified: owed, reported: [], outbox: null, counted: new Set(), inFlight: 0, refused: null }
+  }
+
+  private current(): Active {
+    if (!this.active) throw new OffpeakError("no_channel", "No channel is open")
+    return this.active
+  }
+
+  /** Vouchers depend on verifying records, so nothing is paid for until that is possible. */
+  private checkBook() {
+    this.ctx.book.contract("ChannelManager")
+    this.ctx.book.contract("UsageLedger")
+    this.ctx.book.routerSigner()
+  }
+
+  private needSigner(): Signer {
+    if (!this.ctx.signer) throw new OffpeakError("no_wallet", "Channels need a wallet")
+    return this.ctx.signer
+  }
+
+  private chain(): { reader: PublicClient; writer: WalletClient } {
+    const reader = this.ctx.chain.reader()
+    const writer = this.ctx.chain.writer()
+    if (!reader || !writer?.account) throw new OffpeakError("no_rpc", "Opening or closing a channel needs a wallet and an RPC URL")
+    return { reader, writer }
+  }
+
+  private async serial<T>(work: () => Promise<T>): Promise<T> {
+    const run = this.queue.then(work, work)
+    this.queue = run.catch(() => undefined)
+    return run
+  }
+
+  private async send(reader: PublicClient, writer: WalletClient, address: Address, abi: unknown, functionName: string, args: unknown[]) {
+    const account = writer.account!
+    const hash = await writer.writeContract({ account, chain: writer.chain ?? null, address, abi, functionName, args } as never)
+    const receipt = await reader.waitForTransactionReceipt({ hash, pollingInterval: RECEIPT_POLL_MS })
+    if (receipt.status !== "success") throw new OffpeakError("tx_reverted", `${functionName} transaction reverted`)
+    return hash
+  }
+
+  private async read(id: Hex) {
+    const res = await this.ctx.fetch(`${this.ctx.baseURL}/v1/channels/${id}`)
+    if (res.status === 404) return null
+    if (!res.ok) throw await errorFrom(res)
+    return channelView.parse(await res.json())
+  }
+
+  /** The router learns of a channel through the indexer, a moment after the transaction lands. */
+  private async awaitRouter(id: Hex) {
+    const end = performance.now() + SEEN_TIMEOUT_MS
+    while (performance.now() < end) {
+      if (await this.read(id).catch(() => null)) return
+      await new Promise((resolve) => setTimeout(resolve, SEEN_POLL_MS))
+    }
+    throw new OffpeakError("channel_not_seen", "Channel is open on chain, but the router has not seen it yet", undefined, { channelId: id })
+  }
