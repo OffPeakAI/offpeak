@@ -84,3 +84,82 @@ export async function storeSample(db: Db, kek: Buffer, input: SampleInput) {
   )
   return true
 }
+
+/** A row that keeps failing stops here, and waits longer each time, so it cannot hold up newer rows. */
+export const MAX_SCORE_ATTEMPTS = 10
+const RETRY_BASE_S = 60
+
+/** Records a failed try. Returns true when that was the last one. */
+export async function noteScoreFailure(db: Db, table: "serving.audit_samples" | "serving.canary_runs", reqId: string, nowS: number) {
+  const rows = await db.query<{ score_attempts: number }>(`UPDATE ${table} SET score_attempts = score_attempts + 1, retry_at = $2::bigint + ($3::bigint << score_attempts) WHERE req_id = $1 RETURNING score_attempts`, [reqId, nowS, RETRY_BASE_S])
+  return Number(rows.rows[0]?.score_attempts ?? 0) >= MAX_SCORE_ATTEMPTS
+}
+
+/** Bodies waiting for a score, oldest first. */
+export async function dueSamples(db: Db, nowS: number, limit: number) {
+  const rows = await db.query<SampleRow>(
+    `SELECT req_id, host, model_digest, enc_body, day_key_id, ts FROM serving.audit_samples
+     WHERE scored_at IS NULL AND expires_at > to_timestamp($1) AND score_attempts < $3 AND retry_at <= $4 ORDER BY score_attempts, ts LIMIT $2`,
+    [nowS, limit, MAX_SCORE_ATTEMPTS, nowS],
+  )
+  return rows.rows
+}
+
+/** Null once the key is gone: destroyed data stays unreadable however the row survived. */
+export async function openSample(db: Db, kek: Buffer, row: SampleRow): Promise<SampleContent | null> {
+  const keys = await db.query<{ wrapped: string }>("SELECT wrapped FROM serving.audit_day_keys WHERE id = $1", [row.day_key_id])
+  const wrapped = keys.rows[0]?.wrapped
+  if (!wrapped) return null
+  const key = unseal(kek, wrapped, keyAad(row.day_key_id))
+  return JSON.parse(unseal(key, row.enc_body, row.req_id).toString("utf8")) as SampleContent
+}
+
+export async function markScored(db: Db, reqId: string, nowS: number) {
+  await db.query("UPDATE serving.audit_samples SET scored_at = to_timestamp($2) WHERE req_id = $1", [reqId, nowS])
+}
+
+/** Deletes expired bodies, then destroys every key whose last body has gone. */
+export async function runRetention(db: Db, nowS: number) {
+  return db.transaction(async (tx) => {
+    const bodies = await tx.query<{ req_id: string }>("DELETE FROM serving.audit_samples WHERE expires_at <= to_timestamp($1) RETURNING req_id", [nowS])
+    const keys = await tx.query<{ id: string }>("DELETE FROM serving.audit_day_keys WHERE retire_at <= to_timestamp($1) RETURNING id", [nowS])
+    return { bodies: bodies.rows.length, keys: keys.rows.length }
+  })
+}
+
+const round = (value: unknown, step: number) => (typeof value === "number" && Number.isFinite(value) ? Number((Math.round(value / step) * step).toFixed(2)) : null)
+
+function tokenBand(value: unknown) {
+  if (typeof value !== "number" || value < 1) return null
+  return 2 ** Math.ceil(Math.log2(value))
+}
+
+/** A request's shape, with no content in it. Canary parameters are drawn from counts of these. */
+export function trafficShape(body: Record<string, unknown>) {
+  const messages = Array.isArray(body.messages) ? (body.messages as { role?: string }[]) : []
+  return canonicalJson({
+    temperature: round(body.temperature, 0.1),
+    topP: round(body.top_p, 0.05),
+    maxTokens: tokenBand(body.max_tokens ?? body.max_completion_tokens),
+    tools: Array.isArray(body.tools) ? Math.min(body.tools.length, 4) : 0,
+    stream: body.stream === true,
+    system: messages[0]?.role === "system",
+    turns: Math.min(messages.filter((m) => m.role === "user").length, 6),
+    format: (body.response_format as { type?: string } | undefined)?.type ?? null,
+    seed: typeof body.seed === "number",
+    stop: body.stop !== undefined && body.stop !== null,
+  })
+}
+
+export type TrafficShape = {
+  temperature: number | null
+  topP: number | null
+  maxTokens: number | null
+  tools: number
+  stream: boolean
+  system: boolean
+  turns: number
+  format: string | null
+  seed: boolean
+  stop: boolean
+}

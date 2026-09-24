@@ -193,3 +193,83 @@ async function encryptStream({ upstream, control, run, tokenizer, body, tokensIn
   })
   return new Response(stream, { headers: { "content-type": HPKE_STREAM_CONTENT_TYPE, "cache-control": "no-cache" } })
 }
+
+/** The sealed routes. Decrypted bytes stay inside these handlers. Only counts and ciphertext hashes leave. */
+export function mountSealed(deps: SealedRoutes) {
+  const { app, sealed, model, limit, signed, served, clock, admit, inflight } = deps
+
+  /** With no nonce this only says which boot is running, so the router can notice a restart cheaply. */
+  app.get("/offpeak/v1/attest", async (c) => {
+    const raw = c.req.query("nonce")
+    if (raw === undefined) return c.json({ attestationRef: sealed.attestationRef, hpkePublicKey: sealed.identity.publicKey })
+    const nonce = nonceSchema.safeParse(raw)
+    if (!nonce.success) return refusal(400, "bad_nonce", "Nonce must be 32 bytes of hex and not zero")
+    const running = sealed.attest(nonce.data)
+    if (!running) return refusal(429, "attest_busy", "Too many attestations are running")
+    return running.then(
+      (body) => c.json(body),
+      () => Response.json({ error: { message: "Attestation failed", type: "engine", code: "attest_failed" } }, { status: 503 }),
+    )
+  })
+
+  app.post(SEALED_CHAT_ROUTE, signed, limit, async (c) => {
+    const head = headersSchema.safeParse({ model: c.req.header("x-offpeak-model"), maxTokens: c.req.header("x-offpeak-max-tokens") })
+    if (!head.success) return refusal(400, "bad_request", "Model and max tokens headers are required")
+    const bytes = new Uint8Array(await c.req.arrayBuffer())
+    const promptHash = keccak256(bytes)
+    const req = await admit(sealedReqPayload({ bodyHash: promptHash, ...head.data }), c.req.header("x-offpeak-req"))
+    if (req instanceof Response) return req
+    if (head.data.model !== sealed.boot.modelName) return refusal(404, "model_not_found", "This host does not seal that model")
+    const opened = await sealed.identity.open(bytes, SEALED_PATH, clock() * 1000)
+    if ("refused" in opened) return OPEN_REFUSED[opened.refused]()
+    let json: unknown
+    try {
+      json = JSON.parse(new TextDecoder().decode(opened.plaintext))
+    } catch {
+      return refusal(400, "bad_request", "Body is not a chat request")
+    }
+    const parsed = chatBody.safeParse(json)
+    if (!parsed.success || !withinDepth(json)) return refusal(400, "bad_request", "Body is not a chat request")
+    // The router priced and held the clear headers. The body inside must not ask for more than they paid for.
+    if (parsed.data.model !== head.data.model) return refusal(400, "sealed_model_mismatch", "The sealed body names another model")
+    const asked = parsed.data.max_completion_tokens ?? parsed.data.max_tokens
+    if (asked != null && (!Number.isInteger(asked) || (asked as number) < 1)) return refusal(400, "bad_max_tokens", "max_tokens must be a positive integer")
+    const maxTokens = Math.min((asked as number | null | undefined) ?? head.data.maxTokens, head.data.maxTokens)
+    const body: ChatBody = { messages: parsed.data.messages as ChatMessage[], tools: parsed.data.tools ?? undefined }
+    // Counted before the engine runs. Output the VM cannot put a count on is output nobody can be billed for.
+    const tokensIn = countInput(model.tokenizer, body)
+    if (tokensIn === null || tokensIn > inputTokenCeiling(bytes.length)) return refusal(400, "uncountable", "This request cannot be counted")
+    const control = new AbortController()
+    const signal = AbortSignal.any([control.signal, AbortSignal.timeout(MAX_REQUEST_S * 1000)])
+    inflight(1)
+    const upstream = await fetch(`${sealed.boot.engine}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(forwardedBody({ ...parsed.data, stream: true, max_tokens: maxTokens })),
+      redirect: "error",
+      signal,
+    }).catch(() => null)
+    // vLLM's error text can quote the prompt, and the router would read it. Only a code goes back.
+    if (!upstream?.ok || !upstream.body) {
+      inflight(-1)
+      await upstream?.body?.cancel().catch(() => undefined)
+      return Response.json({ error: { message: "Engine refused the request", type: "engine", code: "engine_refused" } }, { status: 502 })
+    }
+    const run = served.begin({ reqId: req.reqId, ts: req.ts, modelDigest: model.digest })
+    run.request.sealed = { promptHash, outputHash: null }
+    return encryptStream({ upstream, control, run, tokenizer: model.tokenizer, body, tokensIn, secret: opened.secret, enc: opened.enc, inflight })
+  })
+
+  /** The router cannot count ciphertext, so it asks here. The answer carries a signature only this VM can make. */
+  app.get(`${SEALED_COUNTS_ROUTE}/:reqId`, async (c) => {
+    const reqId = c.req.param("reqId")
+    const req = await checkSignedReq(c.req.header("x-offpeak-req"), deps.routerAddress, reqId, clock())
+    if (!req || req.reqId.toLowerCase() !== reqId.toLowerCase()) return Response.json({ error: { message: "signature required", type: "auth", code: "bad_router_req" } }, { status: 401 })
+    const request = served.get(reqId)
+    if (!request?.sealed) return refusal(404, "unknown_request", "No sealed request has this id")
+    const finished = await settledRequest(request)
+    const { promptHash, outputHash } = request.sealed
+    if (!finished || !request.counts || !outputHash) return refusal(409, "uncounted", "This request has no counts yet")
+    return c.json(await sealed.countsKey.sign({ reqId: request.reqId, ...request.counts, promptHash, outputHash }))
+  })
+}

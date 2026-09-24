@@ -78,3 +78,93 @@ export function buyerView(row: BuyerRow, vault: VaultState, now: number) {
     ...(reason ? { reason } : {}),
   }
 }
+
+export async function emptyBuyerRow(): Promise<BuyerRow> {
+  return {
+    balance: "0",
+    hourly_cap: "0",
+    daily_cap: "0",
+    pending_hourly_cap: "0",
+    pending_daily_cap: "0",
+    caps_effective_after_hour: "0",
+    withdraw_requested_at: "0",
+  }
+}
+
+/** Required bond counts credits over the same 30-day window as the registry's ring; rewards stay out. */
+export async function requiredBond(db: Db, host: string, now: number) {
+  const day = BigInt(now) / 86_400n
+  const rows = await db.query<{ total: string | null }>(
+    `SELECT COALESCE(SUM(amount), 0) AS total FROM chain.host_credits
+     WHERE host = $1 AND kind = 'credit' AND accrued_at / 86400 > $2`,
+    [host, (day - RING_DAYS).toString()],
+  )
+  const required = (BigInt(rows.rows[0]?.total ?? 0) * REQUIRED_BOND_BPS) / 10_000n
+  return required > HOST_MIN_BOND ? required : HOST_MIN_BOND
+}
+
+export async function hostView(db: Db, address: string, now: number) {
+  const hosts = await db.query<Record<string, string>>("SELECT * FROM chain.hosts WHERE address = $1", [address])
+  const host = hosts.rows[0]
+  if (!host) return null
+  const models = await db.query<{ digest: string; max_tps: number }>("SELECT digest, max_tps FROM chain.host_models WHERE host = $1 ORDER BY digest", [address])
+  const credits = await db.query<{ releasable: string | null; pending: string | null }>(
+    `SELECT
+       COALESCE(SUM(amount) FILTER (WHERE releasable_at <= $2), 0) AS releasable,
+       COALESCE(SUM(amount) FILTER (WHERE releasable_at > $2), 0) AS pending
+     FROM chain.host_credits WHERE host = $1 AND state = 'open'`,
+    [address, now],
+  )
+  const required = await requiredBond(db, address, now)
+  const bondUsdg = BigInt(host.bond_usdg!)
+  return {
+    operator: address,
+    status: Number(host.status),
+    bondUsdg,
+    bondOfpk: BigInt(host.bond_ofpk!),
+    requiredBond: required,
+    imageDigest: host.image_digest,
+    gpuClass: host.gpu_class,
+    attestationRef: host.attestation_ref,
+    probationEnds: BigInt(host.probation_ends!),
+    strikes: Number(host.strikes),
+    openChallenges: Number(host.open_challenges),
+    releasableCredits: BigInt(credits.rows[0]?.releasable ?? 0),
+    pendingCredits: BigInt(credits.rows[0]?.pending ?? 0),
+    models: models.rows.map((m) => ({ digest: m.digest, maxTps: m.max_tps })),
+    routable: Number(host.status) === 2 && bondUsdg >= required,
+    routingBonusBps: 0,
+    endpointHash: host.endpoint_hash,
+  }
+}
+
+export type ChannelRow = {
+  payer: string
+  deposit: string
+  claimed: string
+  last_seq: string
+  expiry: string
+  challenge_ends_at: string
+  status: number
+}
+
+export function channelView(row: ChannelRow) {
+  const status = Number(row.status)
+  return {
+    payer: row.payer,
+    deposit: BigInt(row.deposit),
+    claimed: BigInt(row.claimed),
+    lastSeq: BigInt(row.last_seq),
+    expiry: BigInt(row.expiry),
+    challengeEndsAt: BigInt(row.challenge_ends_at),
+    status,
+    closeRequested: status === 2,
+  }
+}
+
+export type EscrowRow = { max_amount: string; captured: string; status: string; tx_hash: string }
+
+export function escrowView(row?: EscrowRow) {
+  if (!row) return { status: "none", maxAmount: 0n, captured: 0n, txHash: null }
+  return { status: row.status, maxAmount: BigInt(row.max_amount), captured: BigInt(row.captured), txHash: row.tx_hash }
+}

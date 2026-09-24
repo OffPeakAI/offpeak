@@ -99,3 +99,87 @@ export function referencesFor(references: readonly ReferenceHost[], target: { ho
     .filter((r) => r.host !== target.host && r.modelDigest === target.modelDigest && r.gpuClass === target.gpuClass)
     .sort((a, b) => Number(b.attested) - Number(a.attested) || (a.host < b.host ? -1 : 1))
 }
+
+export async function loadReferences(db: Db): Promise<ReferenceHost[]> {
+  const rows = await db.query<{ host: string; model_digest: string; endpoint: string; gpu_class: string; image_digest: string; attested: boolean }>("SELECT * FROM serving.audit_reference_hosts")
+  return rows.rows.map((r) => ({ host: r.host, modelDigest: r.model_digest, endpoint: r.endpoint, gpuClass: r.gpu_class, imageDigest: r.image_digest, attested: r.attested }))
+}
+
+type BaselineRow = { model_digest: string; gpu_class: string; image_digest: string; temp_bucket: string; len_bucket: string; mu: number; sigma: number; n: number; version: string }
+
+const asBaseline = (r: BaselineRow): Baseline => ({
+  modelDigest: r.model_digest,
+  gpuClass: r.gpu_class,
+  imageDigest: r.image_digest,
+  tempBucket: r.temp_bucket,
+  lenBucket: r.len_bucket,
+  mu: Number(r.mu),
+  sigma: Number(r.sigma),
+  n: Number(r.n),
+  version: r.version,
+})
+
+/** The newest version for each bucket key. */
+export async function loadBaselines(db: Db, modelDigest?: string) {
+  const rows = await db.query<BaselineRow>(
+    `SELECT DISTINCT ON (model_digest, gpu_class, image_digest, temp_bucket, len_bucket) *
+     FROM serving.audit_baselines WHERE ($1::text IS NULL OR model_digest = $1)
+     ORDER BY model_digest, gpu_class, image_digest, temp_bucket, len_bucket, version DESC`,
+    [modelDigest ?? null],
+  )
+  return new Map(rows.rows.map((row) => [baselineId(asBaseline(row)), asBaseline(row)]))
+}
+
+export type ScoredResponse = {
+  reqId: string
+  host: string
+  modelDigest: string
+  gpuClass: string
+  imageDigest: string
+  source: "sample" | "canary"
+  temperature: number
+  tokensOut: number
+  ts: number
+  ll: number
+  refHost: string
+}
+
+/** A score with no baseline yet keeps its ℓ and waits; `fillMissingZ` completes it later. */
+export async function recordScore(db: Db, baselines: Map<string, Baseline>, row: ScoredResponse) {
+  const key = { modelDigest: row.modelDigest, gpuClass: row.gpuClass, imageDigest: row.imageDigest, tempBucket: tempBucket(row.temperature), lenBucket: lenBucket(row.tokensOut) }
+  const baseline = baselines.get(baselineId(key))
+  await db.query(
+    `INSERT INTO serving.audit_scores (req_id, host, model_digest, bucket, ll_mean, z, ref_host, source, ts, gpu_class, image_digest, temp_bucket, len_bucket, baseline_version)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT (req_id) DO NOTHING`,
+    [
+      row.reqId,
+      row.host,
+      row.modelDigest,
+      baselineId(key),
+      row.ll,
+      baseline ? standardise(row.ll, baseline) : null,
+      row.refHost,
+      row.source,
+      row.ts,
+      row.gpuClass,
+      row.imageDigest,
+      key.tempBucket,
+      key.lenBucket,
+      baseline?.version ?? null,
+    ],
+  )
+  return baseline !== undefined
+}
+
+export async function fillMissingZ(db: Db) {
+  const baselines = await loadBaselines(db)
+  const rows = await db.query<{ req_id: string; bucket: string; ll_mean: number }>("SELECT req_id, bucket, ll_mean FROM serving.audit_scores WHERE z IS NULL")
+  let filled = 0
+  for (const row of rows.rows) {
+    const baseline = baselines.get(row.bucket)
+    if (!baseline) continue
+    await db.query("UPDATE serving.audit_scores SET z = $2, baseline_version = $3 WHERE req_id = $1", [row.req_id, standardise(Number(row.ll_mean), baseline), baseline.version])
+    filled++
+  }
+  return filled
+}
