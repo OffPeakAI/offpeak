@@ -192,3 +192,228 @@ function Deposit({ summary }: { summary: Summary }) {
     </form>
   )
 }
+
+function Withdraw({ summary }: { summary: Summary }) {
+  const { token } = useSession()
+  const { run, busy } = useTx()
+  const [text, setText] = useState("")
+  const parsed = parseUsdg(text)
+  const most = BigInt(summary.withdrawable)
+  const error = text === "" ? null : !parsed.ok ? parsed.error : parsed.micro === 0n ? "Enter more than zero." : parsed.micro > most ? `You can withdraw ${formatUsdg(most)} USDG now.` : null
+  const submit = (event: FormEvent) => {
+    event.preventDefault()
+    if (!parsed.ok || error) return
+    void run(`Withdraw ${formatUsdg(parsed.micro)} USDG`, async (wallet) => {
+      await wallet.send("Withdraw from the vault", await trpcMutation<Tx>("account.withdrawTx", { amount: parsed.micro.toString() }, token), { fn: "withdraw", args: [parsed.micro] })
+    }).then((ok) => ok && setText(""))
+  }
+  return (
+    <form className="panel" onSubmit={submit}>
+      <Field label="Amount" error={error} hint={`Up to ${formatUsdg(most)} USDG now.`}>
+        <span className="input-unit">
+          <input inputMode="decimal" autoComplete="off" value={text} onChange={(event) => setText(event.target.value)} placeholder="0.00" />
+          <button type="button" className="copy" onClick={() => setText(formatUsdg(most).replaceAll(",", ""))}>
+            max
+          </button>
+        </span>
+      </Field>
+      <button type="submit" className="btn" disabled={busy || !parsed.ok || Boolean(error)}>
+        Withdraw
+      </button>
+    </form>
+  )
+}
+
+function WithdrawAll({ summary }: { summary: Summary }) {
+  const { token } = useSession()
+  const { run, busy } = useTx()
+  const now = useNow(summary.serverTime)
+  const state = withdrawAllState({ requestedAt: summary.withdrawRequestedAt, dueAt: summary.withdrawDueAt, lastSettledHour: summary.lastSettledHour, now })
+  const act = (title: string, label: string, path: string, want: Want) => run(title, async (wallet) => wallet.send(label, await trpcMutation<Tx>(path, undefined, token), want))
+  if (state.phase === "none") {
+    return (
+      <div className="panel">
+        <p className="note">Serving stops within a second of the request. The full balance, reserve included, can leave once the hour settles, and no later than 2 hours after the request.</p>
+        <button type="button" className="btn ghost" disabled={busy} onClick={() => void act("Withdraw all", "Request withdraw-all", "account.requestWithdrawAllTx", { fn: "requestWithdrawAll" })}>
+          Request withdraw-all
+        </button>
+      </div>
+    )
+  }
+  return (
+    <div className="panel countdown">
+      {state.phase === "waiting" ? (
+        <>
+          <span className="stat-label">Guaranteed by {formatUtc(state.dueAt)}</span>
+          <strong role="timer">{state.label}</strong>
+          <div className="meter gold" aria-hidden="true">
+            <span style={{ width: `${state.elapsedBps / 100}%` }} />
+          </div>
+          <p className="note">Requests are refused while this runs. It can finish sooner, once the hour of the request settles.</p>
+        </>
+      ) : (
+        <>
+          <strong>Ready</strong>
+          <p className="note">{state.reason === "settled" ? "The hour of your request has settled." : "The 2-hour guarantee has passed."} Anyone can now send the balance to your wallet, and a keeper usually does.</p>
+        </>
+      )}
+      <div className="row">
+        {state.phase === "ready" && (
+          <button type="button" className="btn" disabled={busy} onClick={() => void act("Finish withdraw-all", "Send the balance to your wallet", "account.executeWithdrawAllTx", { fn: "executeWithdrawAll", args: [summary.wallet] })}>
+            Finish withdraw-all
+          </button>
+        )}
+        <button type="button" className="btn ghost" disabled={busy} onClick={() => void act("Cancel withdraw-all", "Cancel the request", "account.cancelWithdrawAllTx", { fn: "cancelWithdrawAll" })}>
+          Cancel and keep serving
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function CapsPanel({ summary }: { summary: Summary }) {
+  const { token } = useSession()
+  const { run, busy } = useTx()
+  const caps = capsState(summary)
+  const [hourly, setHourly] = useState("")
+  const [daily, setDaily] = useState("")
+  const parsedHourly = parseUsdg(hourly)
+  const parsedDaily = parseUsdg(daily || "0")
+  const error = hourly === "" ? null : !parsedHourly.ok ? parsedHourly.error : null
+  const dailyError = daily !== "" && !parsedDaily.ok ? parsedDaily.error : null
+  const submit = (event: FormEvent) => {
+    event.preventDefault()
+    if (!parsedHourly.ok || !parsedDaily.ok) return
+    const input = { hourlyCap: parsedHourly.micro.toString(), dailyCap: parsedDaily.micro.toString() }
+    void run("Set caps", async (wallet) => wallet.send("Set hourly and daily caps", await trpcMutation<Tx>("account.setCapsTx", input, token), { fn: "setCaps", args: [parsedHourly.micro, parsedDaily.micro] })).then((ok) => {
+      if (!ok) return
+      setHourly("")
+      setDaily("")
+    })
+  }
+  return (
+    <Section id="caps" title="Caps">
+      <div className="stats two">
+        <Stat label="Hourly" note={caps.pendingHourly !== null ? `Falling to ${formatUsdg(caps.pendingHourly)} USDG` : undefined}>
+          <Usdg micro={caps.hourly} />
+        </Stat>
+        <Stat label="Daily" note={caps.pendingDaily !== null ? `Falling to ${formatUsdg(caps.pendingDaily)} USDG` : undefined}>
+          <Usdg micro={caps.daily} />
+        </Stat>
+      </div>
+      <p className="note">Lower caps apply after the next settled hour. Offpeak serves you at the lower cap straight away; the reserve falls once that hour settles. Higher caps apply at once.</p>
+      <form className="panel" onSubmit={submit}>
+        <div className="fields">
+          <Field label="New hourly cap" error={error}>
+            <span className="input-unit">
+              <input inputMode="decimal" autoComplete="off" value={hourly} onChange={(event) => setHourly(event.target.value)} placeholder="0.00" />
+              <span>USDG</span>
+            </span>
+          </Field>
+          <Field label="New daily cap" error={dailyError} hint="Blank means four times the hourly cap.">
+            <span className="input-unit">
+              <input inputMode="decimal" autoComplete="off" value={daily} onChange={(event) => setDaily(event.target.value)} placeholder="0.00" />
+              <span>USDG</span>
+            </span>
+          </Field>
+        </div>
+        <button type="submit" className="btn ghost" disabled={busy || !parsedHourly.ok || !parsedDaily.ok}>
+          Set caps
+        </button>
+      </form>
+    </Section>
+  )
+}
+
+function Keys() {
+  const { token } = useSession()
+  const keys = useAuthed<ApiKey[]>("keys.list")
+  const client = useQueryClient()
+  const [label, setLabel] = useState("")
+  const [shown, setShown] = useState<{ token: string; label: string } | null>(null)
+  const [failure, setFailure] = useState<unknown>(null)
+  const create = async (event: FormEvent) => {
+    event.preventDefault()
+    setFailure(null)
+    try {
+      setShown(await trpcMutation<{ token: string; label: string }>("keys.create", { label: label.trim() }, token))
+      setLabel("")
+      await client.invalidateQueries({ queryKey: ["keys.list"] })
+    } catch (error) {
+      setFailure(error)
+    }
+  }
+  const revoke = async (key: ApiKey) => {
+    if (!confirm(`Revoke "${key.label}"? Requests with it stop within seconds.`)) return
+    setFailure(null)
+    try {
+      await trpcMutation("keys.revoke", { id: key.id }, token)
+      await client.invalidateQueries({ queryKey: ["keys.list"] })
+    } catch (error) {
+      setFailure(error)
+    }
+  }
+  return (
+    <Section id="keys" title="API keys">
+      {shown && (
+        <div className="reveal" role="status">
+          <p>
+            <strong>{shown.label}</strong>: copy this now. It is stored only as a hash and will not be shown again.
+          </p>
+          <code>{shown.token}</code>
+          <div className="row">
+            <button type="button" className="btn ghost" onClick={() => void navigator.clipboard.writeText(shown.token)}>
+              Copy
+            </button>
+            <button type="button" className="btn ghost" onClick={() => setShown(null)}>
+              Done
+            </button>
+          </div>
+        </div>
+      )}
+      <Data query={keys} lines={2}>
+        {(rows) =>
+          rows.length > 0 ? (
+            <table className="ledger">
+              <thead>
+                <tr>
+                  <th>Label</th>
+                  <th>Created</th>
+                  <th className="num">Rate limit</th>
+                  <th />
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((key) => (
+                  <tr key={key.id}>
+                    <td data-label="Label">{key.label}</td>
+                    <td data-label="Created">{formatUtc(key.createdAt)}</td>
+                    <td data-label="Rate limit" className="num">
+                      {key.rpm} rpm
+                    </td>
+                    <td className="act">
+                      <button type="button" className="btn ghost small" onClick={() => void revoke(key)}>
+                        Revoke
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <Empty title="No API keys yet.">A key lets your code spend from this balance, up to your caps.</Empty>
+          )
+        }
+      </Data>
+      <form className="row end" onSubmit={(event) => void create(event)}>
+        <Field label="New key label">
+          <input value={label} maxLength={64} onChange={(event) => setLabel(event.target.value)} placeholder="build box" />
+        </Field>
+        <button type="submit" className="btn ghost" disabled={label.trim() === ""}>
+          Make a key
+        </button>
+      </form>
+      {failure !== null && <Failed error={failure} />}
+    </Section>
+  )
+}
