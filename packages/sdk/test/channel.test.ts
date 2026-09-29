@@ -206,3 +206,203 @@ describe("payer proof on every request", () => {
     expect(replayed.status).toBe(401)
     expect(((await replayed.json()) as { error: { code: string } }).error.code).toBe("bad_channel_auth")
   })
+
+  test("the router refuses a proof with the wrong body, an old time, or another signer", async () => {
+    const booted = await bootRouter()
+    const id = addChannel(booted, 5n * USDG)
+    const body = JSON.stringify(ask("real body"))
+    const post = async (auth: string, sent = body) =>
+      (await booted.app.request(chatPath, { method: "POST", headers: { "content-type": "application/json", "x-offpeak-channel": id, "x-offpeak-channel-auth": auth }, body: sent })).status
+    const now = booted.stack.clock()
+    expect(await post(await channelAuthHeader(buyerAccount, { channelId: id, ts: now, body }), JSON.stringify(ask("other body")))).toBe(401)
+    expect(await post(await channelAuthHeader(buyerAccount, { channelId: id, ts: now - 120, body }))).toBe(401)
+    const { roleAccount } = await import("../../shared/src/test-keys.ts")
+    expect(await post(await channelAuthHeader(roleAccount("host"), { channelId: id, ts: now, body }))).toBe(401)
+    expect(await post(await channelAuthHeader(buyerAccount, { channelId: id, ts: now, body }))).toBe(200)
+  })
+
+  test("a wallet that does not own the channel is refused", async () => {
+    const booted = await bootRouter()
+    const { roleAccount } = await import("../../shared/src/test-keys.ts")
+    const id = addChannel(booted, 5n * USDG, roleAccount("host").address)
+    const op = client(booted)
+    await expect(op.channels.attach(id)).rejects.toMatchObject({ code: "not_your_channel" })
+    const bare = client(booted, { publicClient: { readContract: async () => ({ ...booted.indexer.channels.get(id)!, payer: buyerAccount.address }) } as never })
+    await bare.channels.attach(id)
+    await expect(bare.chat(ask("not mine"))).rejects.toMatchObject({ code: "bad_channel_auth", status: 401 })
+    expect(await channelRow(booted, id)).toBeNull()
+  })
+})
+
+describe("spend limits", () => {
+  test("a client that stops signing is stopped at the credit limit, and a voucher lets it carry on", async () => {
+    const booted = await bootRouter()
+    const deposit = 2_000n
+    const limit = deposit / 10n
+    const id = addChannel(booted, deposit)
+    const op = client(booted, { channel: { autoVoucher: false } })
+    await op.channels.attach(id)
+    let spent = 0n
+    let stopped: OffpeakError | null = null
+    for (let i = 0; i < 500 && !stopped; i++) {
+      try {
+        spent += costOf(((await op.chat(ask(`unsigned ${i}`))) as ChatResult).envelope)
+      } catch (err) {
+        stopped = err as OffpeakError
+      }
+    }
+    expect(stopped?.code).toBe("credit_limit")
+    expect(stopped?.status).toBe(402)
+    expect(spent).toBeGreaterThan(0n)
+    expect(spent).toBeLessThanOrEqual(limit)
+    expect(await channelRow(booted, id)).toBeNull()
+    const receipt = await op.channels.voucher()
+    expect(receipt?.cumulative).toBe(spent)
+    expect(receipt?.delivered).toBe(true)
+    expect((await channelRow(booted, id))?.cumulative).toBe(spent)
+    const resumed = (await op.chat(ask("signed again"))) as ChatResult
+    expect(resumed.envelope.record.payMode).toBe(3)
+  }, 30_000)
+
+  test("spend stops at the deposit with vouchers flowing", async () => {
+    const booted = await bootRouter()
+    const deposit = 200n
+    const id = addChannel(booted, deposit)
+    const op = client(booted)
+    await op.channels.attach(id)
+    let spent = 0n
+    let stopped: OffpeakError | null = null
+    for (let i = 0; i < 200 && !stopped; i++) {
+      try {
+        spent += costOf(((await op.chat(ask(`spend ${i}`))) as ChatResult).envelope)
+      } catch (err) {
+        stopped = err as OffpeakError
+      }
+    }
+    expect(stopped?.code).toBe("deposit_exhausted")
+    expect(spent).toBeLessThanOrEqual(deposit)
+    expect((await channelRow(booted, id))?.cumulative).toBe(spent)
+  }, 30_000)
+
+  test("a closing channel takes no new requests", async () => {
+    const booted = await bootRouter()
+    const id = addChannel(booted, 5n * USDG)
+    const op = client(booted)
+    await op.channels.attach(id)
+    await op.chat(ask("before close"))
+    booted.indexer.emit({ type: "CloseRequested", channelId: id, challengeEndsAt: booted.stack.clock() + 7200 })
+    await expect(op.chat(ask("after close"))).rejects.toMatchObject({ code: "channel_not_open", status: 402 })
+  })
+})
+
+describe("the client does not sign on the router's word", () => {
+  /** A router that claims a debt nobody can check, and notes every voucher it is sent. */
+  function claiming(app: Parameters<typeof inProcess>[0], id: string, claim: { owed?: bigint; cumulative?: bigint; deposit?: bigint }) {
+    const vouchers: bigint[] = []
+    const send = inProcess(app)
+    const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith("/voucher")) vouchers.push(BigInt(JSON.parse(String(init?.body)).cumulative))
+      const res = await send(input, init)
+      const owed = res.headers.get("x-offpeak-channel-owed")
+      if (owed && claim.owed) {
+        const headers = new Headers(res.headers)
+        headers.set("x-offpeak-channel-owed", String(BigInt(owed) + claim.owed))
+        return new Response(res.body, { status: res.status, headers })
+      }
+      if (!url.endsWith(`/v1/channels/${id}`)) return res
+      const view = (await res.json()) as Record<string, unknown>
+      return Response.json({ ...view, ...Object.fromEntries(Object.entries(claim).map(([key, value]) => [key, String(value)])) })
+    }) as typeof fetch
+    return { vouchers, fetcher }
+  }
+
+  test("a claimed debt from before the attach gets no voucher, even after a failed request", async () => {
+    const booted = await bootRouter()
+    const id = addChannel(booted, 600n * USDG)
+    const { vouchers, fetcher } = claiming(booted.app, id, { owed: 500n * USDG })
+    const op = client(booted, { fetch: fetcher })
+    const snapshot = await op.channels.attach(id)
+    expect(snapshot.signed).toBe(0n)
+    expect(snapshot.verified).toBe(0n)
+    expect(snapshot.unsigned).toEqual([500n * USDG])
+    await expect(op.chat({ model: "no-such-model", messages: [{ role: "user", content: "hi" }] })).rejects.toMatchObject({ code: "model_not_found" })
+    await op.chat(ask("a real one"))
+    expect(vouchers).toEqual([])
+    expect(op.channels.snapshot()?.signed).toBe(0n)
+    expect(op.channels.snapshot()?.refused).toContain("above")
+  })
+
+  test("a claimed cumulative is not a starting point either", async () => {
+    const booted = await bootRouter()
+    const id = addChannel(booted, 600n * USDG)
+    const { vouchers, fetcher } = claiming(booted.app, id, { cumulative: 500n * USDG })
+    const op = client(booted, { fetch: fetcher })
+    expect((await op.channels.attach(id)).signed).toBe(0n)
+    await op.chat(ask("a real one"))
+    expect(vouchers).toHaveLength(1)
+    expect(vouchers[0]!).toBeLessThan(USDG)
+  })
+
+  test("the deposit and expiry come from the chain, not the router", async () => {
+    const booted = await bootRouter()
+    const id = addChannel(booted, 5n * USDG)
+    const { fetcher } = claiming(booted.app, id, { deposit: 900n * USDG })
+    const op = client(booted, { fetch: fetcher })
+    expect((await op.channels.attach(id)).deposit).toBe(5n * USDG)
+  })
+
+  test("what you say you signed still counts", async () => {
+    const booted = await bootRouter()
+    const id = addChannel(booted, 600n * USDG)
+    const { fetcher } = claiming(booted.app, id, { owed: 500n * USDG })
+    const op = client(booted, { fetch: fetcher })
+    expect((await op.channels.attach(id, { seq: 7n, cumulative: 500n * USDG })).signed).toBe(500n * USDG)
+  })
+
+  test("attaching with no chain access is refused rather than taking the router's word", async () => {
+    const booted = await bootRouter()
+    await expect(client(booted, { publicClient: undefined }).channels.attach(addChannel(booted, USDG))).rejects.toMatchObject({ code: "no_rpc" })
+  })
+
+  test("a record from a host the registry never heard of pays for nothing", async () => {
+    const booted = await bootRouter()
+    const id = addChannel(booted, 5n * USDG)
+    const chain = chainView(booted)
+    const op = client(booted, {
+      publicClient: { readContract: (args: { functionName: string }) => (args.functionName === "channelView" ? chain.readContract(args as never) : args.functionName === "hostView" ? Promise.resolve({ status: 0 }) : Promise.resolve([])) } as never,
+    })
+    await op.channels.attach(id)
+    const result = (await op.chat(ask("from an invented host"))) as ChatResult
+    expect(op.channels.snapshot()?.signed).toBe(0n)
+    expect(op.channels.snapshot()?.refused).toContain("host_not_registered")
+    expect(await channelRow(booted, id)).toBeNull()
+    const report = await op.verifyUsage(result.envelope)
+    expect(report).toMatchObject({ ok: false, hostRegistered: false, hostOk: true })
+    expect(report.reasons).toEqual(["host_not_registered"])
+  })
+
+  test("a host registered without this model does not pass", async () => {
+    const booted = await bootRouter()
+    const chain = chainView(booted)
+    const op = client(booted, {
+      apiKey: booted.key.token,
+      publicClient: { readContract: (args: { functionName: string }) => (args.functionName === "modelsOf" ? Promise.resolve([`0x${"12".repeat(32)}`]) : chain.readContract(args as never)) } as never,
+    })
+    const result = (await op.chat(ask("another model"))) as ChatResult
+    expect((await op.verifyUsage(result.envelope)).reasons).toEqual(["host_not_registered"])
+  })
+
+  test("an RPC that cannot answer is not a pass", async () => {
+    const booted = await bootRouter()
+    const op = client(booted, { apiKey: booted.key.token, publicClient: { readContract: () => Promise.reject(new Error("rpc down")) } as never })
+    const result = (await op.chat(ask("rpc down"))) as ChatResult
+    expect((await op.verifyUsage(result.envelope)).reasons).toEqual(["registry_unreadable"])
+  })
+
+  test("with no RPC the report says the registry went unchecked", async () => {
+    const booted = await bootRouter()
+    const op = client(booted, { apiKey: booted.key.token, publicClient: undefined })
+    const result = (await op.chat(ask("no rpc"))) as ChatResult
+    expect(await op.verifyUsage(result.envelope)).toMatchObject({ ok: true, notChecked: ["host_registry"] })
+  })
