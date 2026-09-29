@@ -312,3 +312,160 @@ export async function saveCalibration(db: Db, result: CalibrationResult) {
     ])
   })
 }
+
+type HonestScoreRow = { host: string; ts: string; gpu_class: string; image_digest: string; temp_bucket: string; len_bucket: string; ll_mean: number }
+
+/** A bucket's own label stands in for the raw temperature and length, which live rows do not keep. */
+const LABEL_TEMPERATURE: Record<string, number> = { "0": 0, "(0,0.5]": 0.5, "(0.5,1]": 1, ">1": 2 }
+const LABEL_TOKENS: Record<string, number> = { "<=64": 64, "<=256": 256, "<=1024": 1024, ">1024": 2048 }
+
+/**
+ * Live rows from attested reference hosts only. A clean record proves nothing: a host cheating below
+ * the flag has no flags, and its rows would pull the baseline towards the model it really serves.
+ */
+export async function liveHonestRows(db: Db, modelDigest: string, sinceTs: number): Promise<ScoredRow[]> {
+  const rows = await db.query<HonestScoreRow>(
+    `SELECT s.* FROM serving.audit_scores s
+     WHERE s.model_digest = $1 AND s.ts >= $2
+       AND EXISTS (SELECT 1 FROM serving.audit_reference_hosts h WHERE h.host = s.host AND h.model_digest = s.model_digest AND h.attested)`,
+    [modelDigest, sinceTs],
+  )
+  return rows.rows.map((row) => ({
+    hostWeek: `${row.host}:${weekIndex(Number(row.ts))}`,
+    gpuClass: row.gpu_class,
+    imageDigest: row.image_digest,
+    temperature: LABEL_TEMPERATURE[row.temp_bucket] ?? 1,
+    tokensOut: LABEL_TOKENS[row.len_bucket] ?? 256,
+    ll: Number(row.ll_mean),
+  }))
+}
+
+/**
+ * Which buckets moved too far for a weekly refit to take effect without review. σ counts as much as
+ * μ: a wider σ shrinks every z, which hides a swap as surely as a lower μ does.
+ */
+export function shiftedBuckets(previous: Map<string, Baseline>, next: readonly Baseline[]) {
+  return next.filter((b) => {
+    const old = previous.get(baselineId(b))
+    if (!old) return false
+    return Math.abs(b.mu - old.mu) > MAX_WEEKLY_SHIFT * old.sigma || b.sigma > old.sigma * MAX_WEEKLY_SIGMA_RATIO || b.sigma < old.sigma / MAX_WEEKLY_SIGMA_RATIO
+  })
+}
+
+/**
+ * Step 4: refit from live honest data. The new δ and A stay proposals until a change to
+ * `PUBLISHED_BASELINES` ships them, because a ruling reads only what is pinned in the package.
+ */
+export async function recalibrateLive(db: Db, modelDigest: string, now: number, seed = now) {
+  const honest = await liveHonestRows(db, modelDigest, now - 8 * 604_800)
+  if (honest.length < MIN_SCORED / 4) return { skipped: "too_few_scores" as const, scored: honest.length }
+  const result = calibrateModel({ modelDigest, source: "live", honest, swaps: [], seed, now, fixedDelta: publishedBaseline(modelDigest).delta })
+  const moved = shiftedBuckets(await loadBaselines(db, modelDigest), result.baselines)
+  if (moved.length > 0) return { skipped: "baseline_moved" as const, buckets: moved.map(baselineId) }
+  await saveCalibration(db, result)
+  return { saved: result.version, logA: result.logA }
+}
+
+/** Step 5: flags on attested reference hosts, and flags a panel later cleared. Both should stay near zero. */
+export async function falseFlagProxy(db: Db) {
+  const reference = await db.query<{ n: string }>(
+    `SELECT count(*) AS n FROM serving.audit_runs r JOIN serving.audit_reference_hosts h ON h.host = r.host AND h.model_digest = r.model_digest
+     WHERE r.flagged AND h.attested`,
+  )
+  const cleared = await db.query<{ n: string }>("SELECT count(*) AS n FROM serving.audit_filings WHERE kind = 0 AND outcome = 'cleared'")
+  return { flagsOnReferenceHosts: Number(reference.rows[0]!.n), flagsClearedByPanel: Number(cleared.rows[0]!.n) }
+}
+
+export type CalibrationRow = { model_digest: string; source: CalibrationSource; ready: boolean; report: Omit<CalibrationResult, "baselines">; created_at: string }
+
+export async function latestCalibration(db: Db, modelDigest: string) {
+  const rows = await db.query<CalibrationRow>("SELECT * FROM serving.audit_calibrations WHERE model_digest = $1 ORDER BY created_at DESC, id DESC LIMIT 1", [modelDigest])
+  return rows.rows[0] ?? null
+}
+
+/** Pinned and real: a hardware report that passed its gates and matches what rulings will accept. */
+export async function filingCalibrated(db: Db, modelDigest: string) {
+  const rows = await db.query<CalibrationRow>("SELECT * FROM serving.audit_calibrations WHERE model_digest = $1 AND ready AND source = 'hardware' ORDER BY created_at DESC, id DESC LIMIT 1", [modelDigest])
+  const report = rows.rows[0]?.report
+  if (!report) return false
+  const pinned = publishedBaseline(modelDigest)
+  return pinned.delta === report.delta && pinned.logA === report.logA
+}
+
+const NOT_CALIBRATED = "Thresholds are placeholders until calibration runs on real GPU hosts. Simulated figures describe the method on synthetic data, not real swaps."
+
+/** `GET /v1/audits/calibration`. */
+export async function calibrationReport(db: Db) {
+  const rows = await db.query<CalibrationRow>("SELECT DISTINCT ON (model_digest) * FROM serving.audit_calibrations ORDER BY model_digest, created_at DESC, id DESC")
+  const reports = rows.rows.map((row) => row.report)
+  const baselines = [...(await loadBaselines(db)).values()]
+  const real = await db.query<{ model_digest: string }>("SELECT DISTINCT model_digest FROM serving.audit_calibrations WHERE ready AND source = 'hardware'")
+  const covered = new Set(real.rows.map((row) => row.model_digest))
+  const calibrated = rows.rows.length > 0 && rows.rows.every((row) => covered.has(row.model_digest))
+  return {
+    testId: TEST_ID,
+    testVersion: TEST_VERSION,
+    status: calibrated ? "calibrated" : "not_calibrated",
+    note: calibrated ? "Audits are statistical. They catch sustained model swaps, not every single response." : NOT_CALIBRATED,
+    falseFlagTarget: TARGET_FALSE_FLAG,
+    powerTarget: TARGET_POWER,
+    thresholds: { default: PUBLISHED_BASELINE, byModel: PUBLISHED_BASELINES },
+    baselines,
+    reports,
+    liveFalseFlags: await falseFlagProxy(db),
+  }
+}
+
+const scoredRow = z.object({
+  hostWeek: z.string().min(1),
+  gpuClass: z.string().min(1),
+  imageDigest: z.string().min(1),
+  temperature: z.number().min(0),
+  tokensOut: z.number().int().positive(),
+  ll: z.number().finite(),
+  kind: z.string().optional(),
+})
+
+/** Rows from a run on real hosts, one JSON object per line. A row with `kind` is a swap stand-in. */
+export async function readScoredRows(path: string) {
+  const honest: ScoredRow[] = []
+  const swaps: SwapRow[] = []
+  for await (const line of createInterface({ input: createReadStream(path) })) {
+    if (!line.trim()) continue
+    const { kind, ...row } = scoredRow.parse(JSON.parse(line))
+    if (kind) swaps.push({ ...row, kind })
+    else honest.push(row)
+  }
+  return { honest, swaps }
+}
+
+function arg(argv: readonly string[], name: string) {
+  const at = argv.indexOf(name)
+  return at >= 0 ? argv[at + 1] : undefined
+}
+
+/**
+ * `bun run apps/auditor/src/calibrate.ts --model 0x… --rows rows.jsonl --source hardware [--out report.json]`
+ * Stores nothing unless OFFPEAK_DATABASE_URL is set. A passing report still has to be pinned in
+ * `PUBLISHED_BASELINES` before a ruling accepts it.
+ */
+async function main(argv: readonly string[]) {
+  const modelDigest = arg(argv, "--model")?.toLowerCase()
+  const path = arg(argv, "--rows")
+  const source = z.enum(["hardware", "simulation"]).parse(arg(argv, "--source") ?? "simulation")
+  if (!modelDigest || !path) throw new Error("usage: calibrate --model <digest> --rows <file.jsonl> --source hardware|simulation [--out <file>]")
+  const { honest, swaps } = await readScoredRows(path)
+  const now = Math.floor(Date.now() / 1000)
+  const result = calibrateModel({ modelDigest, source, honest, swaps, seed: now, now })
+  const { baselines, ...report } = result
+  const out = arg(argv, "--out")
+  if (out) writeFileSync(out, JSON.stringify({ ...report, baselines }, null, 2))
+  console.log(JSON.stringify(report))
+  const url = process.env.OFFPEAK_DATABASE_URL
+  if (url && !url.startsWith("pglite://")) {
+    const { connectDatabase } = await import("../../../services/common/src/db.ts")
+    await saveCalibration(connectDatabase(url), result)
+  }
+}
+
+if (import.meta.main) await main(process.argv.slice(2))
