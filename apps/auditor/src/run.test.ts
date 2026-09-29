@@ -347,3 +347,160 @@ describe("metering", () => {
     }
     expect(await runMetering(deps(db), week)).toEqual([])
   })
+
+  test("a low share across many hours is not sustained", async () => {
+    for (let i = 0; i < 1_000; i++) await insertRecord(db, keccakUtf8(`r${i}`), { ts: weekStart + i })
+    for (let i = 0; i < 30; i++) await flag(keccakUtf8(`r${i}`), "counts", weekStart + i * 3_600)
+    expect(await runMetering(deps(db), week)).toEqual([])
+  })
+
+  test("refused signatures have no record to prove, so they alert instead of filing", async () => {
+    for (let i = 0; i < 30; i++) await flag(`0xrefused${i}`, "sign_refused", weekStart + i * 3_600)
+    const d = deps(db)
+    expect(await runMetering(d, week)).toEqual([])
+    expect(d.metrics.get("auditor_metering_unprovable")).toBe(30)
+  })
+
+  test("sustained flags go to filing with a random draw of the host's records", async () => {
+    const proofs: string[] = []
+    for (let i = 0; i < 500; i++) {
+      await insertRecord(db, keccakUtf8(`r${i}`), { ts: weekStart + i * 600 })
+      if (i < 60) await flag(keccakUtf8(`r${i}`), "counts", weekStart + i * 600)
+    }
+    const d = deps(db, {
+      chain: {
+        proof: async (reqId: string) => (proofs.push(reqId), { hour: 1, leaf: keccakUtf8(`leaf-${reqId}`), proof: [], root: "0x0", txHash: "0x0" }),
+      } as never,
+      reader: { readContract: async () => false } as never,
+      contracts: { UsageLedger: `0x${"11".repeat(20)}`, AuditCourt: `0x${"22".repeat(20)}`, MockUSDG: `0x${"33".repeat(20)}` },
+    })
+    expect(await runMetering(d, week)).toEqual([{ host: HOST, result: "leaf_unproven" }])
+    expect(new Set(proofs).size).toBe(400)
+    const flaggedDrawn = proofs.filter((reqId) => Array.from({ length: 60 }, (_, i) => keccakUtf8(`r${i}`)).includes(reqId as Hex)).length
+    expect(flaggedDrawn).toBeGreaterThan(30)
+    expect(flaggedDrawn).toBeLessThan(60)
+  })
+})
+
+describe("throughput", () => {
+  test("is off unless an operator turns it on", async () => {
+    expect(await runThroughput(deps(db, { contracts: { WindowMarket: `0x${"44".repeat(20)}` } }))).toEqual([])
+  })
+
+  async function disputed(perf: { below: number; good: number }) {
+    for (let i = 0; i < perf.below + perf.good; i++) {
+      await db.query("INSERT INTO shared.window_perf (window_id, ts, tokens_per_s, demanded) VALUES (7,to_timestamp($1),$2,true)", [NOW + i * 60, i < perf.below ? 1 : 500])
+    }
+    return deps(db, {
+      fileThroughput: true,
+      contracts: { WindowMarket: `0x${"44".repeat(20)}`, UsageLedger: `0x${"11".repeat(20)}` },
+      chain: { proof: async () => null } as never,
+      reader: {
+        getBlockNumber: async () => 10n,
+        getContractEvents: async () => [{ args: { id: 7n } }],
+        readContract: async () => ({ host: HOST, modelDigest: MODEL, minTps: 100, t1: BigInt(NOW + 3_600) }),
+      } as never,
+    })
+  }
+
+  test("a Window the auditor's own measure says passed is left alone", async () => {
+    expect(await runThroughput(await disputed({ below: 10, good: 90 }))).toEqual([])
+  })
+
+  test("a dispute of a Window that did fail goes towards filing", async () => {
+    const d = await disputed({ below: 30, good: 70 })
+    ;(d.reader as unknown as { readContract: (args: { functionName: string }) => Promise<unknown> }).readContract = async ({ functionName }) => (functionName === "windowView" ? { host: HOST, modelDigest: MODEL, minTps: 100, t1: BigInt(NOW + 3_600) } : 0n)
+    d.contracts.MockUSDG = `0x${"33".repeat(20)}`
+    expect(await runThroughput(d)).toEqual([{ windowId: "7", result: "bond_too_low" }])
+  })
+})
+
+describe("outcomes and coverage", () => {
+  test("finished challenges feed the false-flag proxy", async () => {
+    await db.query(`INSERT INTO serving.audit_filings (id, host, model_digest, week, kind, samples_root, evidence, signal_sequential, signal_replication, status, challenge_id, from_block) VALUES ('a','0xh','0xm',1,0,'0xr','{}'::jsonb,true,true,'filed','5',0)`)
+    const fetcher = async () => Response.json({ head: {}, data: [{ id: 5, state: "finalized", outcome: 0, slash_bps: 0 }, { id: 6, state: "filed", outcome: null, slash_bps: null }] })
+    expect(await syncOutcomes({ db, fetcher, indexerUrl: "http://i", internalToken: "t" })).toBe(1)
+    expect((await db.query<{ outcome: string }>("SELECT outcome FROM serving.audit_filings")).rows[0]!.outcome).toBe("cleared")
+  })
+
+  test("a host on an uncalibrated image or class is named", async () => {
+    const d = deps(db)
+    expect(await uncalibratedHosts(d)).toEqual([[MODEL, "0xgpu", "0ximage"].join("|")])
+    await baseline(db)
+    expect(await uncalibratedHosts(d)).toEqual([])
+  })
+})
+
+describe("router capture", () => {
+  const body = { model: "ofm-8b", messages: [{ role: "user", content: "the-private-canary-string" }], temperature: 0.7, max_tokens: 8 }
+
+  test("the router call stores opted-in bodies at the sampled rate and never logs one", async () => {
+    const booted = await bootStack()
+    process.env.OFFPEAK_AUDIT_SAMPLE_KEK = KEK.toString("hex")
+    const logged: string[] = []
+    const realError = console.error
+    const realLog = console.log
+    console.error = (...args: unknown[]) => void logged.push(args.join(" "))
+    console.log = (...args: unknown[]) => void logged.push(args.join(" "))
+    try {
+      await booted.stack.db.query("INSERT INTO serving.accounts (id, wallet, audit_opt_in) VALUES ('opted',$1,true)", [WALLET])
+      const input = { reqId: "0x0", host: HOST, modelDigest: MODEL, accountId: "opted", body, text: "reply", toolCalls: [], ts: booted.stack.clock() }
+      const runs = 5_000
+      await Promise.all(Array.from({ length: runs }, (_, i) => noteForAudit(booted.stack, { ...input, reqId: keccakUtf8(`n${i}`) })))
+      const stored = await booted.stack.db.query<{ n: string }>("SELECT count(*) AS n FROM serving.audit_samples")
+      const expected = runs * 0.02
+      expect(Math.abs(Number(stored.rows[0]!.n) - expected)).toBeLessThan(5 * Math.sqrt(expected))
+      expect(logged.join("\n")).not.toContain("the-private-canary-string")
+    } finally {
+      console.error = realError
+      console.log = realLog
+      delete process.env.OFFPEAK_AUDIT_SAMPLE_KEK
+    }
+  })
+
+  test("a buyer who did not opt in leaves no body however many requests they send", async () => {
+    const booted = await bootStack()
+    process.env.OFFPEAK_AUDIT_SAMPLE_KEK = KEK.toString("hex")
+    try {
+      const account = booted.key.accountId
+      await Promise.all(Array.from({ length: 1_000 }, (_, i) => noteForAudit(booted.stack, { reqId: keccakUtf8(`m${i}`), host: HOST, modelDigest: MODEL, accountId: account, body, text: "reply", toolCalls: [], ts: booted.stack.clock() })))
+      expect((await booted.stack.db.query("SELECT 1 FROM serving.audit_samples")).rows).toHaveLength(0)
+    } finally {
+      delete process.env.OFFPEAK_AUDIT_SAMPLE_KEK
+    }
+  })
+
+  test("without a KEK nothing is stored, and the request still succeeds", async () => {
+    const booted = await bootStack()
+    await booted.stack.db.query("UPDATE serving.accounts SET audit_opt_in = true")
+    const res = await booted.app.request("/v1/chat/completions", { method: "POST", headers: { authorization: `Bearer ${booted.key.token}`, "content-type": "application/json" }, body: JSON.stringify(body) })
+    expect(res.status).toBe(200)
+    expect((await booted.stack.db.query("SELECT 1 FROM serving.audit_samples")).rows).toHaveLength(0)
+  })
+
+  test("a database failure in capture cannot fail the request", async () => {
+    const booted = await bootStack()
+    process.env.OFFPEAK_AUDIT_SAMPLE_KEK = "ab".repeat(32)
+    const realError = console.error
+    console.error = () => undefined
+    const realQuery = booted.stack.db.query
+    try {
+      booted.stack.db.query = ((sql: string, params?: unknown[]) => (sql.includes("audit_opt_in FROM serving.accounts WHERE id") ? Promise.reject(new Error("down")) : realQuery(sql, params))) as never
+      await noteForAudit(booted.stack, { reqId: "0x1", host: HOST, modelDigest: MODEL, accountId: "x", body, text: "r", toolCalls: [], ts: booted.stack.clock() })
+    } finally {
+      console.error = realError
+      delete process.env.OFFPEAK_AUDIT_SAMPLE_KEK
+    }
+  })
+
+  test("request shapes are counted with no content in them", async () => {
+    const booted = await bootStack()
+    booted.stack.setClock(booted.stack.clock())
+    for (let i = 0; i < 3; i++) await noteForAudit(booted.stack, { reqId: `0x${i}`, host: HOST, modelDigest: MODEL, accountId: null, body, text: "r", toolCalls: [], ts: booted.stack.clock() })
+    booted.stack.setClock(booted.stack.clock() + 120)
+    await noteForAudit(booted.stack, { reqId: "0x9", host: HOST, modelDigest: MODEL, accountId: null, body, text: "r", toolCalls: [], ts: booted.stack.clock() })
+    const rows = await booted.stack.db.query<{ shape: string; n: string }>("SELECT shape, n FROM serving.audit_traffic")
+    expect(Number(rows.rows[0]!.n)).toBe(4)
+    expect(rows.rows[0]!.shape).not.toContain("private")
+  })
+})
