@@ -267,3 +267,142 @@ describe("close falls back to requestClose and says so", () => {
     expect(result.challengeEndsAt).toBeGreaterThan(nowish() + 7000)
     return { op, id, result }
   }
+
+  test("when the router refuses", async () => {
+    const { op, id } = await expectFallback(() => Response.json({ error: { message: "Voucher is behind", type: "payment", code: "owed_mismatch" } }, { status: 409 }), "Voucher is behind")
+    expect(op.channels.snapshot()).toBeNull()
+    const again = client()
+    await expect(again.channels.attach(id)).rejects.toMatchObject({ code: "channel_not_open" })
+  })
+
+  test("when the endpoint is not there", async () => {
+    await expectFallback(() => new Response("not found", { status: 404 }), "router refused")
+  })
+
+  test("when the router cannot be reached", async () => {
+    await expectFallback(() => {
+      throw new Error("connection refused")
+    }, "could not be reached")
+  })
+
+  test("when the answer has the wrong shape", async () => {
+    await expectFallback(() => Response.json({ routerSig: "0x12" }), "wrong shape")
+  })
+
+  test("when the router names another contract", async () => {
+    await expectFallback(async (req, id) => {
+      const reply = (await (await honestClose(req, id)).json()) as Record<string, unknown>
+      return Response.json({ ...reply, to: "0x000000000000000000000000000000000000dEaD" })
+    }, "another contract")
+  })
+
+  test("when the router names another chain", async () => {
+    await expectFallback(async (req, id) => {
+      const reply = (await (await honestClose(req, id)).json()) as Record<string, unknown>
+      return Response.json({ ...reply, chainId: 1 })
+    }, "another chain")
+  })
+
+  test("when the calldata is some other call", async () => {
+    await expectFallback(async (req, id) => {
+      const reply = (await (await honestClose(req, id)).json()) as Record<string, unknown>
+      return Response.json({ ...reply, data: encodeFunctionData({ abi: ChannelManagerAbi, functionName: "topUp", args: [id, 1n] }) })
+    }, "not a cooperative close")
+  })
+
+  test("when the calldata pays more than was signed", async () => {
+    await expectFallback(async (req, id) => {
+      const { deadline, payerSig } = (await req.clone().json()) as { deadline: string; payerSig: Hex }
+      const reply = (await (await honestClose(req, id)).json()) as { routerSig: Hex }
+      const data = encodeFunctionData({ abi: ChannelManagerAbi, functionName: "cooperativeClose", args: [id, { channelId: id, finalCumulative: 2n * USDG, deadline: BigInt(deadline) }, payerSig, reply.routerSig] })
+      return Response.json({ ...reply, data })
+    }, "does not match")
+  })
+
+  test("when the router's signature is not the payee's", async () => {
+    await expectFallback(async (req, id) => {
+      const { finalCumulative, deadline, payerSig } = (await req.json()) as { finalCumulative: string; deadline: string; payerSig: Hex }
+      const close = { channelId: id, finalCumulative: BigInt(finalCumulative), deadline: BigInt(deadline) }
+      const manager = contract("ChannelManager")
+      const routerSig = await stranger.signTypedData({ domain: domain("OffpeakChannel", manager), types: coopCloseTypes, primaryType: "CooperativeClose", message: close })
+      const data = encodeFunctionData({ abi: ChannelManagerAbi, functionName: "cooperativeClose", args: [id, close, payerSig, routerSig] })
+      return Response.json({ routerSig, to: manager, data, value: "0", chainId: 4663 })
+    }, "would not go through")
+  })
+})
+
+describe("when neither close path works", () => {
+  test("the caller gets one clear error with both failures", async () => {
+    const op = client(() => new Response("not found", { status: 404 }))
+    const { channelId } = await op.channels.open(2n * USDG, nowish() + 7 * 3600)
+    const hash = await wallet.writeContract({ account: agent, chain: null, address: contract("ChannelManager"), abi: ChannelManagerAbi, functionName: "requestClose", args: [channelId] })
+    await reader.waitForTransactionReceipt({ hash })
+    const err = (await op.channels.close().catch((e) => e)) as { code: string; message: string }
+    expect(err.code).toBe("close_failed")
+    expect(err.message).toContain("router refused")
+    expect(err.message).toContain("requestClose failed too")
+  })
+})
+
+describe("UsageLedger.verifyLeaf over RPC", () => {
+  test("a real posted root answers yes for the right hour and no for the wrong one", async () => {
+    const op = client(undefined, { apiKey: booted.key.token })
+    const { envelope } = (await op.chat(ask("prove me on chain"))) as ChatResult
+    const leaf = leafFor(envelope.record, envelope.routerSig, envelope.hostSig)
+    const leaves = [leaf, keccak256(toBytes("neighbour"))]
+    const root = merkleRoot(leaves)
+    const hour = 400_001
+    const vault = contract("OffpeakVault")
+    await rpc("anvil_impersonateAccount", [vault])
+    await rpc("anvil_setBalance", [vault, "0x56BC75E2D63100000"])
+    const posted = await createWalletClient({ account: vault, transport: http(chain.rpcUrl) }).writeContract({
+      chain: null,
+      address: contract("UsageLedger"),
+      abi: UsageLedgerAbi,
+      functionName: "postRoot",
+      args: [BigInt(hour), root, keccak256(toBytes("totals")), 2],
+    })
+    await reader.waitForTransactionReceipt({ hash: posted })
+    const proofRow = { hour, leaf, proof: merkleProof(leaves, 0), root, txHash: posted as string }
+    booted.indexer.proofs.set(envelope.record.reqId, proofRow)
+    expect(await op.proof(envelope.record.reqId)).toMatchObject({ ok: true, onchain: true, status: "verified", hour })
+    booted.indexer.proofs.set(envelope.record.reqId, { ...proofRow, hour: hour + 1 })
+    expect(await op.proof(envelope.record.reqId)).toMatchObject({ ok: false, onchain: false, status: "mismatch" })
+  })
+})
+
+describe("Permit2 signing against the real contracts", () => {
+  test("an SDK-signed upto payment passes X402Escrow.authorize", async () => {
+    const op = client()
+    await op.x402.approvePermit2(1_000_000n)
+    const reqId = keccak256(toBytes("sdk-real-authorize"))
+    const block = await reader.getBlock({ blockTag: "latest" })
+    const { payload } = (
+      await op.x402.payUpto({
+        scheme: "upto",
+        network: "eip155:4663",
+        asset: contract("MockUSDG"),
+        maxAmountRequired: "60000",
+        payTo: contract("OffpeakVault"),
+        extra: { permit2: contract("Permit2"), spender: contract("X402Escrow"), reqId, validBefore: Number(block.timestamp) + 600, witness: "UptoWitness" },
+      })
+    ).payload as PaymentPayload
+    const witness = payload.witness as { reqId: Hex; payee: Address; maxAmount: string; validBefore: string; resourceHash: Hex }
+    const before = await usdgOf(agent.address)
+    const hash = await createWalletClient({ account: relay, transport: http(chain.rpcUrl) }).writeContract({
+      chain: null,
+      address: contract("X402Escrow"),
+      abi: X402EscrowAbi,
+      functionName: "authorize",
+      args: [
+        { permitted: { token: payload.permitted.token, amount: BigInt(payload.permitted.amount) }, nonce: BigInt(payload.nonce), deadline: BigInt(payload.deadline) },
+        payload.signature,
+        agent.address,
+        { reqId: witness.reqId, payee: witness.payee, maxAmount: BigInt(witness.maxAmount), validBefore: BigInt(witness.validBefore), resourceHash: witness.resourceHash },
+      ],
+    })
+    expect((await reader.waitForTransactionReceipt({ hash })).status).toBe("success")
+    expect(await usdgOf(agent.address)).toBe(before - 60_000n)
+    expect(await usdgOf(contract("X402Escrow"))).toBeGreaterThanOrEqual(60_000n)
+  })
+})

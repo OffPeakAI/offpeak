@@ -104,3 +104,137 @@ describe("request wire", () => {
     expect(decode(opened.plaintext)).toBe("canary-sealed-plain")
     expect(opened.secret).toEqual(sealed.secret)
   })
+
+  test("the first nine bytes and the path are both bound", async () => {
+    const keys = await generateHostKey()
+    const { bytes } = await sealRequest(keys.publicKey, encode("x"), SEALED_PATH, 1_000)
+    await expect(openRequest(keys.privateKey, bytes, "/v1/embeddings")).rejects.toThrow()
+    const moved = bytes.slice()
+    moved[8]! ^= 1
+    await expect(openRequest(keys.privateKey, moved, SEALED_PATH)).rejects.toThrow()
+    const version = bytes.slice()
+    version[0] = 0x02
+    await expect(openRequest(keys.privateKey, version, SEALED_PATH)).rejects.toThrow()
+  })
+
+  test("the replay window is 60 seconds either way", () => {
+    expect(withinReplayWindow(100_000n, 160_000)).toBe(true)
+    expect(withinReplayWindow(100_000n, 160_001)).toBe(false)
+    expect(withinReplayWindow(220_000n, 160_000)).toBe(true)
+    expect(withinReplayWindow(220_001n, 160_000)).toBe(false)
+    expect(withinReplayWindow(2n ** 64n - 1n, 160_000)).toBe(false)
+  })
+})
+
+describe("response frames", () => {
+  test("every frame has one length on the wire, and the padding comes off", async () => {
+    const { keys, frames } = await response("a", "a much longer piece of the same stream", "")
+    expect(new Set(frames.map((frame) => frame.length))).toEqual(new Set([FRAME_WIRE_BYTES]))
+    expect(decode(await openFrame(keys, 1, FLAG_DATA, frames[1]!.subarray(5)))).toBe("a much longer piece of the same stream")
+    expect((await openFrame(keys, 2, FLAG_LAST, frames[2]!.subarray(5))).length).toBe(0)
+  })
+
+  test("a frame cannot hold more than its data bytes", async () => {
+    const { keys } = await response("x")
+    await expect(sealFrame(keys, 0, new Uint8Array(FRAME_DATA_BYTES), false)).resolves.toHaveLength(FRAME_WIRE_BYTES)
+    await expect(sealFrame(keys, 0, new Uint8Array(FRAME_DATA_BYTES + 1), false)).rejects.toMatchObject({ code: "sealed_bad_frame" })
+  })
+
+  test("a frame opens at its own index and nowhere else", async () => {
+    const { keys, frames } = await response("first", "second")
+    const body = frames[0]!.subarray(5)
+    expect(decode(await openFrame(keys, 0, FLAG_DATA, body))).toBe("first")
+    await expect(openFrame(keys, 1, FLAG_DATA, body)).rejects.toMatchObject({ code: "sealed_bad_frame" })
+  })
+
+  test("the nonce XORs the index into the low bytes", () => {
+    const base = new Uint8Array(12).fill(0xff)
+    expect(bytesToHex(frameNonce(base, 1))).toBe("0xfffffffffffffffffffffffe")
+    expect(bytesToHex(frameNonce(base, 0x01020304))).toBe("0xfffffffffffffffffefdfcfb")
+    expect(() => frameNonce(base, 2 ** 32)).toThrow()
+  })
+
+  test("a whole stream decrypts in any chunking and hashes the same", async () => {
+    const { secret, enc, salt, frames } = await response("one ", "two ", "three")
+    const whole = concatBytes(salt, ...frames)
+    const inPieces = Array.from(whole, (byte) => new Uint8Array([byte]))
+    const read = await readAll(streamOf(...inPieces), secret, enc)
+    expect(read.text).toBe("one two three")
+    expect(read.opened!.outputHash).toBe(keccak256(whole))
+  })
+
+  test("a stream that stops between frames is truncated", async () => {
+    const { secret, enc, salt, frames } = await response("one ", "two ", "three")
+    await expect(readAll(streamOf(salt, frames[0]!, frames[1]!), secret, enc)).rejects.toMatchObject({ code: "sealed_truncated" })
+  })
+
+  test("a stream that stops inside a frame is truncated", async () => {
+    const { secret, enc, salt, frames } = await response("one ", "two ")
+    await expect(readAll(streamOf(salt, frames[0]!, frames[1]!.slice(0, 9)), secret, enc)).rejects.toMatchObject({ code: "sealed_truncated" })
+  })
+
+  test("half of the closing frame after a whole stream is truncated", async () => {
+    const { secret, enc, salt, frames } = await response("one")
+    const closing = encodeTrailer({ channelOwed: "12" })
+    await expect(readAll(streamOf(salt, ...frames, closing.slice(0, 8)), secret, enc)).rejects.toMatchObject({ code: "sealed_truncated" })
+  })
+
+  test("a stream with no frames at all is truncated", async () => {
+    const { secret, enc, salt } = await response("one")
+    await expect(readAll(streamOf(salt), secret, enc)).rejects.toMatchObject({ code: "sealed_truncated" })
+    await expect(readAll(streamOf(new Uint8Array(0)), secret, enc)).rejects.toMatchObject({ code: "sealed_truncated" })
+  })
+
+  test("a relay cannot end the stream early by setting the last flag on a data frame", async () => {
+    const { secret, enc, salt, frames } = await response("one ", "two ", "three")
+    const forged = frames[1]!.slice()
+    forged[0] = FLAG_LAST
+    await expect(readAll(streamOf(salt, frames[0]!, forged), secret, enc)).rejects.toMatchObject({ code: "sealed_bad_frame" })
+  })
+
+  test("a changed, dropped or reordered frame fails", async () => {
+    const { secret, enc, salt, frames } = await response("one ", "two ", "three")
+    const flipped = frames[1]!.slice()
+    flipped[8]! ^= 1
+    await expect(readAll(streamOf(salt, frames[0]!, flipped, frames[2]!), secret, enc)).rejects.toMatchObject({ code: "sealed_bad_frame" })
+    await expect(readAll(streamOf(salt, frames[0]!, frames[2]!), secret, enc)).rejects.toMatchObject({ code: "sealed_bad_frame" })
+    await expect(readAll(streamOf(salt, frames[1]!, frames[0]!, frames[2]!), secret, enc)).rejects.toMatchObject({ code: "sealed_bad_frame" })
+  })
+
+  test("a frame sealed for another request fails", async () => {
+    const { secret, enc, salt, frames } = await response("one")
+    await expect(readAll(streamOf(salt, ...frames), secret, new Uint8Array(32).fill(1))).rejects.toMatchObject({ code: "sealed_bad_frame" })
+  })
+
+  test("bytes after the last frame, an unknown flag and a huge length are refused", async () => {
+    const { secret, enc, salt, frames } = await response("one", "two")
+    await expect(readAll(streamOf(salt, ...frames, frames[0]!), secret, enc)).rejects.toMatchObject({ code: "sealed_bad_frame" })
+    const unknown = new Uint8Array([0x07, 0, 0, 0, 0])
+    await expect(readAll(streamOf(salt, unknown), secret, enc)).rejects.toMatchObject({ code: "sealed_bad_frame" })
+    const huge = new Uint8Array([FLAG_DATA, 0xff, 0xff, 0xff, 0xff])
+    await expect(readAll(streamOf(salt, huge), secret, enc)).rejects.toMatchObject({ code: "sealed_bad_frame" })
+  })
+
+  test("the router's closing frame stays out of the hash and cannot be followed", async () => {
+    const { secret, enc, salt, frames } = await response("one")
+    const trailer = encodeTrailer({ channelOwed: "12" })
+    const read = await readAll(streamOf(salt, ...frames, trailer), secret, enc)
+    expect(read.opened!.trailer).toEqual({ channelOwed: "12" })
+    expect(read.opened!.outputHash).toBe(keccak256(concatBytes(salt, ...frames)))
+    await expect(readAll(streamOf(salt, ...frames, trailer, trailer), secret, enc)).rejects.toMatchObject({ code: "sealed_bad_frame" })
+  })
+
+  test("a closing frame alone does not make a cut stream whole, and a router error surfaces", async () => {
+    const { secret, enc, salt, frames } = await response("one", "two")
+    await expect(readAll(streamOf(salt, frames[0]!, encodeTrailer({ channelOwed: "1" })), secret, enc)).rejects.toMatchObject({ code: "sealed_truncated" })
+    await expect(readAll(streamOf(salt, frames[0]!, encodeTrailer({ error: { code: "unbilled", message: "no" } })), secret, enc)).rejects.toMatchObject({ code: "unbilled" })
+  })
+
+  test("the splitter needs no key and reports each flag", async () => {
+    const { salt, frames } = await response("one", "two")
+    const splitter = new FrameSplitter()
+    const seen = splitter.push(concatBytes(salt, frames[0]!, frames[1]!, encodeTrailer({})))
+    expect(seen.map((frame) => frame.flag)).toEqual([FLAG_DATA, FLAG_LAST, FLAG_TRAILER])
+    expect(splitter.lastSeen).toBe(true)
+  })
+})

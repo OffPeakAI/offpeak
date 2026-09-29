@@ -307,3 +307,132 @@ async function advanceRun(deps: AuditDeps, run: RunRow, now: number) {
   }
   return result.filed ? "filed" : result.reason
 }
+
+const challengeList = z.object({ data: z.array(z.object({ id: z.union([z.string(), z.number()]), state: z.string(), outcome: z.union([z.string(), z.number()]).nullable(), slash_bps: z.union([z.string(), z.number()]).nullable() })) })
+
+/** Records how filed challenges ended, which feeds the live false-flag proxy. */
+export async function syncOutcomes(deps: Pick<AuditDeps, "db" | "fetcher" | "indexerUrl" | "internalToken">) {
+  const res = await deps.fetcher(`${deps.indexerUrl}/idx/v1/challenges`, { headers: { authorization: `Bearer ${deps.internalToken}` } })
+  if (!res.ok) return 0
+  let updated = 0
+  for (const row of challengeList.parse(await res.json()).data) {
+    if (row.state !== "finalized") continue
+    const outcome = Number(row.slash_bps ?? 0) > 0 ? "upheld" : "cleared"
+    const done = await deps.db.query("UPDATE serving.audit_filings SET outcome = $2 WHERE challenge_id = $1 AND outcome IS NULL RETURNING id", [String(row.id), outcome])
+    updated += done.rows.length
+  }
+  return updated
+}
+
+type FlagRow = { req_id: string; reason: string; router_counts: unknown; host_counts: unknown; hour: string | null; model_digest: string | null }
+
+const shuffled = <T>(items: readonly T[], seed: string) => [...items].map((item, i) => ({ item, key: keccakUtf8(`${seed}:${i}`) })).sort((a, b) => (a.key < b.key ? -1 : 1)).map((row) => row.item)
+
+/**
+ * Sustained count disagreements on one host. The bundle is a random draw of the host's records,
+ * not a pick of the flagged ones, so its share reads as the host's own. A refused signature leaves
+ * no record, so it cannot be proven against a root; those raise an alert for a person instead.
+ */
+export async function runMetering(deps: AuditDeps, week = weekIndex(deps.clock()) - 1) {
+  const start = weekStartOf(week)
+  const hosts = await deps.db.query<{ host: string }>("SELECT DISTINCT host FROM serving.metering_flags WHERE created_at >= to_timestamp($1) AND created_at < to_timestamp($2)", [start, start + WEEK_S])
+  const results: { host: string; result: string }[] = []
+  for (const { host } of hosts.rows) {
+    const flags = await deps.db.query<FlagRow>(
+      `SELECT f.req_id, f.reason, f.router_counts, f.host_counts, u.hour, u.model_digest
+       FROM serving.metering_flags f LEFT JOIN shared.usage_records u ON u.req_id = f.req_id
+       WHERE f.host = $1 AND f.reason = ANY($2::text[]) AND f.created_at >= to_timestamp($3) AND f.created_at < to_timestamp($4)`,
+      [host, METERING_REASONS, start, start + WEEK_S],
+    )
+    const provable = flags.rows.filter((flag) => flag.hour !== null)
+    const unprovable = flags.rows.length - provable.length
+    if (unprovable >= METERING_MIN_FLAGS) {
+      deps.metrics.inc("auditor_metering_unprovable", unprovable)
+      log(SERVICE, "metering_unprovable", { host, week, flags: unprovable })
+    }
+    for (const modelDigest of new Set(provable.map((flag) => flag.model_digest!))) {
+      const forModel = provable.filter((flag) => flag.model_digest === modelDigest)
+      const records = await deps.db.query<{ req_id: string }>("SELECT req_id FROM shared.usage_records WHERE host = $1 AND model_digest = $2 AND ts >= $3 AND ts < $4 AND status = 'final' ORDER BY req_id", [host, modelDigest, start, start + WEEK_S])
+      const share = forModel.length / Math.max(1, records.rows.length)
+      const sustained = forModel.length >= METERING_MIN_FLAGS && new Set(forModel.map((flag) => flag.hour)).size >= METERING_MIN_HOURS && share >= METERING_SHARE
+      if (!sustained) continue
+      const drawn = shuffled(records.rows.map((row) => row.req_id), `${host}:${modelDigest}:${week}`).slice(0, METERING_SAMPLE)
+      const proved = await proveSamples(deps, drawn)
+      const flagged = new Set(forModel.map((flag) => flag.req_id))
+      const samples = [...proved.values()].map((row) => ({ ...row, z: 0, canaryFail: false, refAgrees: false, meteringFlag: flagged.has(row.reqId) }))
+      const bundle = {
+        v: 1 as const,
+        host: host as Hex,
+        modelDigest: modelDigest as Hex,
+        testId: "metering-v1",
+        testVersion: "1",
+        baseline: { ...publishedBaseline(modelDigest) },
+        samples,
+        attachments: { flags: forModel.filter((flag) => proved.has(flag.req_id)).map((flag) => ({ reqId: flag.req_id, reason: flag.reason, routerCounts: flag.router_counts, hostCounts: flag.host_counts })), records: records.rows.length, refusedSignatures: unprovable },
+      }
+      const result = await fileMetering(deps, bundle, week)
+      results.push({ host, result: result.filed ? "filed" : result.reason })
+    }
+  }
+  return results
+}
+
+/**
+ * Throughput filings answer a host's dispute of a performance post, and only when the auditor's own
+ * measure agrees the Window failed. Off by default: rulings dismiss every throughput challenge until
+ * their Windows branch exists, and each dismissal costs half a bond.
+ */
+export async function runThroughput(deps: AuditDeps) {
+  if (!deps.fileThroughput || !deps.contracts.WindowMarket) return []
+  const market = deps.contracts.WindowMarket as Address
+  const head = await deps.reader.getBlockNumber()
+  const results: { windowId: string; result: string }[] = []
+  for (let from = head > THROUGHPUT_LOOKBACK_BLOCKS ? head - THROUGHPUT_LOOKBACK_BLOCKS : 0n; from <= head; from += LOG_PAGE) {
+    const to = from + LOG_PAGE - 1n > head ? head : from + LOG_PAGE - 1n
+    const disputes = await deps.reader.getContractEvents({ address: market, abi: WindowMarketAbi, eventName: "PerformanceDisputed", fromBlock: from, toBlock: to })
+    for (const dispute of disputes) {
+      const id = (dispute.args as { id: bigint }).id
+      const view = await deps.reader.readContract({ address: market, abi: WindowMarketAbi, functionName: "windowView", args: [id] })
+      const perf = await deps.db.query<{ below: string; measured: string }>(
+        "SELECT count(*) FILTER (WHERE demanded AND tokens_per_s < $2) AS below, count(*) FILTER (WHERE demanded) AS measured FROM shared.window_perf WHERE window_id = $1",
+        [id.toString(), view.minTps],
+      )
+      const belowSeconds = Number(perf.rows[0]!.below) * SAMPLE_S
+      const measuredSeconds = Number(perf.rows[0]!.measured) * SAMPLE_S
+      const thresholdSeconds = WINDOW_FAILURE_SHARE * measuredSeconds
+      if (measuredSeconds === 0 || belowSeconds <= thresholdSeconds) continue
+      const draws = await deps.db.query<{ req_id: string }>("SELECT req_id FROM shared.usage_records WHERE window_id = $1 AND status = 'final' ORDER BY req_id", [id.toString()])
+      const proved = await proveSamples(deps, draws.rows.map((row) => row.req_id))
+      const bundle = {
+        v: 1 as const,
+        host: view.host.toLowerCase() as Hex,
+        modelDigest: view.modelDigest,
+        testId: "window-throughput-v1",
+        testVersion: "1",
+        baseline: { ...publishedBaseline(view.modelDigest) },
+        samples: [...proved.values()].map((row) => ({ ...row, z: 0, canaryFail: false, refAgrees: false, meteringFlag: false })),
+        attachments: { windowId: id.toString(), minTps: Number(view.minTps), belowSeconds, measuredSeconds },
+      }
+      const result = await fileThroughput(deps, bundle, weekIndex(Number(view.t1)), { belowSeconds, thresholdSeconds })
+      results.push({ windowId: id.toString(), result: result.filed ? "filed" : result.reason })
+    }
+  }
+  return results
+}
+
+/** A model, GPU class or image with no baseline scores nothing until calibration covers it. */
+export async function uncalibratedHosts(deps: Pick<AuditDeps, "db" | "chain" | "metrics">) {
+  const baselines = await loadBaselines(deps.db)
+  const covered = new Set([...baselines.values()].map((b) => [b.modelDigest, b.gpuClass, b.imageDigest].join("|")))
+  const missing = new Set<string>()
+  for (const host of await deps.chain.hostList()) {
+    for (const model of host.models) {
+      const key = [model.digest, host.gpuClass, host.imageDigest].join("|")
+      if (!covered.has(key)) missing.add(key)
+    }
+  }
+  deps.metrics.set("auditor_uncalibrated_combinations", missing.size)
+  if (missing.size > 0) log(SERVICE, "calibration_needed", { combinations: [...missing] })
+  return [...missing]
+}
+
