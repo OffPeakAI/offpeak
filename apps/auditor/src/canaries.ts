@@ -297,3 +297,189 @@ function chooseAccount(accounts: readonly CanaryAccount[], used: Map<string, num
   }
   return open[open.length - 1] ?? null
 }
+
+async function usedToday(deps: Pick<AuditDeps, "db">, now: number) {
+  const dayStart = now - (now % 86_400)
+  const rows = await deps.db.query<{ wallet: string; n: string }>("SELECT wallet, count(*) AS n FROM serving.canary_runs WHERE ts >= $1 GROUP BY wallet", [dayStart])
+  return new Map(rows.rows.map((row) => [row.wallet, Number(row.n)]))
+}
+
+async function liveShapes(deps: Pick<AuditDeps, "db">, modelDigest: string, now: number) {
+  const week = weekIndex(now)
+  const rows = await deps.db.query<{ shape: string; n: string }>("SELECT shape, sum(n) AS n FROM serving.audit_traffic WHERE model_digest = $1 AND week >= $2 GROUP BY shape ORDER BY shape", [modelDigest, week - 2])
+  return rows.rows.map((row) => ({ shape: row.shape, n: Number(row.n) }))
+}
+
+async function drawExpected(deps: Pick<AuditDeps, "db" | "rng">, modelDigest: string) {
+  const rows = await deps.db.query<{ prompt_id: string; body: { messages: unknown }; accepted: string[] }>("SELECT prompt_id, body, accepted FROM serving.canary_expected WHERE model_digest = $1 ORDER BY prompt_id", [modelDigest])
+  if (rows.rows.length === 0) return null
+  const row = pick(rows.rows, deps.rng)
+  return { promptId: row.prompt_id, messages: row.body.messages, accepted: row.accepted }
+}
+
+export async function chooseCanary(deps: Pick<AuditDeps, "db" | "rng">, corpus: Corpus, modelName: string, modelDigest: string, now: number) {
+  const shape = drawShape(await liveShapes(deps, modelDigest, now), deps.rng)
+  if (deps.rng() < DETERMINISTIC_SHARE) {
+    const expected = await drawExpected(deps, modelDigest)
+    if (expected) return deterministicCanary(corpus, modelName, expected, shape, deps.rng)
+  }
+  return openCanary(corpus, modelName, shape, deps.rng)
+}
+
+const usageEnvelope = z.object({
+  record: z.object({ reqId: z.string(), host: z.string(), tokensOut: z.number().int().nonnegative(), ts: z.number().int() }),
+})
+
+export type CanaryReply = { text: string; toolCalls: unknown[]; envelope: z.infer<typeof usageEnvelope> }
+
+async function readStream(res: Response) {
+  let text = ""
+  const toolCalls = new Map<number, { id: string; type: string; function: { name: string; arguments: string } }>()
+  let envelope: unknown
+  for (const block of (await res.text()).split("\n\n")) {
+    const dataLine = block.split("\n").find((line) => line.startsWith("data:"))
+    if (!dataLine) continue
+    const data = dataLine.slice(5).trim()
+    if (data === "[DONE]") continue
+    if (block.startsWith("event: offpeak.usage")) {
+      envelope = JSON.parse(data)
+      continue
+    }
+    if (block.startsWith("event:")) continue
+    const delta = JSON.parse(data)?.choices?.[0]?.delta
+    text += delta?.content ?? ""
+    for (const call of delta?.tool_calls ?? []) {
+      const entry = toolCalls.get(call.index ?? 0) ?? { id: "", type: "function", function: { name: "", arguments: "" } }
+      entry.id ||= call.id ?? ""
+      entry.function.name += call.function?.name ?? ""
+      entry.function.arguments += call.function?.arguments ?? ""
+      toolCalls.set(call.index ?? 0, entry)
+    }
+  }
+  return { text, toolCalls: [...toolCalls.values()] as unknown[], envelope }
+}
+
+async function readJson(res: Response) {
+  const json = (await res.json()) as { choices: { message: { content: string | null; tool_calls?: unknown[] } }[]; offpeak_usage: unknown }
+  const message = json.choices[0]!.message
+  return { text: message.content ?? "", toolCalls: message.tool_calls ?? [], envelope: json.offpeak_usage }
+}
+
+export async function readReply(res: Response, stream: boolean): Promise<CanaryReply> {
+  const reply = stream ? await readStream(res) : await readJson(res)
+  return { ...reply, envelope: usageEnvelope.parse(reply.envelope) }
+}
+
+export async function callRouter(deps: Pick<AuditDeps, "fetcher" | "routerUrl" | "internalToken">, account: Pick<CanaryAccount, "apiKey">, host: string, body: Record<string, unknown>) {
+  return deps.fetcher(`${deps.routerUrl}/internal/audit/canary`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${account.apiKey}`, "content-type": "application/json", "x-offpeak-internal": deps.internalToken, "x-offpeak-canary-host": host },
+    body: JSON.stringify(body),
+  })
+}
+
+/** Lower case, single spaces, no closing punctuation: a robust answer should survive formatting. */
+export function normaliseAnswer(text: string) {
+  return text.trim().toLowerCase().replace(/\s+/g, " ").replace(/[.!]+$/, "")
+}
+
+export const answerAccepted = (accepted: readonly string[], output: string) => accepted.includes(normaliseAnswer(output))
+
+/** Sends one canary. A refused or failed request leaves no run, and costs nothing but the attempt. */
+export async function sendCanary(deps: AuditDeps, plan: Pick<CanaryPlan, "host" | "modelDigest">) {
+  if (!deps.corpus) return null
+  const now = deps.clock()
+  const account = chooseAccount(deps.accounts, await usedToday(deps, now), Math.floor((now % 86_400) / HOUR_S), deps.rng)
+  const model = deps.models.find((row) => row.digest === plan.modelDigest)
+  if (!account || !model) return null
+  const canary = await chooseCanary(deps, deps.corpus, model.name, model.digest, now)
+  const res = await callRouter(deps, account, plan.host, canary.body)
+  if (!res.ok) {
+    deps.metrics.inc("auditor_canary_refused")
+    return null
+  }
+  const reply = await readReply(res, canary.body.stream === true)
+  const record = reply.envelope.record
+  if (record.host.toLowerCase() !== plan.host) throw new Error("canary came back from another host")
+  const passed = canary.deterministic ? answerAccepted(canary.accepted, reply.text) : null
+  await deps.db.query(
+    `INSERT INTO serving.canary_runs (id, host, expected, output, passed, req_id, model_digest, prompt_id, deterministic, body, tool_calls, wallet, tokens_out, ts)
+     VALUES ($1,$2,$3::jsonb,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12,$13,$14)`,
+    [
+      randomUUID(),
+      plan.host,
+      JSON.stringify(canary.accepted),
+      reply.text,
+      passed,
+      record.reqId,
+      plan.modelDigest,
+      canary.promptId,
+      canary.deterministic,
+      JSON.stringify(canary.body),
+      JSON.stringify(reply.toolCalls),
+      account.wallet,
+      record.tokensOut,
+      record.ts,
+    ],
+  )
+  deps.metrics.inc("auditor_canaries_sent")
+  return { reqId: record.reqId, passed }
+}
+
+/** Runs each pooled prompt on every reference host for a model. The set is what they answered. */
+export async function refreshAccepted(deps: AuditDeps, modelDigest: string, pool = deps.corpus ? deterministicPool(deps.corpus, deps.rng) : []) {
+  const model = deps.models.find((row) => row.digest === modelDigest)
+  const references = (await deps.db.query<{ host: string; gpu_class: string }>("SELECT host, gpu_class FROM serving.audit_reference_hosts WHERE model_digest = $1", [modelDigest])).rows
+  const account = deps.accounts[0]
+  if (!model || !account || references.length === 0) return 0
+  let stored = 0
+  for (const prompt of pool) {
+    const accepted = new Set<string>()
+    const body = { model: model.name, messages: prompt.messages, temperature: 0, max_tokens: ANSWER_LIMIT }
+    let cutOff = false
+    for (const reference of references) {
+      const res = await callRouter(deps, account, reference.host, body)
+      if (!res.ok) continue
+      const reply = await readReply(res, false)
+      cutOff ||= reply.envelope.record.tokensOut >= ANSWER_LIMIT
+      accepted.add(normaliseAnswer(reply.text))
+    }
+    if (accepted.size === 0 || cutOff) continue
+    await deps.db.query(
+      `INSERT INTO serving.canary_expected (prompt_id, model_digest, body, accepted, gpu_classes, observed_at) VALUES ($1,$2,$3::jsonb,$4::jsonb,$5::jsonb,$6)
+       ON CONFLICT (prompt_id, model_digest) DO UPDATE SET accepted = EXCLUDED.accepted, gpu_classes = EXCLUDED.gpu_classes, observed_at = EXCLUDED.observed_at`,
+      [prompt.promptId, modelDigest, JSON.stringify({ messages: prompt.messages }), JSON.stringify([...accepted]), JSON.stringify([...new Set(references.map((r) => r.gpu_class))]), deps.clock()],
+    )
+    stored++
+  }
+  return stored
+}
+
+/** The smallest failure count an honest host reaches with probability at most α. */
+export function canaryThreshold(n: number, honestFailRate: number, alpha = 0.001) {
+  let logTerm = n * Math.log(1 - honestFailRate)
+  const odds = Math.log(honestFailRate) - Math.log(1 - honestFailRate)
+  const terms: number[] = []
+  for (let k = 0; k <= n; k++) {
+    terms.push(logTerm)
+    logTerm += Math.log(n - k) - Math.log(k + 1) + odds
+  }
+  let tail = 0
+  for (let k = n; k >= 0; k--) {
+    tail += Math.exp(terms[k]!)
+    if (tail > alpha) return k + 1
+  }
+  return 0
+}
+
+/** Laplace-smoothed exact-match failures on reference hosts, with a floor for small counts. */
+export async function honestCanaryFailRate(deps: Pick<AuditDeps, "db">, modelDigest: string) {
+  const rows = await deps.db.query<{ n: string; fails: string }>(
+    `SELECT count(*) AS n, count(*) FILTER (WHERE NOT r.passed) AS fails FROM serving.canary_runs r
+     JOIN serving.audit_reference_hosts h ON h.host = r.host AND h.model_digest = r.model_digest
+     WHERE r.model_digest = $1 AND r.deterministic`,
+    [modelDigest],
+  )
+  const row = rows.rows[0]!
+  return Math.max(0.01, (Number(row.fails) + 1) / (Number(row.n) + 2))
+}
