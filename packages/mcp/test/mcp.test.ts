@@ -290,3 +290,196 @@ describe("offpeak_usage", () => {
     const [bad] = await usageOf(mcp, { req_id, recount: { prompt: complete, output: `${body.text} and more` } })
     expect(bad!.verification).toMatchObject({ ok: false, reasons: ["output_hash", ...NOT_COUNTED] })
   })
+
+  test("finds one by id, and since filters by time", async () => {
+    const booted = await bootRouter()
+    const mcp = await connected(client(booted, { apiKey: booted.key.token }))
+    const { body } = await call(mcp, "offpeak_complete", complete)
+    expect(await usageOf(mcp, { req_id: body.usage.record.reqId })).toHaveLength(1)
+    expect(await usageOf(mcp, { since: new Date((booted.stack.clock() + 60) * 1000).toISOString() })).toHaveLength(0)
+    expect(await usageOf(mcp, { since: new Date((booted.stack.clock() - 60) * 1000).toISOString() })).toHaveLength(1)
+  })
+
+  test("a record this server never saw comes from the router and is checked", async () => {
+    const booted = await bootRouter()
+    const other = client(booted, { apiKey: booted.key.token })
+    const seen = (await other.chat(ask("elsewhere"))) as { envelope: { record: { reqId: string } } }
+    const mcp = await connected(client(booted, { apiKey: booted.key.token }))
+    const [record] = await usageOf(mcp, { req_id: seen.envelope.record.reqId })
+    expect(record).toMatchObject({ verification: { ok: true }, proof: { status: "pending" } })
+    expect(record!.usage).toBeTruthy()
+  })
+
+  test("a paid call keeps its answer when the recount cannot run", async () => {
+    const booted = await bootRouter()
+    const send = inProcess(booted.app)
+    const blocked = (async (input: RequestInfo | URL, init?: RequestInit) => (String(input).includes("/v1/tokenizers/") ? new Response("down", { status: 503 }) : send(input, init))) as typeof fetch
+    const mcp = await connected(client(booted, { apiKey: booted.key.token, fetch: blocked }))
+    const { isError, body } = await call(mcp, "offpeak_complete", complete)
+    expect(isError).toBe(false)
+    expect(body.text.length).toBeGreaterThan(0)
+    expect(body.verification).toMatchObject({ ok: true })
+    expect(body.verification.recount_problem).toBeTruthy()
+  })
+
+  test("a request id the router does not know says what could not be checked", async () => {
+    const booted = await bootRouter()
+    const mcp = await connected(client(booted, { apiKey: booted.key.token }))
+    const [record] = await usageOf(mcp, { req_id: `0x${"12".repeat(32)}` })
+    expect(record).toMatchObject({ usage: null, verification: { ok: false, status: "not_checked" }, proof: { status: "not_found" } })
+  })
+
+  test("an unpublished deployment shows as not checked, not as passed", async () => {
+    const booted = await bootRouter()
+    const mcp = await connected(client(booted, { apiKey: booted.key.token, deployment: "4663" }))
+    const { isError, body } = await call(mcp, "offpeak_complete", complete)
+    expect(isError).toBe(false)
+    expect(body.verification).toMatchObject({ ok: false, status: "not_checked" })
+  })
+})
+
+describe("configuration", () => {
+  const good = { OFFPEAK_PUBLIC_BASE_URL: BASE, OFFPEAK_API_KEY: "op_live_test" }
+
+  test("needs a base URL and a way to pay", () => {
+    expect(() => readConfig({ OFFPEAK_API_KEY: "op_live_test" })).toThrow("OFFPEAK_PUBLIC_BASE_URL")
+    expect(() => readConfig({ OFFPEAK_PUBLIC_BASE_URL: BASE })).toThrow("OFFPEAK_API_KEY or OFFPEAK_AGENT_WALLET_KEY")
+  })
+
+  test("a bad wallet key is named and never printed", () => {
+    const secret = "0xdeadbeefdeadbeef"
+    const message = (() => {
+      try {
+        readConfig({ ...good, OFFPEAK_AGENT_WALLET_KEY: secret })
+        return ""
+      } catch (err) {
+        return String(err)
+      }
+    })()
+    expect(message).toContain("OFFPEAK_AGENT_WALLET_KEY")
+    expect(message).not.toContain(secret)
+  })
+
+  test("an all-zero key is refused without printing it", () => {
+    const config = readConfig({ ...good, OFFPEAK_AGENT_WALLET_KEY: `0x${"0".repeat(64)}` })
+    expect(() => clientFrom(config)).toThrow("not a usable key")
+  })
+
+  test("refuses to run beside a service key", () => {
+    expect(() => readConfig({ ...good, OFFPEAK_ROUTER_SIGNER_KEY: AGENT_KEY })).toThrow("service key")
+  })
+
+  test("a channel needs a wallet, one source, and an RPC URL", () => {
+    const id = `0x${"ab".repeat(32)}`
+    expect(() => readConfig({ ...good, OFFPEAK_CHANNEL_ID: id })).toThrow("needs OFFPEAK_AGENT_WALLET_KEY")
+    expect(() => readConfig({ ...good, OFFPEAK_AGENT_WALLET_KEY: AGENT_KEY, OFFPEAK_CHANNEL_ID: id, OFFPEAK_CHANNEL_DEPOSIT: "1" })).toThrow("not both")
+    expect(() => readConfig({ ...good, OFFPEAK_AGENT_WALLET_KEY: AGENT_KEY, OFFPEAK_CHANNEL_DEPOSIT: "1000000" })).toThrow("OFFPEAK_RPC_URL")
+    expect(() => readConfig({ ...good, OFFPEAK_AGENT_WALLET_KEY: AGENT_KEY, OFFPEAK_CHANNEL_ID: id })).toThrow("OFFPEAK_RPC_URL")
+  })
+
+  test("a restart states both halves of what it signed, or neither", () => {
+    const id = `0x${"ab".repeat(32)}`
+    const base = { ...good, OFFPEAK_AGENT_WALLET_KEY: AGENT_KEY, OFFPEAK_CHANNEL_ID: id, OFFPEAK_RPC_URL: "http://rpc.test" }
+    expect(() => readConfig({ ...base, OFFPEAK_CHANNEL_SEQ: "4" })).toThrow("as a pair")
+    expect(readConfig({ ...base, OFFPEAK_CHANNEL_SEQ: "4", OFFPEAK_CHANNEL_CUMULATIVE: "900" }).OFFPEAK_CHANNEL_CUMULATIVE).toBe("900")
+  })
+
+  test("defaults to this machine", () => {
+    expect(readConfig(good).OFFPEAK_MCP_HOST).toBe("127.0.0.1")
+  })
+})
+
+describe("transports", () => {
+  let booted: Booted
+  let routerServer: ReturnType<typeof Bun.serve>
+  let routerUrl: string
+
+  beforeAll(async () => {
+    booted = await bootRouter()
+    routerServer = Bun.serve({ port: port(), hostname: "127.0.0.1", fetch: booted.app.fetch })
+    routerUrl = `http://127.0.0.1:${routerServer.port}`
+  })
+
+  afterAll(() => routerServer.stop(true))
+
+  test("stdio runs the real entry point with a wallet, and the key is not in its output", async () => {
+    const id = addChannel(booted, 5_000_000n, anvilAccount(3).address)
+    const rpc = chainServer(booted)
+    const transport = new StdioClientTransport({
+      command: "bun",
+      args: ["run", MAIN],
+      env: { PATH: process.env.PATH!, OFFPEAK_PUBLIC_BASE_URL: routerUrl, OFFPEAK_AGENT_WALLET_KEY: AGENT_KEY, OFFPEAK_CHANNEL_ID: id, OFFPEAK_RPC_URL: `http://127.0.0.1:${rpc.port}`, OFFPEAK_DEPLOYMENT_FILE: DEPLOYMENT_FILE },
+      stderr: "pipe",
+    })
+    const logged: string[] = []
+    transport.stderr?.on("data", (chunk) => logged.push(String(chunk)))
+    const mcp = await connect(transport)
+    try {
+      const { tools } = await mcp.listTools()
+      expect(tools).toHaveLength(4)
+      const done = await call(mcp, "offpeak_complete", complete)
+      expect(done.body.usage.record.payMode).toBe(3)
+      expect(done.body.verification.reasons).toEqual(NOT_COUNTED)
+      expect((await channelRow(booted, id))?.seq).toBe(1n)
+      expect((await call(mcp, "offpeak_prices", { model: "ofm-8b" })).body.forecast_next_24h).toHaveLength(24)
+      expect([done.raw, ...logged].join("").toLowerCase()).not.toContain(AGENT_KEY.slice(2).toLowerCase())
+    } finally {
+      await mcp.close()
+      rpc.stop(true)
+    }
+  }, 30_000)
+
+  test("streamable HTTP serves all four tools from one client across requests", async () => {
+    const op = new Offpeak({ baseURL: routerUrl, apiKey: booted.key.token, deployment: "local" })
+    const server = serveHttp(op, { host: "127.0.0.1", port: port() })
+    const url = new URL(`http://127.0.0.1:${server.port}/mcp`)
+    const mcp = await connect(new StreamableHTTPClientTransport(url))
+    try {
+      expect((await mcp.listTools()).tools).toHaveLength(4)
+      const done = await call(mcp, "offpeak_complete", complete)
+      expect(done.body.verification.reasons).toEqual(NOT_COUNTED)
+      expect((await call(mcp, "offpeak_prices", {})).body.models.length).toBeGreaterThan(0)
+      expect((await call(mcp, "offpeak_schedule_job", { model: "ofm-8b", requests: [{ messages: [{ role: "user", content: "later" }] }], deadline: farDeadline() })).body.job_id).toStartWith("batch_")
+      const later = await connect(new StreamableHTTPClientTransport(url))
+      const records = await usageOf(later, {})
+      expect(records.map((row) => row.req_id)).toContain(done.body.usage.record.reqId)
+      await later.close()
+    } finally {
+      await mcp.close()
+      server.stop(true)
+    }
+  }, 30_000)
+
+  test("a local HTTP server turns away other hosts, browser pages and other paths", async () => {
+    const op = new Offpeak({ baseURL: routerUrl, apiKey: booted.key.token, deployment: "local" })
+    const server = serveHttp(op, { host: "127.0.0.1", port: port() })
+    const url = `http://127.0.0.1:${server.port}`
+    const rpc = { method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" }) }
+    try {
+      expect((await fetch(`${url}/mcp`, { ...rpc, headers: { ...rpc.headers, origin: "https://page.example" } })).status).toBe(403)
+      expect((await fetch(`${url}/mcp`, { ...rpc, headers: { ...rpc.headers, host: "attacker.example" } })).status).toBe(403)
+      expect((await fetch(`${url}/other`, rpc)).status).toBe(404)
+      expect((await fetch(`${url}/mcp`)).status).toBe(405)
+      expect((await fetch(`${url}/mcp`, { ...rpc, headers: { ...rpc.headers, origin: url } })).status).not.toBe(403)
+    } finally {
+      server.stop(true)
+    }
+  })
+
+  test("a token, when set, is required, and leaving this machine demands one", async () => {
+    const op = new Offpeak({ baseURL: routerUrl, apiKey: booted.key.token, deployment: "local" })
+    expect(() => serveHttp(op, { host: "0.0.0.0", port: port() })).toThrow("OFFPEAK_MCP_TOKEN")
+    const token = "t".repeat(40)
+    const server = serveHttp(op, { host: "127.0.0.1", port: port(), token })
+    const url = new URL(`http://127.0.0.1:${server.port}/mcp`)
+    try {
+      expect((await fetch(url, { method: "POST" })).status).toBe(401)
+      expect((await fetch(url, { method: "POST", headers: { authorization: "Bearer wrong" } })).status).toBe(401)
+      const mcp = await connect(new StreamableHTTPClientTransport(url, { requestInit: { headers: { authorization: `Bearer ${token}` } } }))
+      expect((await mcp.listTools()).tools).toHaveLength(4)
+      await mcp.close()
+    } finally {
+      server.stop(true)
+    }
+  })
+})

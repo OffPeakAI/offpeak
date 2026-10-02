@@ -148,3 +148,143 @@ export class SealedStream implements AsyncIterable<Record<string, unknown>> {
     }
   }
 }
+
+export class SealedClient {
+  private options: z.infer<typeof optionsSchema>
+
+  constructor(
+    private ctx: ClientContext,
+    options: SealedOptions | undefined,
+    /** The client's own paid dispatch, which handles keys, channels and `upto`. */
+    private send: (url: string, init: RequestInit) => Promise<Response>,
+  ) {
+    this.options = optionsSchema.parse(options ?? {})
+    // A client that never touches sealed needs none of this, so with no options the refusal waits for first use.
+    if (options) this.requireVerifier()
+  }
+
+  private requireVerifier() {
+    if (!this.options.trustRouterVerification) this.ownVerifier()
+  }
+
+  private ownVerifier() {
+    const { verifierUrl, gpuVerifierUrl, measurements, modelDigests } = this.options
+    if (!verifierUrl || !gpuVerifierUrl || !measurements || !modelDigests) {
+      throw new OffpeakError("sealed_verifier_required", "Sealed chats need verifierUrl, gpuVerifierUrl, measurements and modelDigests of your own")
+    }
+    return { verifierUrl, gpuVerifierUrl, measurements }
+  }
+
+  /** Asks through the router, so the host never sees who asked. Nothing here is believed until the quote is checked. */
+  private async freshQuote(host: Hex, nonce: Hex) {
+    const headers = { "content-type": HPKE_CONTENT_TYPE, "x-offpeak-sealed-host": host, "x-offpeak-attest-nonce": nonce }
+    const res = await this.ctx.fetch(`${this.ctx.baseURL}${SEALED_PATH}`, { method: "POST", headers }).catch(() => null)
+    if (!res?.ok) return null
+    const reply = attestReplySchema.safeParse(await res.json().catch(() => null)).data
+    return reply?.nonce === nonce && reply.hpkePublicKey === reply.bindings.hpkePublicKey ? reply : null
+  }
+
+  /** A quote made for this client just now, judged by your own services and the chain. Nothing the router listed is kept. */
+  private async ownTranscript(host: Hex): Promise<Transcript | null> {
+    const { verifierUrl, gpuVerifierUrl, measurements } = this.ownVerifier()
+    const send = this.ctx.fetch
+    const nonce = bytesToHex(crypto.getRandomValues(new Uint8Array(32)))
+    const verifiedAt = nowSeconds()
+    const reply = await this.freshQuote(host, nonce)
+    if (!reply) return null
+    const [fresh, boot, gpuResult, registry] = await Promise.all([dcapVerify(send, verifierUrl, reply.quote), dcapVerify(send, verifierUrl, reply.boot.quote), gpuVerify(send, gpuVerifierUrl, nonce, reply.gpuEvidence), this.registryOf(host)])
+    const allowListed = registry ? quotesAllowed(measurements, registry.imageDigest, [reply, reply.boot]) : false
+    return {
+      v: 1,
+      host,
+      nonce,
+      verifiedAt,
+      bindings: reply.bindings,
+      quote: reply.quote,
+      gpuEvidence: reply.gpuEvidence,
+      boot: reply.boot,
+      registry: registry ?? { attestationRef: ZERO_NONCE, imageDigest: ZERO_NONCE, modelDigests: [] },
+      verdict: { quoteVerified: fresh.verified && boot.verified, tcbStatus: fresh.tcbStatus, bootTcbStatus: boot.tcbStatus, allowListed, gpuResult },
+    }
+  }
+
+  private async registryOf(host: Hex) {
+    const reader = this.ctx.chain.reader()
+    if (!reader) return null
+    try {
+      const address = this.ctx.book.contract("HostRegistry")
+      const [view, models] = await Promise.all([
+        reader.readContract({ address, abi: hostRegistryAbi, functionName: "hostView", args: [host] }),
+        reader.readContract({ address, abi: hostRegistryAbi, functionName: "modelsOf", args: [host] }),
+      ])
+      return { attestationRef: view.attestationRef as Hex, imageDigest: view.imageDigest as Hex, modelDigests: [...models] as Hex[] }
+    } catch {
+      return null
+    }
+  }
+
+  private async judge(row: z.infer<typeof hostsReply>["hosts"][number], model: string): Promise<HostCheck> {
+    const { trustRouterVerification, measurements, modelDigests, maxAgeSeconds } = this.options
+    const transcript = trustRouterVerification ? row.transcript : await this.ownTranscript(row.host)
+    if (!transcript) return { host: row.host, ok: false, reasons: ["no_attestation"], sealed: null }
+    const reasons = checkTranscript(transcript, { host: row.host, now: nowSeconds(), maxAgeS: maxAgeSeconds, measurements })
+    if (row.modelDigest !== transcript.bindings.modelDigest) reasons.push("identity")
+    const pinned = modelDigests?.[model]
+    if (pinned ? pinned !== transcript.bindings.modelDigest : !trustRouterVerification) reasons.push("model_pin")
+    if (reasons.length > 0) return { host: row.host, ok: false, reasons, sealed: null }
+    const sealed = {
+      host: row.host,
+      modelDigest: transcript.bindings.modelDigest,
+      hpkePublicKey: transcript.bindings.hpkePublicKey,
+      attestationRef: transcript.registry.attestationRef,
+      tcbStatus: transcript.verdict.tcbStatus,
+      verifiedAt: transcript.verifiedAt,
+      transcript,
+    }
+    return { host: row.host, ok: true, reasons, sealed }
+  }
+
+  /** Every host the router lists for this model, with the reasons any of them was refused. */
+  async check(model: string): Promise<HostCheck[]> {
+    this.requireVerifier()
+    const url = `${this.ctx.baseURL}/v1/sealed/hosts?model=${encodeURIComponent(model)}`
+    const res = await this.send(url, { method: "GET" })
+    if (!res.ok) throw await errorFrom(res)
+    const parsed = hostsReply.safeParse(await res.json())
+    if (!parsed.success) throw new OffpeakError("sealed_bad_transcript", "The host list cannot be read")
+    return Promise.all(parsed.data.hosts.map((row) => this.judge(row, model)))
+  }
+
+  /** Hosts for this model that passed every check. A host that failed any of them is not here. */
+  async hosts(model: string): Promise<SealedHost[]> {
+    return (await this.check(model)).flatMap((row) => (row.sealed ? [row.sealed] : []))
+  }
+
+  private async begin(params: SealedParams, opts: SealedChatOptions): Promise<SealedStream> {
+    this.requireVerifier()
+    const body = sealedParams.parse(params)
+    const host = opts.host ?? (await this.hosts(body.model))[0]
+    if (!host) throw new OffpeakError("sealed_no_host", "No host passed its attestation checks, so nothing was sent")
+    const asked = body.max_completion_tokens ?? body.max_tokens ?? DEFAULT_MAX_TOKENS
+    const maxTokens = z.int().positive().parse(asked)
+    const { max_completion_tokens: _ignored, ...rest } = body
+    const plaintext = new TextEncoder().encode(JSON.stringify({ ...rest, stream: true, max_tokens: maxTokens }))
+    const publicKey = await publicKeyFrom(hexToBytes(host.hpkePublicKey))
+    const request = await sealRequest(publicKey, plaintext, SEALED_PATH, Date.now())
+    const res = await this.send(`${this.ctx.baseURL}${SEALED_PATH}`, {
+      method: "POST",
+      headers: { ...opts.headers, "content-type": HPKE_CONTENT_TYPE, "x-offpeak-model": body.model, "x-offpeak-max-tokens": String(maxTokens), "x-offpeak-sealed-host": host.host },
+      body: request.bytes,
+    })
+    if (!res.ok) throw await errorFrom(res)
+    return new SealedStream(res, request, host, this.ctx.verify)
+  }
+
+  /** Encrypts on this machine, sends only ciphertext, and decrypts the reply as it arrives. */
+  async chat(params: SealedParams & { stream: true }, opts?: SealedChatOptions): Promise<SealedStream>
+  async chat(params: SealedParams, opts?: SealedChatOptions): Promise<SealedResult>
+  async chat(params: SealedParams, opts: SealedChatOptions = {}): Promise<SealedResult | SealedStream> {
+    const stream = await this.begin(params, opts)
+    return params.stream ? stream : stream.final()
+  }
+}
