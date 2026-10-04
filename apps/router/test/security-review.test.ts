@@ -165,3 +165,201 @@ describe("host health", () => {
     }
     expect(seen.chats).toBe(0)
   })
+
+  test("a 4xx from the host is the buyer's, so the host stays in routing and the hold goes back", async () => {
+    const booted = await bootStack()
+    refusing(booted, 400)
+    for (let i = 0; i < 5; i++) {
+      const res = await chat(booted, chatBody(`bad ${i}`))
+      expect(res.status).toBe(400)
+      expect(await errorCode(res)).toBe("host_refused")
+    }
+    expect(booted.stack.load.errorRate(booted.host)).toBe(0)
+    expect(await held(booted)).toBe(0n)
+    booted.stack.candidateCache.clear()
+    expect(await errorCode(await chat(booted, chatBody("still routed")))).toBe("host_refused")
+  })
+
+  test("a 5xx and a timeout still count", async () => {
+    const booted = await bootStack()
+    refusing(booted, 502)
+    expect((await chat(booted, chatBody("down"))).status).toBe(503)
+    expect(booted.stack.load.errorRate(booted.host)).toBe(1)
+    const slow = await bootStack()
+    slow.stack.ttftFailoverMs = 5
+    slow.stack.hosts.request = (_host, _endpoint, _path, init) => new Promise((_, reject) => init.signal!.addEventListener("abort", () => reject(new Error("abort"))))
+    expect((await chat(slow, chatBody("slow"))).status).toBe(503)
+    expect(slow.stack.load.errorRate(slow.host)).toBe(1)
+  })
+
+  test("embeddings hold to the same rule", async () => {
+    const booted = await bootStack()
+    const real = booted.hostApps.get(booted.host)!
+    const answering = new Hono()
+    let status = 400
+    answering.post("/offpeak/v1/embeddings", (c) => c.json({ error: { code: "too_long" } }, status as 400))
+    answering.all("*", (c) => real.fetch(c.req.raw))
+    booted.hostApps.set(booted.host, answering)
+    const embed = () => booted.app.request("/v1/embeddings", { method: "POST", headers: prepaid(booted), body: JSON.stringify({ model: "ofm-embed", input: "hello" }) })
+    const refused = await embed()
+    expect(refused.status).toBe(400)
+    expect(await errorCode(refused)).toBe("host_refused")
+    expect(booted.stack.load.errorRate(booted.host)).toBe(0)
+    status = 500
+    expect((await embed()).status).toBe(503)
+    expect(booted.stack.load.errorRate(booted.host)).toBe(1)
+  })
+})
+
+describe("Window demand", () => {
+  test("a request the host refuses leaves no demanded minute, and gives its tokens back", async () => {
+    const booted = await bootStack()
+    holdWindow(booted)
+    refusing(booted, 400)
+    const res = await chat(booted, chatBody("forged"), prepaid(booted, { "x-offpeak-window": WINDOW }))
+    expect(res.status).toBe(400)
+    expect(await pending(booted)).toBe(0n)
+    await sweepPast(booted)
+    expect(await demandedMinutes(booted)).toBe(0)
+  })
+
+  test("a host that fails a holder still leaves one", async () => {
+    const booted = await bootStack()
+    holdWindow(booted)
+    refusing(booted, 503)
+    expect((await chat(booted, chatBody("real"), prepaid(booted, { "x-offpeak-window": WINDOW }))).status).toBe(503)
+    await sweepPast(booted)
+    expect(await demandedMinutes(booted)).toBe(1)
+  })
+
+  test("a holder who hangs up before the first token leaves none", async () => {
+    const booted = await bootStack()
+    holdWindow(booted)
+    wrapHost(booted, (c) => {
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'))
+          c.req.raw.signal.addEventListener("abort", () => controller.error(new Error("aborted")))
+        },
+      })
+      return new Response(stream, { headers: { "content-type": "text/event-stream" } })
+    })
+    const res = await chat(booted, chatBody("gone", { stream: true }), prepaid(booted, { "x-offpeak-window": WINDOW }))
+    await res.body!.cancel()
+    for (let i = 0; i < 100 && (await flags(booted)).length === 0; i++) await Bun.sleep(5)
+    await sweepPast(booted)
+    expect(await demandedMinutes(booted)).toBe(0)
+  })
+
+  test("a dropped flow takes nothing from real demand in the same minute", () => {
+    let seconds = 6_000
+    let ms = 0
+    const perf = new WindowPerf(() => seconds, () => ms)
+    perf.begin(7n).drop()
+    expect(perf.take(6_060)).toEqual([])
+    const waited = perf.begin(7n)
+    perf.begin(7n).drop()
+    ms += 500
+    waited.end()
+    seconds += MINUTE
+    expect(perf.take(seconds)).toEqual([{ windowId: 7n, minute: 100, tokens: 0, busyMs: 500, demanded: true }])
+  })
+})
+
+describe("the audit sample", () => {
+  test("holds the body as sent, so it matches the record's hash", async () => {
+    const booted = await bootStack()
+    const kek = "11".repeat(32)
+    const before = process.env.OFFPEAK_AUDIT_SAMPLE_KEK
+    process.env.OFFPEAK_AUDIT_SAMPLE_KEK = kek
+    await booted.stack.db.query("UPDATE serving.accounts SET audit_opt_in = true")
+    spyOn(sample, "drawsSample").mockReturnValue(true)
+    expect((await chat(booted, chatBody("sampled", { max_completion_tokens: 8 }))).status).toBe(200)
+    if (before === undefined) delete process.env.OFFPEAK_AUDIT_SAMPLE_KEK
+    else process.env.OFFPEAK_AUDIT_SAMPLE_KEK = before
+    let rows: SampleRow[] = []
+    for (let i = 0; i < 100 && rows.length === 0; i++) {
+      rows = (await booted.stack.db.query<SampleRow>("SELECT * FROM serving.audit_samples")).rows
+      await Bun.sleep(5)
+    }
+    const opened = await openSample(booted.stack.db, sample.parseKek(kek)!, rows[0]!)
+    expect(promptHashOf(opened!.body)).toBe((await records(booted)).rows[0]!.prompt_hash)
+  })
+})
+
+describe("the output limit", () => {
+  test("a compact tool call that re-renders past the limit is clamped, with no metering flag against the host", async () => {
+    const booted = await bootStack()
+    const body = chatBody("use a tool", { tools: [{ type: "function", function: { name: "lookup" } }] })
+    expect((await chat(booted, body)).status).toBe(200)
+    expect((await records(booted)).rows[0]!.tokens_out).toBe(8)
+    expect(await flags(booted)).toEqual([])
+  })
+
+  test("either name must be a safe whole number", async () => {
+    const booted = await bootStack()
+    for (const limits of [{ max_tokens: 1e308 }, { max_tokens: 1e308, max_completion_tokens: 8 }, { max_completion_tokens: 2 ** 60 }, { max_tokens: 1.5 }]) {
+      const res = await chat(booted, chatBody("big", limits))
+      expect(res.status).toBe(400)
+      expect(await errorCode(res)).toBe("bad_max_tokens")
+    }
+  })
+
+  test("a batch line is held to the same rule", async () => {
+    const booted = await bootStack()
+    const line = JSON.stringify({ custom_id: "a", body: { model: "ofm-8b", messages: [{ role: "user", content: "hi" }], max_tokens: 1e308 } })
+    const { id } = (await (await booted.app.request("/v1/files", { method: "POST", headers: prepaid(booted), body: JSON.stringify({ purpose: "batch", content: line }) })).json()) as { id: string }
+    const res = await booted.app.request("/v1/batches", { method: "POST", headers: prepaid(booted), body: JSON.stringify({ input_file_id: id, completion_window: "24h" }) })
+    expect(res.status).toBe(400)
+    expect(await errorCode(res)).toBe("bad_file")
+  })
+
+  test("audit bookkeeping that throws does not touch a final record", async () => {
+    const booted = await bootStack()
+    holdWindow(booted)
+    // Passes the door, and overflows the audit's rounding of it.
+    const text = await (await chat(booted, chatBody("hot", { stream: true, temperature: 1e308 }), prepaid(booted, { "x-offpeak-window": WINDOW }))).text()
+    expect(text).toContain("offpeak.usage")
+    expect(text).not.toContain("unbilled")
+    const row = (await records(booted)).rows[0]!
+    expect(await pending(booted)).toBe(BigInt(row.tokens_in + row.tokens_out))
+    expect(await flags(booted)).toEqual([])
+  })
+})
+
+describe("contract vouchers", () => {
+  const id = keccak256(toBytes("seven-seven-oh-two"))
+  const owner = roleAccount("settlerA")
+
+  test("a voucher only the wallet can vouch for counts against credit, even when requests prove with the key", async () => {
+    const booted = await bootStack()
+    const row = openChannel(booted, id, 2_000_000n)
+    const approved = new Set<string>()
+    booted.stack.wallets = { hasCode: async () => true, isValidSignature: async (_address, digest) => approved.has(digest) }
+    const { db } = booted.stack
+    expect((await channelChat(booted, id, chatBody("first"))).status).toBe(200)
+    await db.query("INSERT INTO serving.owed_boundaries (channel_id, cumulative, req_ids) VALUES ($1,199995,'{0xa}')", [id])
+    await db.query("UPDATE serving.channels_local SET unvouchered_micro = 199995 WHERE channel_id = $1", [id])
+    const typed = { domain: domain("OffpeakChannel", booted.stack.channelManager), types: voucherTypes, primaryType: "Voucher", message: { channelId: id, seq: 1n, cumulative: 199_995n } } as const
+    approved.add(hashTypedData(typed))
+    const sig = await owner.signTypedData(typed)
+    expect((await booted.app.request(`/v1/channels/${id}/voucher`, { method: "POST", body: JSON.stringify({ seq: "1", cumulative: "199995", sig }) })).status).toBe(200)
+    const refused = await channelChat(booted, id, chatBody("over"))
+    expect(refused.status).toBe(402)
+    expect(await errorCode(refused)).toBe("credit_limit")
+    row.claimed = 199_995n
+    expect((await channelChat(booted, id, chatBody("landed"))).status).toBe(200)
+  })
+
+  test("a key's own voucher does not", async () => {
+    const booted = await bootStack()
+    openChannel(booted, id, 2_000_000n)
+    const { db } = booted.stack
+    expect((await channelChat(booted, id, chatBody("first"))).status).toBe(200)
+    await db.query("INSERT INTO serving.owed_boundaries (channel_id, cumulative, req_ids) VALUES ($1,199995,'{0xa}')", [id])
+    await db.query("UPDATE serving.channels_local SET unvouchered_micro = 199995 WHERE channel_id = $1", [id])
+    const sig = await buyerKey.signTypedData({ domain: domain("OffpeakChannel", booted.stack.channelManager), types: voucherTypes, primaryType: "Voucher", message: { channelId: id, seq: 1n, cumulative: 199_995n } })
+    expect((await booted.app.request(`/v1/channels/${id}/voucher`, { method: "POST", body: JSON.stringify({ seq: "1", cumulative: "199995", sig }) })).status).toBe(200)
+    expect((await channelChat(booted, id, chatBody("fine"))).status).toBe(200)
+  })
+})
