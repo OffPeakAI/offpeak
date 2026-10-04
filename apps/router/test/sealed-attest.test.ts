@@ -161,3 +161,189 @@ describe("fails closed", () => {
     await sweep(booted)
     expect(verifiedHost(booted.stack, booted.host)).toBeNull()
   })
+
+  test("a config hash in the fresh quote that the boot quote does not hold", async () => {
+    const booted = await rig({ measurements: (imageDigest, configHash) => [configHash, OTHER_HASH].map((hash) => ({ imageDigest, configHash: hash, mrtd: FAKE_TD.mrtd, rtmrs: FAKE_TD.rtmrs })), noSweep: true })
+    tamperAttest(booted, (reply) => {
+      reply.bindings.configHash = OTHER_HASH
+      reply.quote = bytesToHex(fakeQuote(FAKE_TD, reportDataFor(reply.bindings, reply.nonce)))
+    })
+    expect(await reasonsFor(booted)).toEqual(["identity"])
+  })
+
+  test("a counts key in the fresh quote that the boot quote does not hold", async () => {
+    const booted = await rig({ noSweep: true })
+    tamperAttest(booted, (reply) => {
+      reply.bindings.countsSigner = `0x${"99".repeat(20)}`
+      reply.quote = bytesToHex(fakeQuote(FAKE_TD, reportDataFor(reply.bindings, reply.nonce)))
+    })
+    expect(await reasonsFor(booted)).toEqual(["identity"])
+  })
+
+  test.each(["OutOfDate", "OutOfDateConfigurationNeeded", "ConfigurationNeeded", "ConfigurationAndSWHardeningNeeded", "Revoked", "UPTODATE"])("TCB status %s is refused", async (status) => {
+    const booted = await rig({ noSweep: true })
+    booted.dcap.state.tcbStatus = status
+    expect(await reasonsFor(booted)).toContain("tcb_status")
+    await sweep(booted)
+    expect(verifiedHost(booted.stack, booted.host)).toBeNull()
+  })
+
+  test("a GPU that fails, or an answer for another nonce", async () => {
+    const booted = await rig({ noSweep: true })
+    booted.gpu.state.result = false
+    expect(await reasonsFor(booted)).toContain("gpu")
+    booted.gpu.state.result = true
+    booted.gpu.state.nonceOverride = "00"
+    expect(await reasonsFor(booted)).toContain("gpu")
+  })
+
+  test("a quote the verifier rejects", async () => {
+    const booted = await rig({ noSweep: true })
+    tamperAttest(booted, (reply) => {
+      const bytes = hexToBytes(reply.quote)
+      bytes[300]! ^= 1
+      reply.quote = bytesToHex(bytes)
+    })
+    expect(await reasonsFor(booted)).toContain("quote_verifier")
+  })
+
+  test.each([
+    ["hpkePublicKey", `0x${"66".repeat(32)}`],
+    ["modelDigest", `0x${"77".repeat(32)}`],
+    ["imageDigest", `0x${"88".repeat(32)}`],
+    ["operator", `0x${"99".repeat(20)}`],
+    ["countsSigner", `0x${"99".repeat(20)}`],
+    ["configHash", `0x${"bb".repeat(32)}`],
+    ["gpuEvidenceHash", `0x${"aa".repeat(32)}`],
+  ])("tampered bindings are refused: %s", async (field, value) => {
+    const booted = await rig({ noSweep: true })
+    tamperAttest(booted, (reply) => {
+      Object.assign(reply.bindings, { [field]: value })
+      if (field === "hpkePublicKey") reply.hpkePublicKey = value as Hex
+    })
+    expect(await reasonsFor(booted)).toContain("bindings")
+  })
+
+  test("a host claiming an image or model the registry does not hold, under a quote that matches", async () => {
+    const booted = await rig({ noSweep: true })
+    tamperAttest(booted, (reply) => {
+      reply.bindings.modelDigest = `0x${"77".repeat(32)}`
+      reply.quote = bytesToHex(fakeQuote(FAKE_TD, reportDataFor(reply.bindings, reply.nonce)))
+    })
+    expect(await reasonsFor(booted)).toContain("identity")
+  })
+
+  test("another operator's quotes", async () => {
+    const booted = await rig({ noSweep: true })
+    tamperAttest(booted, (reply) => {
+      for (const bindings of [reply.bindings, reply.boot.bindings]) bindings.operator = `0x${"99".repeat(20)}`
+      reply.quote = bytesToHex(fakeQuote(FAKE_TD, reportDataFor(reply.bindings, reply.nonce)))
+      reply.boot.quote = bytesToHex(fakeQuote(FAKE_TD, reportDataFor(reply.boot.bindings, `0x${"00".repeat(32)}`)))
+    })
+    expect(await reasonsFor(booted)).toContain("identity")
+  })
+
+  test("an old reply replayed for a new nonce", async () => {
+    const booted = await rig({ noSweep: true })
+    const nonce = `0x${"ee".repeat(32)}`
+    const old = (await (await booted.hostApps.get(booted.host)!.request(`/offpeak/v1/attest?nonce=${nonce}`)).json()) as AttestReply
+    tamperAttest(booted, (reply) => void Object.assign(reply, { ...old, nonce: reply.nonce }))
+    expect(await reasonsFor(booted)).toContain("bindings")
+  })
+
+  test("a key beside the bindings that differs from the one inside them", async () => {
+    const booted = await rig({ noSweep: true })
+    tamperAttest(booted, (reply) => void (reply.hpkePublicKey = `0x${"66".repeat(32)}`))
+    expect(await reasonsFor(booted)).toEqual(["identity"])
+  })
+
+  test("a reply for some other nonce", async () => {
+    const booted = await rig({ noSweep: true })
+    tamperAttest(booted, (reply) => void (reply.nonce = `0x${"ee".repeat(32)}`))
+    expect(await reasonsFor(booted)).toEqual(["nonce"])
+  })
+
+  test("an attestationRef the registry does not hold", async () => {
+    const booted = await rig({ noSweep: true })
+    booted.hostRow.attestationRef = `0x${"44".repeat(32)}`
+    expect(await reasonsFor(booted)).toContain("attestation_ref")
+  })
+
+  test("a TD in debug mode", async () => {
+    expect(await reasonsFor(await rig({ td: { ...FAKE_TD, debug: true }, noSweep: true }))).toContain("debug_td")
+  })
+
+  test("a host that does not answer, or sends something else", async () => {
+    const booted = await rig({ noSweep: true })
+    const hosts = booted.stack.hosts
+    booted.stack.hosts = { request: async () => new Response("no", { status: 500 }) }
+    expect(await reasonsFor(booted)).toEqual(["no_attestation"])
+    booted.stack.hosts = { request: async () => Response.json({ quote: "0x" }) }
+    expect(await reasonsFor(booted)).toEqual(["no_attestation"])
+    booted.stack.hosts = hosts
+  })
+
+  test("a host with no ref registered is never asked", async () => {
+    const booted = await rig({ noSweep: true })
+    booted.hostRow.attestationRef = ZERO_BYTES32 as Hex
+    let asked = 0
+    const hosts = booted.stack.hosts
+    booted.stack.hosts = { request: (...args) => ((asked += 1), hosts.request(...args)) }
+    await sweep(booted)
+    expect(asked).toBe(0)
+    expect(verifiedHost(booted.stack, booted.host)).toBeNull()
+  })
+})
+
+describe("a client's own fresh quote", () => {
+  const ask = (booted: Rig, headers: Record<string, string>) => booted.app.request("/v1/chat/completions", { method: "POST", headers: { "content-type": "application/offpeak-hpke", ...headers } })
+  const nonce = `0x${"ab".repeat(32)}`
+
+  test("passes through the router under the client's nonce", async () => {
+    const booted = await rig()
+    const res = await ask(booted, { "x-offpeak-sealed-host": booted.host, "x-offpeak-attest-nonce": nonce })
+    expect(res.status).toBe(200)
+    const reply = (await res.json()) as AttestReply
+    expect(reply.nonce).toBe(nonce as Hex)
+    expect(reply.bindings.hpkePublicKey).toBe(booted.sealed.identity.publicKey)
+  })
+
+  test("only for a verified host, with both headers readable", async () => {
+    const booted = await rig()
+    expect((await ask(booted, { "x-offpeak-sealed-host": booted.host, "x-offpeak-attest-nonce": "abc" })).status).toBe(400)
+    expect((await ask(booted, { "x-offpeak-attest-nonce": nonce })).status).toBe(400)
+    expect((await ask(booted, { "x-offpeak-sealed-host": `0x${"12".repeat(20)}`, "x-offpeak-attest-nonce": nonce })).status).toBe(503)
+  })
+
+  test("stays at 501 while the switch is off", async () => {
+    const booted = await rig()
+    booted.stack.flags.sealed = false
+    expect((await ask(booted, { "x-offpeak-sealed-host": booted.host, "x-offpeak-attest-nonce": nonce })).status).toBe(501)
+  })
+})
+
+describe("re-verification", () => {
+  test("24 hours on, the host is checked again with a new nonce", async () => {
+    const booted = await rig()
+    const first = verifiedHost(booted.stack, booted.host)!
+    booted.stack.setClock(first.verifiedAt + 86_399)
+    await sweep(booted)
+    expect(verifiedHost(booted.stack, booted.host)!.transcript.nonce).toBe(first.transcript.nonce)
+    booted.stack.setClock(first.verifiedAt + 86_400)
+    await sweep(booted)
+    const second = verifiedHost(booted.stack, booted.host)!
+    expect(second.transcript.nonce).not.toBe(first.transcript.nonce)
+    expect(second.verifiedAt).toBe(first.verifiedAt + 86_400)
+    expect((await rows(booted))[0]!.transcript.nonce).toBe(second.transcript.nonce)
+  })
+
+  test("a host that fails at 24 hours is gone from routing, the list and the table", async () => {
+    const booted = await rig()
+    const first = verifiedHost(booted.stack, booted.host)!
+    booted.stack.setClock(first.verifiedAt + 86_400)
+    booted.dcap.state.tcbStatus = "Revoked"
+    await sweep(booted)
+    expect(verifiedHost(booted.stack, booted.host)).toBeNull()
+    expect((await hostsOf(booted)).hosts).toEqual([])
+    expect(await rows(booted)).toEqual([])
+  })

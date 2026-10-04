@@ -126,3 +126,149 @@ describe("channel requests", () => {
     expect(await acceptVoucher(db, row, id, { seq: 4n, cumulative: low, sig: await sig(4n, low) })).toBe("stale")
   })
 })
+
+describe("upto", () => {
+  async function payment(booted: Awaited<ReturnType<typeof bootStack>>, reqId: Hex) {
+    const { uptoHeader } = await import("./support/upto.ts")
+    return uptoHeader(booted.stack, buyerKey, reqId)
+  }
+
+  test("a non-streaming reply waits for authorization, and a failure is neither returned nor billed", async () => {
+    const booted = await bootStack()
+    booted.facilitator.delayMs = 5
+    const reqId = keccak256(toBytes("short-fail"))
+    booted.facilitator.failReqIds.add(reqId)
+    const res = await booted.app.request("/v1/chat/completions", { method: "POST", headers: { "content-type": "application/json", "payment-signature": await payment(booted, reqId) }, body: chatBody("hi") })
+    expect(res.status).toBe(402)
+    expect(await res.text()).not.toContain("honest")
+    expect((await usageRows(booted)).rows.length).toBe(0)
+    expect(booted.facilitator.captured.length).toBe(0)
+  })
+
+  test("a short stream is not billed when authorization fails", async () => {
+    const booted = await bootStack()
+    booted.facilitator.delayMs = 5
+    const reqId = keccak256(toBytes("short-stream-fail"))
+    booted.facilitator.failReqIds.add(reqId)
+    const res = await booted.app.request("/v1/chat/completions", { method: "POST", headers: { "content-type": "application/json", "payment-signature": await payment(booted, reqId) }, body: chatBody("hi", { stream: true }) })
+    const text = await res.text()
+    expect(text).toContain("authorize_failed")
+    expect(text).not.toContain("offpeak.usage")
+    expect((await usageRows(booted)).rows.length).toBe(0)
+  })
+})
+
+describe("billing", () => {
+  test("a cancelled stream bills what came through", async () => {
+    const booted = await bootStack()
+    const res = await booted.app.request("/v1/chat/completions", { method: "POST", headers: prepaid(booted.key.token), body: chatBody("longform", { stream: true, max_tokens: 800 }) })
+    const reader = res.body!.getReader()
+    await reader.read()
+    await reader.cancel()
+    for (let i = 0; i < 100 && (await usageRows(booted)).rows.length === 0; i++) await Bun.sleep(10)
+    const rows = await usageRows(booted)
+    expect(rows.rows.length).toBe(1)
+    expect(rows.rows[0]!.tokens_out).toBeGreaterThan(0)
+  })
+
+  test("streamed JSON mode that fails to parse is still billed", async () => {
+    const booted = await bootStack()
+    const hostApp = new Hono()
+    const real = booted.hostApps.get(booted.host)!
+    hostApp.post("/offpeak/v1/chat/completions", async (c) => {
+      const res = await real.request("/offpeak/v1/chat/completions", { method: "POST", headers: c.req.raw.headers, body: await c.req.text() })
+      const text = (await res.text()).replaceAll('{\\"ok\\":true}', "{oops")
+      return new Response(text, { headers: { "content-type": "text/event-stream" } })
+    })
+    hostApp.post("/offpeak/v1/sign", async (c) => real.request("/offpeak/v1/sign", { method: "POST", headers: c.req.raw.headers, body: JSON.stringify({ ...(await c.req.json()), partial: true }) }))
+    booted.hostApps.set(booted.host, hostApp)
+    const res = await booted.app.request("/v1/chat/completions", { method: "POST", headers: prepaid(booted.key.token), body: chatBody("json", { stream: true, response_format: { type: "json_object" } }) })
+    const text = await res.text()
+    expect(text).toContain("bad_json")
+    expect(text).toContain("offpeak.usage")
+    expect((await usageRows(booted)).rows.length).toBe(1)
+  })
+
+  test("the host receives the limit the hold was priced on", async () => {
+    const booted = await bootStack()
+    let seen: { max_tokens?: number; max_completion_tokens?: number; stream?: boolean } = {}
+    const real = booted.hostApps.get(booted.host)!
+    const spy = new Hono()
+    spy.all("*", async (c) => {
+      const raw = c.req.method === "POST" ? await c.req.text() : undefined
+      if (c.req.path.endsWith("/chat/completions")) seen = JSON.parse(raw!)
+      return real.request(c.req.path, { method: c.req.method, headers: c.req.raw.headers, body: raw })
+    })
+    booted.hostApps.set(booted.host, spy)
+    await booted.app.request("/v1/chat/completions", { method: "POST", headers: prepaid(booted.key.token), body: JSON.stringify({ model: "ofm-8b", messages: [{ role: "user", content: "x" }], max_tokens: 1, max_completion_tokens: 100_000 }) })
+    expect(seen.max_tokens).toBe(4096)
+    expect(seen.max_completion_tokens).toBeUndefined()
+    const bad = await booted.app.request("/v1/chat/completions", { method: "POST", headers: prepaid(booted.key.token), body: chatBody("x", { max_tokens: -5 }) })
+    expect(bad.status).toBe(400)
+  })
+
+  test("a capture that fails after the record commits is finished by the sweep", async () => {
+    const booted = await bootStack()
+    const realCapture = booted.stack.ledger.capture.bind(booted.stack.ledger)
+    let down = true
+    booted.stack.ledger.capture = async (...args) => {
+      if (down) throw new Error("redis down")
+      return realCapture(...args)
+    }
+    const res = await booted.app.request("/v1/chat/completions", { method: "POST", headers: prepaid(booted.key.token), body: chatBody("capture") })
+    expect(res.status).toBe(200)
+    expect((await usageRows(booted)).rows.length).toBe(1)
+    const waiting = () => booted.stack.db.query("SELECT 1 FROM serving.pending_captures")
+    expect((await waiting()).rows.length).toBe(1)
+    down = false
+    await booted.stack.db.query("UPDATE serving.pending_captures SET created_at = now() - interval '1 minute'")
+    await sweepCaptures(booted.stack)
+    expect((await waiting()).rows.length).toBe(0)
+  })
+})
+
+describe("edges from the second review", () => {
+  test("a multi-byte prompt is held on bytes, so its reply is billed", async () => {
+    const booted = await bootStack()
+    const body = JSON.stringify({ model: "ofm-8b", messages: [{ role: "user", content: "语".repeat(2000) }], max_tokens: 8, stream: true })
+    const res = await booted.app.request("/v1/chat/completions", { method: "POST", headers: prepaid(booted.key.token), body })
+    expect(await res.text()).toContain("offpeak.usage")
+    expect((await usageRows(booted)).rows.length).toBe(1)
+  })
+
+  test("output past the hold bills what fits, and the record equals the charge", async () => {
+    const booted = await bootStack()
+    const real = booted.stack.ledger.admit.bind(booted.stack.ledger)
+    const captures: bigint[] = []
+    booted.stack.ledger.admit = real
+    const capture = booted.stack.ledger.capture.bind(booted.stack.ledger)
+    booted.stack.ledger.capture = async (wallet, holdId, actual, hour) => {
+      captures.push(actual)
+      return capture(wallet, holdId, actual, hour)
+    }
+    const spy = new Hono()
+    const host = booted.hostApps.get(booted.host)!
+    spy.all("*", async (c) => {
+      const raw = c.req.method === "POST" ? await c.req.text() : undefined
+      if (!c.req.path.endsWith("/chat/completions")) return host.request(c.req.path, { method: c.req.method, headers: c.req.raw.headers, body: raw })
+      const asked = JSON.parse(raw!) as { max_tokens: number }
+      return host.request(c.req.path, { method: "POST", headers: c.req.raw.headers, body: JSON.stringify({ ...JSON.parse(raw!), max_tokens: asked.max_tokens * 100 }) })
+    })
+    booted.hostApps.set(booted.host, spy)
+    const res = await booted.app.request("/v1/chat/completions", { method: "POST", headers: prepaid(booted.key.token), body: chatBody("longform", { max_tokens: 1 }) })
+    await res.text()
+    const rows = await usageRows(booted)
+    expect(rows.rows.length).toBe(1)
+    expect(rows.rows[0]!.tokens_out).toBe(1)
+    expect(captures[0]).toBe(BigInt(rows.rows[0]!.host_cost_micro) + BigInt(rows.rows[0]!.fee_micro))
+  })
+
+  test("work after the commit cannot fail a billed request or release its hold twice", async () => {
+    const booted = await bootStack()
+    booted.indexer.windows.set("9", { id: 9n, host: booted.host as Hex, modelDigest: booted.modelDigest, t0: 0n, t1: BigInt(booted.stack.clock() + 3600), minTps: 1, units: 10n, hostPricePerUnit: 1n, buyerPricePerUnit: 1n, failed: false } as never)
+    booted.indexer.holders.set(`9:${booted.buyer}`, { balance: 10n, lockedPartial: 0n, drawnTokens: 0n, costBasis: 1n })
+    await booted.stack.db.exec("ALTER TABLE shared.window_perf RENAME TO window_perf_gone")
+    const res = await booted.app.request("/v1/chat/completions", { method: "POST", headers: prepaid(booted.key.token, { "x-offpeak-window": "9" }), body: chatBody("draw") })
+    expect(res.status).toBe(200)
+    expect((await usageRows(booted)).rows.length).toBe(1)
+  })
