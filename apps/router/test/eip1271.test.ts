@@ -110,3 +110,117 @@ describe("contract wallets", () => {
     expect(admitChannel({ ...base, unlanded: 200_000n })).toEqual({ ok: false, error: "credit_limit" })
     expect(admitChannel({ ...base, unlanded: 150_000n }).ok).toBe(true)
   })
+
+  test("a wallet stops at its credit limit until its vouchers are on chain", async () => {
+    const booted = await bootStack()
+    const row = openChannel(booted, wallet, 2_000_000n)
+    const fake = fakeWallet()
+    booted.stack.wallets = fake.chain
+    await booted.stack.db.query("INSERT INTO shared.channel_state (channel_id, payer, latest_seq, cumulative, voucher_sig) VALUES ($1,$2,1,199995,'0x')", [id, wallet])
+    const body = chatBody("over")
+    const refused = await request(booted, { "x-offpeak-channel-auth": await walletProof(booted, fake, body) }, body)
+    expect(refused.status).toBe(402)
+    expect(((await refused.json()) as { error: { code: string } }).error.code).toBe("credit_limit")
+    row.claimed = 199_995n
+    const again = chatBody("landed")
+    expect((await request(booted, { "x-offpeak-channel-auth": await walletProof(booted, fake, again) }, again)).status).toBe(200)
+  })
+
+  test("a wallet slower than the limit is refused in time, as unavailable rather than as a forgery", async () => {
+    const booted = await bootStack()
+    openChannel(booted)
+    const fake = fakeWallet({ delayMs: WALLET_CHECK_MS * 4 })
+    booted.stack.wallets = fake.chain
+    const body = chatBody("slow")
+    const proof = await walletProof(booted, fake, body)
+    const t0 = performance.now()
+    const res = await request(booted, { "x-offpeak-channel-auth": proof }, body)
+    expect(res.status).toBe(503)
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("verify_unavailable")
+    expect(performance.now() - t0).toBeLessThan(WALLET_CHECK_MS * 3)
+  })
+
+  test("with no chain access a contract wallet is refused, not trusted", async () => {
+    const booted = await bootStack()
+    openChannel(booted)
+    const fake = fakeWallet()
+    const body = chatBody("no rpc")
+    expect((await request(booted, { "x-offpeak-channel-auth": await walletProof(booted, fake, body) }, body)).status).toBe(401)
+  })
+})
+
+describe("ordinary keys", () => {
+  test("a good EOA signature makes no chain call at all", async () => {
+    const booted = await bootStack()
+    openChannel(booted, booted.buyer as Hex)
+    const fake = fakeWallet()
+    booted.stack.wallets = fake.chain
+    const body = chatBody("eoa")
+    const auth = await channelAuthHeader(roleAccount("buyer"), { channelId: id, ts: booted.stack.clock(), body })
+    expect((await request(booted, { "x-offpeak-channel-auth": auth }, body)).status).toBe(200)
+    expect(fake.calls).toEqual({ code: 0, sig: 0 })
+  })
+
+  test("bad signatures on an EOA cost one code read, and never a wallet call", async () => {
+    const booted = await bootStack()
+    openChannel(booted, booted.buyer as Hex)
+    const fake = fakeWallet({ code: false })
+    booted.stack.wallets = fake.chain
+    for (let i = 0; i < 5; i++) {
+      const body = chatBody(`forged ${i}`)
+      const auth = await channelAuthHeader(roleAccount("host"), { channelId: id, ts: booted.stack.clock(), body })
+      expect((await request(booted, { "x-offpeak-channel-auth": auth }, body)).status).toBe(401)
+    }
+    expect(fake.calls).toEqual({ code: 1, sig: 0 })
+  })
+
+  test("a proof cannot be replayed in its other signature form", async () => {
+    const booted = await bootStack()
+    openChannel(booted, booted.buyer as Hex)
+    const body = chatBody("once")
+    const auth = await channelAuthHeader(roleAccount("buyer"), { channelId: id, ts: booted.stack.clock(), body })
+    expect((await request(booted, { "x-offpeak-channel-auth": auth }, body)).status).toBe(200)
+    const proof = JSON.parse(Buffer.from(auth, "base64url").toString("utf8")) as { ts: number; nonce: string; sig: Hex }
+    const n = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n
+    const s = BigInt(`0x${proof.sig.slice(66, 130)}`)
+    const flipped = `${proof.sig.slice(0, 66)}${(n - s).toString(16).padStart(64, "0")}${proof.sig.slice(130) === "1b" ? "1c" : "1b"}`
+    const twin = Buffer.from(JSON.stringify({ ...proof, sig: flipped })).toString("base64url")
+    expect((await request(booted, { "x-offpeak-channel-auth": twin }, body)).status).toBe(401)
+  })
+})
+
+describe("the RPC wallet check", () => {
+  const rpcServer = (port: number, handle: (method: string, params: unknown[]) => unknown, delayMs = 0) =>
+    Bun.serve({
+      port,
+      hostname: "127.0.0.1",
+      fetch: async (req) => {
+        const { id: rpcId, method, params } = (await req.json()) as { id: number; method: string; params: unknown[] }
+        if (delayMs) await Bun.sleep(delayMs)
+        const reply = handle(method, params)
+        return Response.json(reply instanceof Error ? { jsonrpc: "2.0", id: rpcId, error: { code: 3, message: reply.message } } : { jsonrpc: "2.0", id: rpcId, result: reply })
+      },
+    })
+  const digest = keccak256(toBytes("digest"))
+  const magic = "0x1626ba7e00000000000000000000000000000000000000000000000000000000"
+
+  test("a yes needs the exact magic value, and a revert is a no", async () => {
+    let answer: unknown = magic
+    const server = rpcServer(34501, (method) => (method === "eth_getCode" ? "0x60" : answer))
+    const wallets = rpcWallets("http://127.0.0.1:34501")
+    expect(await wallets.hasCode(wallet)).toBe(true)
+    expect(await wallets.isValidSignature(wallet, digest, "0x1234")).toBe(true)
+    answer = "0xffffffff00000000000000000000000000000000000000000000000000000000"
+    expect(await wallets.isValidSignature(wallet, digest, "0x1234")).toBe(false)
+    answer = new Error("execution reverted")
+    expect(await wallets.isValidSignature(wallet, digest, "0x1234")).toBe(false)
+    server.stop(true)
+  })
+
+  test("a node that does not answer in time is a failure, not a no", async () => {
+    const server = rpcServer(34502, () => magic, WALLET_CHECK_MS * 3)
+    const wallets = rpcWallets("http://127.0.0.1:34502")
+    await expect(wallets.isValidSignature(wallet, digest, "0x1234")).rejects.toThrow()
+    server.stop(true)
+  })
+})
