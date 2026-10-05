@@ -221,3 +221,168 @@ const facilitatorCall = async (path: string, body: unknown, headers: Record<stri
   const res = await fac.request(path, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) })
   return (await res.json()) as Record<string, unknown>
 }
+
+const requirements = () => ({ payTo: contract("OffpeakVault"), asset: contract("MockUSDG"), maxAmountRequired: "100000" })
+
+async function until(check: () => Promise<boolean>, what: string, ms = 15_000) {
+  const end = performance.now() + ms
+  while (performance.now() < end) {
+    if (await check()) return
+    await Bun.sleep(20)
+  }
+  throw new Error(`timed out waiting for ${what}`)
+}
+
+/** A slow, flaky link. Half of its failures lose the response after the node has already acted on the call. */
+function flakyRpc(target: string) {
+  return Bun.serve({
+    port: PROXY_PORT,
+    async fetch(req) {
+      const body = await req.text()
+      await Bun.sleep(Math.random() * 40)
+      const roll = Math.random()
+      if (roll < 0.05) return new Response("overloaded", { status: 503 })
+      const response = await fetch(target, { method: "POST", headers: { "content-type": "application/json" }, body })
+      return roll < 0.1 ? new Response("lost", { status: 503 }) : response
+    },
+  })
+}
+
+beforeAll(async () => {
+  const redis = new Redis(REDIS)
+  await redis.flushdb()
+  redis.disconnect()
+  chain = await startLocalChain(PORT)
+  reader = createPublicClient({ transport: http(chain.rpcUrl), pollingInterval: 20 }) as PublicClient
+  booted = await bootStack({ live: { indexerUrl: `http://127.0.0.1:${API_PORT}`, facilitatorUrl: `http://127.0.0.1:${FAC_PORT}`, token: TOKEN } })
+  db = booted.stack.db
+  await applySchemas(db, { shared: false })
+  process.env.OFFPEAK_INTERNAL_TOKEN = TOKEN
+
+  const bond = 2_000_000_000n
+  await send(host, contract("MockUSDG"), MockUSDGAbi, "approve", [contract("HostRegistry"), bond])
+  await send(host, contract("HostRegistry"), HostRegistryAbi, "register", [
+    {
+      modelDigests: [booted.modelDigest],
+      maxTps: [100],
+      imageDigest: booted.imageDigest,
+      gpuClass: keccak256(toBytes("h100-80g-sxm")),
+      endpointHash: keccak256(toBytes("http://host.local")),
+      attestationRef: `0x${"00".repeat(32)}`,
+      bondUsdg: bond,
+      bondOfpk: 0n,
+    },
+  ])
+  await send(agent, contract("MockUSDG"), MockUSDGAbi, "mint", [agent.address, 1_000_000_000n])
+  await send(agent, contract("MockUSDG"), MockUSDGAbi, "approve", [contract("ChannelManager"), 1_000_000_000n])
+  await send(agent, contract("MockUSDG"), MockUSDGAbi, "approve", [PERMIT2, 1_000_000_000n])
+
+  ingest = {
+    db,
+    reader,
+    contracts: chain.contracts,
+    confirmations: 1,
+    publish: (msg) => {
+      pushes.push(msg)
+      booted.chain!.push(JSON.parse(encodePush(msg)))
+    },
+  }
+  await tick(ingest, ingestState)
+  api = createApi({ db, reader, contracts: chain.contracts, internalToken: TOKEN, metrics })
+  apiServer = Bun.serve({ port: API_PORT, fetch: api.fetch })
+  workers = signerAccounts.map((account) => ({
+    db,
+    reader,
+    writer: createWalletClient({ account, transport: http(chain.rpcUrl), chain: null }) as never,
+    account: account as never,
+    chainId: 4663,
+    contracts: chain.contracts,
+    routerAddress: router.address,
+    settlers: signerAccounts.map((s) => s.address),
+    metrics,
+  }))
+  keeper = {
+    db,
+    reader,
+    writer: createWalletClient({ account: keeperAccount, transport: http(chain.rpcUrl), chain: null }) as never,
+    account: keeperAccount as never,
+    contracts: chain.contracts,
+    metrics,
+  }
+
+  const publish = (msg: Record<string, unknown>) => {
+    facilitatorPushes.push(msg)
+    booted.chain!.push(JSON.parse(encodePush(msg)))
+  }
+  batcher = new RelayBatcher({
+    db,
+    reader,
+    writer: createWalletClient({ account: relay, transport: http(chain.rpcUrl), chain: null }) as never,
+    account: relay,
+    escrow: contract("X402Escrow"),
+    metrics,
+    publish,
+    nativeUsd: 3_000,
+    flushMs: 20,
+  })
+  captures = new CaptureQueue({
+    reader,
+    writer: createWalletClient({ account: capturer, transport: http(chain.rpcUrl), chain: null }) as never,
+    account: capturer,
+    escrow: contract("X402Escrow"),
+    metrics,
+    redisUrl: REDIS,
+    nativeUsd: 3_000,
+    flushMs: 50,
+  })
+  batcher.start()
+  captures.start()
+  fac = facilitatorApp({
+    verify: {
+      db,
+      reader,
+      usdg: contract("MockUSDG"),
+      vault: contract("OffpeakVault"),
+      escrow: contract("X402Escrow"),
+      relay: relay.address,
+      relayFloorWei: 1n,
+      denylist: new Denylist(),
+    },
+    db,
+    batcher,
+    captures,
+    internalToken: TOKEN,
+    metrics,
+  })
+  facServer = Bun.serve({ port: FAC_PORT, fetch: fac.fetch })
+}, 180_000)
+
+afterAll(async () => {
+  apiServer?.stop(true)
+  facServer?.stop(true)
+  batcher?.stop()
+  await captures?.stop()
+  chain?.stop()
+})
+
+describe("IC4", () => {
+  let hour = 0
+  let channel: Hex
+  let claimedOnChain = 0n
+
+  test("an agent opens a channel, makes 1,000 calls, and the keeper claims as it goes", async () => {
+    const start = hourEnd(hourIndex(await chainTime())) + 5
+    hour = hourIndex(start)
+    await mineAt(start)
+    channel = await openChannel(50_000_000n)
+
+    const checkpoints = new Set([250, 500, 750])
+    await runCalls(channel, CALLS, async (done) => {
+      if (!checkpoints.has(done)) return
+      await mineAt((await chainTime()) + 301)
+      expect(await runChannelClaim(keeper)).toEqual([channel])
+      await tick(ingest, ingestState)
+      const onChain = await channelOf(channel)
+      expect(onChain.claimed).toBeGreaterThan(claimedOnChain)
+      claimedOnChain = onChain.claimed
+    })
