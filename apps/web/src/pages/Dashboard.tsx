@@ -417,3 +417,114 @@ function Keys() {
     </Section>
   )
 }
+
+function Audit({ summary }: { summary: Summary }) {
+  const { token } = useSession()
+  const client = useQueryClient()
+  const [failure, setFailure] = useState<unknown>(null)
+  const [busy, setBusy] = useState(false)
+  const flip = async (optIn: boolean) => {
+    setBusy(true)
+    setFailure(null)
+    try {
+      await trpcMutation("account.setAuditOptIn", { optIn }, token)
+      await client.invalidateQueries({ queryKey: ["account.summary"] })
+    } catch (error) {
+      setFailure(error)
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <Section id="audit" title="Audit sampling">
+      <label className="toggle">
+        <input type="checkbox" checked={summary.auditOptIn} disabled={busy} onChange={(event) => void flip(event.target.checked)} />
+        <span>
+          <strong>Opt in for 1% off.</strong> Your fee is {formatBps(summary.feeBps)} of the host cost now.
+        </span>
+      </label>
+      <p className="note">A random 2% of your requests keep the prompt and output, encrypted, so audits can test that hosts serve the model they claim. Audit sampling stores request bodies for up to 72 hours, only if you opt in. Requests already sampled stay until those 72 hours end.</p>
+      {failure !== null && <Failed error={failure} />}
+    </Section>
+  )
+}
+
+function Disputes({ reqId, setReqId, material, dropMaterial }: { reqId: string; setReqId: (reqId: string) => void; material: Material | null; dropMaterial: () => void }) {
+  const { token } = useSession()
+  const disputes = useAuthed<Dispute[]>("disputes.list")
+  const client = useQueryClient()
+  const [reason, setReason] = useState("")
+  const [failure, setFailure] = useState<string | null>(null)
+  const valid = /^0x[0-9a-fA-F]{64}$/.test(reqId.trim())
+  const submit = async (event: FormEvent) => {
+    event.preventDefault()
+    setFailure(null)
+    try {
+      await trpcMutation("disputes.open", { reqIds: [reqId.trim() as Hex], reason: reason.trim(), ...(material ? { material } : {}) }, token)
+      setReqId("")
+      setReason("")
+      dropMaterial()
+      await client.invalidateQueries({ queryKey: ["disputes.list"] })
+    } catch (error) {
+      setFailure(error instanceof ApiError ? explain(error) : "That did not go through.")
+    }
+  }
+  return (
+    <Section id="disputes" title="Disputes">
+      <p className="note">Dispute any request within 7 days. Automatic checks recount tokens and verify signatures and the price against the sheet. Upheld disputes are refunded to your vault balance. You get a reply within 72 hours.</p>
+      <Data query={disputes} lines={2}>
+        {(rows) =>
+          rows.length > 0 ? (
+            <table className="ledger">
+              <thead>
+                <tr>
+                  <th>Dispute</th>
+                  <th>Requests</th>
+                  <th>Reason</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row) => (
+                  <tr key={row.id}>
+                    <td data-label="Dispute">{row.id}</td>
+                    <td data-label="Requests">{row.reqIds.length}</td>
+                    <td data-label="Reason">{row.reason}</td>
+                    <td data-label="Status">
+                      <span className="pill wait">{row.outcome ?? "In review"}</span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <Empty title="No disputes." />
+          )
+        }
+      </Data>
+      <form className="panel" onSubmit={(event) => void submit(event)}>
+        <div className="fields">
+          <Field label="Request id" hint="Open a record under Usage and choose Dispute, or paste its id." error={reqId !== "" && !valid ? "A request id is 0x and 64 hex characters." : null}>
+            <input value={reqId} autoComplete="off" onChange={(event) => setReqId(event.target.value)} placeholder="0x…" />
+          </Field>
+          <Field label="What looks wrong">
+            <input value={reason} maxLength={500} onChange={(event) => setReason(event.target.value)} placeholder="Token count looks high" />
+          </Field>
+        </div>
+        {material && (
+          <p className="note">
+            Your request body and output go with this dispute, so the router can recount it.{" "}
+            <button type="button" className="btn ghost small" onClick={dropMaterial}>
+              Leave them out
+            </button>
+          </p>
+        )}
+        <button type="submit" className="btn ghost" disabled={!valid || reason.trim() === ""}>
+          Open dispute
+        </button>
+        {failure && <p className="field-error">{failure}</p>}
+      </form>
+    </Section>
+  )
+}
+
