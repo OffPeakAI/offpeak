@@ -394,3 +394,168 @@ describe("trustRouterVerification: false", () => {
     const { op } = client(booted, {}, own(booted), { publicClient: reader(booted, { attestationRef: `0x${"44".repeat(32)}` }) })
     expect((await op.sealed.check(MODEL))[0]!.reasons).toContain("attestation_ref")
   })
+
+  test("with no chain access the registry cannot be confirmed, so no host passes", async () => {
+    const booted = await rig()
+    const { op } = client(booted, {}, own(booted))
+    expect((await op.sealed.check(MODEL))[0]!.reasons).toContain("attestation_ref")
+  })
+
+  test("an empty allow-list means no host passes", async () => {
+    const booted = await rig()
+    const { op } = client(booted, {}, own(booted, { measurements: [] }), { publicClient: reader(booted) })
+    expect((await op.sealed.check(MODEL))[0]!.reasons).toContain("measurement")
+  })
+})
+
+describe("op.sealed.chat", () => {
+  test("nothing the router receives holds the plaintext, and the prompt is not in any header", async () => {
+    const booted = await rig()
+    const { op, posts } = client(booted)
+    await op.sealed.chat(ask("private prompt text"))
+    expect(posts.length).toBe(1)
+    expect(Buffer.from(posts[0]!).includes("private prompt text")).toBe(false)
+  })
+
+  test("a stream the router cuts between frames is detected, even after text arrived", async () => {
+    const booted = await rig({ reply: () => ({ text: "a reply long enough to span a few frames" }) })
+    const { op } = client(booted, {
+      response: async (res) => {
+        const { salt, frames, headers } = await framesOf(res)
+        return new Response(concatBytes(salt, frames[0]!.raw), { headers })
+      },
+    })
+    await expect(op.sealed.chat(ask("cut me"))).rejects.toMatchObject({ code: "sealed_truncated" })
+  })
+
+  test("the router cannot cut the stream and call the last frame it kept final", async () => {
+    const booted = await rig({ reply: () => ({ text: "a reply long enough to span a few frames" }) })
+    const { op } = client(booted, {
+      response: async (res) => {
+        const { salt, frames, headers } = await framesOf(res)
+        const kept = frames[0]!.raw.slice()
+        expect(kept[0]).toBe(0x00)
+        kept[0] = 0x01
+        return new Response(concatBytes(salt, kept), { headers })
+      },
+    })
+    await expect(op.sealed.chat(ask("cut me"))).rejects.toMatchObject({ code: "sealed_bad_frame" })
+  })
+
+  test("a record over other bytes is refused", async () => {
+    const booted = await rig()
+    const { op } = client(booted, {
+      response: async (res) => {
+        const { salt, frames, headers } = await framesOf(res)
+        const trailer = JSON.parse(new TextDecoder().decode(frames.at(-1)!.body)) as { usage: { record: { outputHash: string } } }
+        trailer.usage.record.outputHash = `0x${"12".repeat(32)}`
+        return new Response(concatBytes(salt, ...frames.slice(0, -1).map((frame) => frame.raw), encodeTrailer(trailer)), { headers })
+      },
+    })
+    await expect(op.sealed.chat(ask("relabel me"))).rejects.toMatchObject({ code: "sealed_record_mismatch" })
+  })
+
+  test("a record that does not say sealed is refused, and so is one for another prompt or host", async () => {
+    const edit = (change: (usage: { sealed: boolean; record: { promptHash: string; host: string } }) => void) => ({
+      response: async (res: Response) => {
+        const { salt, frames, headers } = await framesOf(res)
+        const trailer = JSON.parse(new TextDecoder().decode(frames.at(-1)!.body)) as { usage: never }
+        change(trailer.usage)
+        return new Response(concatBytes(salt, ...frames.slice(0, -1).map((frame) => frame.raw), encodeTrailer(trailer)), { headers })
+      },
+    })
+    const booted = await rig()
+    await expect(client(booted, edit((usage) => void (usage.sealed = false))).op.sealed.chat(ask("a"))).rejects.toMatchObject({ code: "sealed_record_mismatch" })
+    await expect(client(booted, edit((usage) => void (usage.record.promptHash = `0x${"12".repeat(32)}`))).op.sealed.chat(ask("b"))).rejects.toMatchObject({ code: "sealed_record_mismatch" })
+    await expect(client(booted, edit((usage) => void (usage.record.host = `0x${"12".repeat(20)}`))).op.sealed.chat(ask("c"))).rejects.toMatchObject({ code: "sealed_record_mismatch" })
+  })
+
+  test("a record for another model is refused", async () => {
+    const booted = await rig()
+    const hook = editTrailer((trailer) => void (trailer.usage.record.modelDigest = `0x${"12".repeat(32)}`))
+    await expect(client(booted, hook).op.sealed.chat(ask("relabel"))).rejects.toMatchObject({ code: "sealed_record_mismatch" })
+  })
+
+  test("a record whose signatures do not hold is refused", async () => {
+    const booted = await rig()
+    const flip = (sig: string) => `${sig.slice(0, 10)}${sig[10] === "0" ? "1" : "0"}${sig.slice(11)}`
+    const host = editTrailer((trailer) => void (trailer.usage.hostSig = flip(trailer.usage.hostSig)))
+    const router = editTrailer((trailer) => void (trailer.usage.routerSig = flip(trailer.usage.routerSig)))
+    const billed = editTrailer((trailer) => void (trailer.usage.record.hostCostMicro = "999999"))
+    await expect(client(booted, host).op.sealed.chat(ask("a"))).rejects.toMatchObject({ code: "sealed_record_mismatch" })
+    await expect(client(booted, router).op.sealed.chat(ask("b"))).rejects.toMatchObject({ code: "sealed_record_mismatch" })
+    await expect(client(booted, billed).op.sealed.chat(ask("c"))).rejects.toMatchObject({ code: "sealed_record_mismatch" })
+  })
+
+  test("a reply with no signed counts, or with counts changed, has no usable record", async () => {
+    const booted = await rig()
+    const missing = editTrailer((trailer) => void delete trailer.counts)
+    const raised = editTrailer((trailer) => void (trailer.counts.tokensOut += 1))
+    const forged = editTrailer((trailer) => void (trailer.counts.sig = `0x${"12".repeat(65)}`))
+    await expect(client(booted, missing).op.sealed.chat(ask("a"))).rejects.toMatchObject({ code: "sealed_counts_mismatch" })
+    await expect(client(booted, raised).op.sealed.chat(ask("b"))).rejects.toMatchObject({ code: "sealed_counts_mismatch" })
+    await expect(client(booted, forged).op.sealed.chat(ask("c"))).rejects.toMatchObject({ code: "sealed_counts_mismatch" })
+  })
+
+  test("the envelope's counts must be the ones the VM signed", async () => {
+    const booted = await rig()
+    const hook = editTrailer((trailer) => void (trailer.usage.hostCounts.tokensOut += 1))
+    await expect(client(booted, hook).op.sealed.chat(ask("a"))).rejects.toMatchObject({ code: "sealed_counts_mismatch" })
+  })
+
+  test("a reply with no record fails at final()", async () => {
+    const booted = await rig()
+    const { op } = client(booted, {
+      response: async (res) => {
+        const { salt, frames, headers } = await framesOf(res)
+        return new Response(concatBytes(salt, ...frames.slice(0, -1).map((frame) => frame.raw)), { headers })
+      },
+    })
+    await expect(op.sealed.chat(ask("no record"))).rejects.toMatchObject({ code: "no_usage_record" })
+  })
+
+  test("a stream can be read once", async () => {
+    const booted = await rig()
+    const stream = await client(booted).op.sealed.chat({ ...ask("once"), stream: true })
+    await stream.final()
+    const again = async () => {
+      for await (const _ of stream) void _
+    }
+    await expect(again()).rejects.toMatchObject({ code: "stream_used" })
+  })
+
+  test("a host chosen earlier can be reused", async () => {
+    const booted = await rig()
+    const { op } = client(booted)
+    const [host] = await op.sealed.hosts(MODEL)
+    expect((await op.sealed.chat(ask("reuse"), { host })).host).toBe(booted.host as never)
+  })
+
+  test("tools come back whole", async () => {
+    const booted = await rig({ reply: () => ({ text: "", toolCalls: [{ id: "call_1", type: "function", function: { name: "lookup", arguments: '{"q":1}' } }] }) })
+    const result = await client(booted).op.sealed.chat(ask("use a tool"))
+    expect(result.toolCalls).toEqual([{ id: "call_1", type: "function", function: { name: "lookup", arguments: '{"q":1}' } }])
+  })
+})
+
+describe("the rules themselves", () => {
+  test("the report data is the bindings hash then the nonce", async () => {
+    const booted = await rig()
+    const nonce = `0x${"ab".repeat(32)}` as Hex
+    const bindings = booted.sealed.bootBindings
+    expect(bytesToHex(reportDataFor(bindings, nonce))).toBe(`${bindingsHash(bindings)}${nonce.slice(2)}`)
+  })
+
+  test("attestationRef is the sha256 of the boot quote", async () => {
+    const booted = await rig()
+    expect(attestationRefOf(booted.sealed.bootQuote)).toBe(sha256Hex(hexToBytes(booted.sealed.bootQuote)))
+  })
+
+  test("an honest transcript passes the router's own rules with its own allow-list", async () => {
+    const booted = await rig()
+    const { transcript } = booted.stack.attest!.hosts.get(booted.host)!
+    const measurements = booted.stack.attest!.config.measurements
+    expect(checkTranscript(transcript, { host: booted.host, now: booted.stack.clock(), measurements })).toEqual([])
+    expect(checkTranscript(transcript, { host: booted.host, now: booted.stack.clock(), measurements: [] })).toContain("measurement")
+  })
+})
