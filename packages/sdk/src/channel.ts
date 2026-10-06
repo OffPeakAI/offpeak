@@ -323,3 +323,140 @@ export class Channels {
     }
     throw new OffpeakError("channel_not_seen", "Channel is open on chain, but the router has not seen it yet", undefined, { channelId: id })
   }
+
+  private proof(ch: Active, body: string) {
+    return channelAuthHeader(this.needSigner(), { channelId: ch.id, ts: nowSeconds(), body })
+  }
+
+  /** A record counts once, and only if it is signed, adds up, names a registered host, and belongs to this payer and channel, under any cap on the request. */
+  private async count(ch: Active, envelope: UsageEnvelope, cap: MaxPrice | undefined) {
+    const { record } = envelope
+    if (ch.counted.has(record.reqId)) {
+      ch.refused = `Record ${record.reqId} was reported twice`
+      return
+    }
+    const report = await this.ctx.verify(envelope, { payer: this.needSigner().address })
+    if (!report.ok) {
+      ch.refused = `Usage record failed: ${report.reasons.join(", ")}`
+      return
+    }
+    if (!report.hostRegistered) {
+      ch.refused = `Record ${record.reqId} names a host that could not be checked against the registry`
+      return
+    }
+    if (record.payMode !== 3 || record.payRef.toLowerCase() !== ch.id) {
+      ch.refused = `Record ${record.reqId} is not for this channel`
+      return
+    }
+    if (cap && overMaxPrice(record, cap)) {
+      ch.refused = `Record ${record.reqId} bills above your max price`
+      return
+    }
+    ch.counted.add(record.reqId)
+    ch.verified += record.hostCostMicro + record.feeMicro
+  }
+
+  /** Signs the highest reported amount the verified records cover. A voucher is never signed on the router's word. */
+  private async signLatest(ch: Active) {
+    const covered = ch.reported.filter((owed) => owed > ch.signed && owed <= ch.verified && owed <= ch.deposit)
+    const target = covered.reduce<Micro | null>((best, owed) => (best === null || owed > best ? owed : best), null)
+    if (target !== null) await this.sign(ch, target)
+    ch.reported = ch.reported.filter((owed) => owed > ch.signed)
+    if (ch.inFlight > 0 || ch.reported.length === 0) return
+    const top = ch.reported.reduce((best, owed) => (owed > best ? owed : best))
+    ch.refused ??= top > ch.deposit ? `Owed ${top} is above the deposit` : `Owed ${top} is above the ${ch.verified} covered by verified records`
+  }
+
+  private async sign(ch: Active, cumulative: Micro) {
+    const seq = ch.seq + 1n
+    const sig = await this.needSigner().signTypedData({
+      domain: domain("OffpeakChannel", this.ctx.book.contract("ChannelManager")),
+      types: voucherTypes,
+      primaryType: "Voucher",
+      message: { channelId: ch.id, seq, cumulative },
+    })
+    ch.seq = seq
+    ch.signed = cumulative
+    ch.outbox = { seq, cumulative, sig, delivered: false }
+  }
+
+  /** A voucher lost in transit stays queued for the next request. A refused one is dropped, so it cannot block that request. */
+  private async deliver(ch: Active, receipt: VoucherReceipt, strict: boolean) {
+    const body = JSON.stringify({ seq: receipt.seq.toString(), cumulative: receipt.cumulative.toString(), sig: receipt.sig })
+    let res: Response
+    try {
+      res = await this.ctx.fetch(`${this.ctx.baseURL}/v1/channels/${ch.id}/voucher`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-offpeak-channel": ch.id, "x-offpeak-channel-auth": await this.proof(ch, body) },
+        body,
+      })
+    } catch (err) {
+      if (strict) throw new OffpeakError("voucher_undelivered", "Voucher could not be sent. It goes with the next request.", undefined, { cause: String(err) })
+      return
+    }
+    if (ch.outbox === receipt) ch.outbox = null
+    if (res.ok) {
+      receipt.delivered = true
+      ch.accepted = receipt.cumulative
+      return
+    }
+    const refused = await errorFrom(res)
+    ch.signed = ch.accepted
+    ch.refused = `Router refused voucher ${receipt.seq}: ${refused.message}`
+    if (strict) throw refused
+  }
+
+  private async closeTogether(ch: Active, finalCumulative: Micro, reader: PublicClient, writer: WalletClient): Promise<{ txHash: Hex } | { refused: string }> {
+    const signer = this.needSigner()
+    const deadline = BigInt(nowSeconds() + CLOSE_DEADLINE_S)
+    const payerSig = await signer.signTypedData({
+      domain: domain("OffpeakChannel", this.ctx.book.contract("ChannelManager")),
+      types: coopCloseTypes,
+      primaryType: "CooperativeClose",
+      message: { channelId: ch.id, finalCumulative, deadline },
+    })
+    const body = JSON.stringify({ finalCumulative: finalCumulative.toString(), deadline: deadline.toString(), payerSig })
+    let res: Response
+    try {
+      res = await this.ctx.fetch(`${this.ctx.baseURL}/v1/channels/${ch.id}/close`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-offpeak-channel": ch.id, "x-offpeak-channel-auth": await this.proof(ch, body) },
+        body,
+      })
+    } catch {
+      return { refused: "router could not be reached" }
+    }
+    if (!res.ok) return { refused: `router refused: ${(await errorFrom(res)).message}` }
+    const reply = closeReply.safeParse(await res.json().catch(() => null))
+    if (!reply.success) return { refused: "router answer has the wrong shape" }
+    const wrong = this.closeCallError(reply.data, ch.id, finalCumulative, deadline, payerSig)
+    if (wrong) return { refused: wrong }
+    const { to, data } = reply.data
+    const account = writer.account!
+    try {
+      await reader.call({ account, to, data, value: 0n })
+      const txHash = await writer.sendTransaction({ account, chain: writer.chain ?? null, to, data, value: 0n })
+      const receipt = await reader.waitForTransactionReceipt({ hash: txHash, pollingInterval: RECEIPT_POLL_MS })
+      return receipt.status === "success" ? { txHash } : { refused: "close transaction reverted" }
+    } catch {
+      return { refused: "close transaction would not go through" }
+    }
+  }
+
+  /** The wallet is about to send what the router wrote, so it must be exactly the call this client asked for. */
+  private closeCallError(reply: z.output<typeof closeReply>, id: Hex, finalCumulative: Micro, deadline: bigint, payerSig: Hex): string | null {
+    if (reply.to !== this.ctx.book.contract("ChannelManager")) return "router named another contract"
+    if (reply.chainId !== CHAIN_ID) return "router named another chain"
+    let call: ReturnType<typeof decodeFunctionData<typeof ChannelManagerAbi>>
+    try {
+      call = decodeFunctionData({ abi: ChannelManagerAbi, data: reply.data })
+    } catch {
+      return "router calldata cannot be read"
+    }
+    if (call.functionName !== "cooperativeClose") return "router calldata is not a cooperative close"
+    const [channelId, terms, sentSig, routerSig] = call.args
+    const same = channelId === id && terms.channelId === id && terms.finalCumulative === finalCumulative && terms.deadline === deadline
+    if (!same || sentSig.toLowerCase() !== payerSig.toLowerCase() || routerSig.toLowerCase() !== reply.routerSig.toLowerCase()) return "router calldata does not match the close you signed"
+    return null
+  }
+}

@@ -126,3 +126,122 @@ function Recount({ row, onDispute }: { row: UsageRow; onDispute: OnDispute }) {
     </details>
   )
 }
+
+function Row({ row, network, serverTime, onDispute }: { row: UsageRow; network: Network | undefined; serverTime: number; onDispute: OnDispute }) {
+  const [open, setOpen] = useState(false)
+  const now = useNow(serverTime)
+  const reqId = row.record.reqId
+  const checks = useQuery({
+    queryKey: ["verify", reqId, network?.routerSigner],
+    queryFn: () => verifyRecord(row, { routerSigner: network!.routerSigner, usageLedger: network!.usageLedger }),
+    enabled: Boolean(network),
+    staleTime: Infinity,
+  })
+  const shown = verdict(checks.data ?? null)
+  const provable = proofState(row, null, now)
+  const settled = Boolean(row.settledTx)
+  return (
+    <li className={row.status === "void" ? "usage-row void" : "usage-row"}>
+      <button type="button" className="usage-line" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
+        <span className="usage-when">{formatUtc(row.record.ts)}</span>
+        <span className="usage-model">{row.model ?? "Unknown model"}</span>
+        <span className="usage-tokens">
+          {formatTokens(row.record.tokensIn)} in · {formatTokens(row.record.tokensOut)} out
+        </span>
+        <span className="usage-cost">{row.record.payMode === 4 ? <span className="note">Window draw</span> : <Usdg micro={buyerTotal(row.record)} />}</span>
+        <span className={`pill ${shown.tone}`}>{shown.label}</span>
+        <span className={`pill ${settled ? "ok" : "wait"}`}>{settled ? "Settled" : provable.state === "open" ? "Hour open" : "Awaiting proof"}</span>
+      </button>
+      {open && <Detail row={row} network={network} checks={checks.data ? checkLines(checks.data) : null} now={now} onDispute={onDispute} />}
+    </li>
+  )
+}
+
+function Detail({ row, network, checks, now, onDispute }: { row: UsageRow; network: Network | undefined; checks: Line[] | null; now: number; onDispute: OnDispute }) {
+  const reqId = row.record.reqId
+  const full = useAuthed<UsageRow & { proof: ProofRow | null }>("usage.get", { reqId })
+  const proof = full.data ? proofState(row, full.data.proof, now) : null
+  const { data: walletClient } = useWalletClient()
+  const onchain = useQuery({
+    queryKey: ["verifyLeaf", reqId, full.data?.proof?.root],
+    enabled: Boolean(walletClient && full.data?.proof && network),
+    staleTime: Infinity,
+    queryFn: () =>
+      walletClient!.extend(publicActions).readContract({
+        address: network!.usageLedger,
+        abi: UsageLedgerAbi,
+        functionName: "verifyLeaf",
+        args: [BigInt(row.hour), row.leaf, full.data!.proof!.proof as Hex[]],
+      }),
+  })
+  const { stage } = useSession()
+  const envelope = {
+    v: 1,
+    record: row.record,
+    routerSig: row.routerSig,
+    hostSig: row.hostSig,
+    leaf: row.leaf,
+    sealed: row.sealed,
+    proofUrl: `/v1/usage/${reqId}`,
+  }
+  return (
+    <div className="usage-detail">
+      <div>
+        <h4>Local verification</h4>
+        {checks ? (
+          <ul className="ticks">
+            {checks.map((line) => (
+              <Tick key={line.label} line={line} />
+            ))}
+            {proof && <Tick line={proofLine(proof)} />}
+            {proof?.state === "proven" && onchain.data !== undefined && <Tick line={{ label: "On chain", tone: onchain.data ? "ok" : "fail", detail: onchain.data ? "UsageLedger confirmed this leaf through your wallet's RPC." : "UsageLedger did not confirm this leaf." }} />}
+          </ul>
+        ) : (
+          <p className="note">Checking…</p>
+        )}
+        {row.sealed ? <p className="note">Sealed record: the token counts come from the attested host, since the router cannot read the request.</p> : <Recount row={row} onDispute={onDispute} />}
+        {full.isError && <Failed error={full.error} retry={() => void full.refetch()} />}
+      </div>
+      <div>
+        <h4>Record</h4>
+        <dl className="facts">
+          <dt>Request</dt>
+          <dd>
+            <Mono value={reqId} />
+          </dd>
+          <dt>Host</dt>
+          <dd>
+            <Mono value={row.record.host} />
+          </dd>
+          <dt>Paid by</dt>
+          <dd>{PAY_MODES[row.record.payMode] ?? "Unknown"}</dd>
+          <dt>Host cost</dt>
+          <dd>
+            <Usdg micro={row.record.hostCostMicro} />
+          </dd>
+          <dt>Fee</dt>
+          <dd>
+            <Usdg micro={row.record.feeMicro} />
+          </dd>
+          {proof?.state === "proven" && (
+            <>
+              <dt>Settled in</dt>
+              <dd>
+                <Mono value={proof.txHash} />
+              </dd>
+            </>
+          )}
+        </dl>
+        <details>
+          <summary>Envelope</summary>
+          <pre>{JSON.stringify(envelope, null, 2)}</pre>
+        </details>
+        {stage === "ready" && disputeOpen(row.record.ts, now) && (
+          <button type="button" className="btn ghost small" onClick={() => onDispute(reqId)}>
+            Dispute this request
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
