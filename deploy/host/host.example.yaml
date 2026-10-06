@@ -1,0 +1,26 @@
+# Copy to /etc/offpeak/host.yaml and fill in your own operator and endpoint.
+operator: "0xabababababababababababababababababababab"
+endpoint: https://host.example.net
+gpuClass: h100-80g-sxm
+# Same digest as compose.yaml. Registered on chain, and checked against that registration at boot.
+image: vllm/vllm-openai@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34
+# The router's signing address. Boot refuses if it differs from UsageLedger.routerSigner.
+router: "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+# Plain HTTP, so it stays on loopback. A TLS proxy serves `endpoint` and forwards here. Boot refuses anything else outside local.
+listen:
+  host: 127.0.0.1
+  port: 8790
+dataDir: /var/lib/offpeak
+models:
+  - name: qwen2.5-0.5b-instruct
+    path: /models/current
+    manifest: /etc/offpeak/manifests/qwen2.5-0.5b-instruct.json
+    maxTps: 400
+    # Only tensor parallel size, max model len, dtype and prefix caching, with values from the manifest's recipe.
+    vllmArgs:
+      - --tensor-parallel-size=1
+      - --max-model-len=8192
+      - --dtype=auto
+      - --enable-prefix-caching
+    # Set to true to take night jobs, which bill a locked price that can sit outside the hour's band.
+    nightJobs: false

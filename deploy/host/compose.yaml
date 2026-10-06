@@ -1,0 +1,54 @@
+# One model on one host. Run `offpeak-host init` first, then:
+#   docker compose -f deploy/host/compose.yaml --env-file /var/lib/offpeak/vllm-<model>.env up -d
+# A host with several models runs one vLLM per model, each on its own port, and sets `engine` in host.yaml.
+#
+# The vLLM digest is vllm/vllm-openai:v0.32.0 as published on Docker Hub, read from the registry on 2026-11-02.
+# It must equal `image` in host.yaml and the digest registered on chain.
+#
+# The agent speaks plain HTTP, so its port is published on this machine's loopback only. Your TLS proxy
+# terminates the public `endpoint` and forwards to it. See docs/runbooks/deploy-host.md.
+name: offpeak-host
+
+services:
+  vllm:
+    image: vllm/vllm-openai@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34
+    container_name: offpeak-vllm
+    runtime: nvidia
+    restart: unless-stopped
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      VLLM_NO_USAGE_STATS: "1"
+      DO_NOT_TRACK: "1"
+    # Listens on loopback. The agent shares this network namespace, so it is the only way in.
+    command: --model=/models/current --host=127.0.0.1 --port=8000 ${VLLM_ARGS:?run offpeak-host init and pass its env file}
+    ports:
+      - "127.0.0.1:${OFFPEAK_AGENT_PORT:-8790}:8790"
+    volumes:
+      - ${OFFPEAK_MODEL_DIR:?set the folder that holds the model}:/models/current:ro
+
+  agent:
+    build:
+      context: ../..
+      dockerfile: deploy/host/Dockerfile.agent
+    depends_on:
+      - vllm
+    network_mode: service:vllm
+    # nvidia-smi only. vLLM alone runs on the cards.
+    runtime: nvidia
+    restart: unless-stopped
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: utility
+      OFFPEAK_ENV: ${OFFPEAK_ENV:-mainnet}
+      OFFPEAK_RPC_URL: ${OFFPEAK_RPC_URL:?set the rpc url}
+      OFFPEAK_DEPLOYMENT_FILE: /etc/offpeak/deployment.json
+      OFFPEAK_HOST_OPERATOR_KEY: ${OFFPEAK_HOST_OPERATOR_KEY:?set the operator key}
+      OFFPEAK_HOST_CONFIG: /etc/offpeak/host.yaml
+      # The container's own interface, reachable only through the loopback port published above.
+      OFFPEAK_AGENT_BIND: 0.0.0.0
+    volumes:
+      - ${OFFPEAK_CONFIG_DIR:-/etc/offpeak}:/etc/offpeak:ro
+      - ${OFFPEAK_MODEL_DIR:?set the folder that holds the model}:/models/current:ro
+      - ${OFFPEAK_DATA_DIR:-/var/lib/offpeak}:/var/lib/offpeak
