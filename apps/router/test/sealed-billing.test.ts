@@ -212,3 +212,218 @@ describe("prepaid", () => {
     expect(closingOf(new Uint8Array(await res.arrayBuffer()))?.usage).toBeDefined()
     expect((await records(booted)).length).toBe(1)
   })
+
+  test("a client that hangs up pays for what the VM counted", async () => {
+    let finish = () => {}
+    const hold = new Promise<void>((resolve) => (finish = resolve))
+    const booted = await rig({ hold, reply: () => ({ text: "a longer reply that the client walks away from" }) })
+    const res = await post(booted, (await sealedBytes(booted)).bytes)
+    const reader = res.body!.getReader()
+    await reader.read()
+    await reader.cancel()
+    finish()
+    const end = performance.now() + 3_000
+    while ((await records(booted)).length === 0 && performance.now() < end) await Bun.sleep(10)
+    expect((await records(booted)).length).toBe(1)
+  })
+})
+
+describe("clear headers", () => {
+  test.each([
+    ["no model", { model: null }],
+    ["no max tokens", { maxTokens: null }],
+    ["no host", { host: null }],
+    ["zero max tokens", { maxTokens: "0" }],
+    ["too many max tokens", { maxTokens: "4097" }],
+    ["text max tokens", { maxTokens: "lots" }],
+    ["a bad host", { host: "0x12" }],
+  ])("%s is a 400", async (_name, over) => {
+    const booted = await rig()
+    const res = await post(booted, (await sealedBytes(booted)).bytes, over as Over)
+    expect(res.status).toBe(400)
+    expect((await errorOf(res)).code).toBe("bad_sealed_headers")
+  })
+
+  test("a model nobody serves is a 404", async () => {
+    const booted = await rig()
+    expect((await post(booted, (await sealedBytes(booted)).bytes, { model: "no-such-model" })).status).toBe(404)
+  })
+
+  test("a body too short to be sealed is a 400", async () => {
+    const booted = await rig()
+    expect((await errorOf(await post(booted, new Uint8Array(10)))).code).toBe("bad_sealed_body")
+  })
+
+  test("a night job cannot be sealed", async () => {
+    const booted = await rig()
+    const res = await post(booted, (await sealedBytes(booted)).bytes, { headers: { "x-offpeak-flex": "2030-01-01T00:00:00Z" } })
+    expect((await errorOf(res)).code).toBe("sealed_no_flex")
+    await expect(booted.op.chat(body("night", { stream: false }), { sealed: true, flex: "2030-01-01T00:00:00Z" })).rejects.toMatchObject({ code: "sealed_no_flex" })
+  })
+})
+
+describe("routing on the clear headers", () => {
+  test("a host that is not verified takes no sealed traffic, and no hold is left", async () => {
+    const booted = await rig()
+    booted.stack.attest!.hosts.clear()
+    const res = await post(booted, (await sealedBytes(booted)).bytes)
+    expect(res.status).toBe(503)
+    expect((await errorOf(res)).code).toBe("sealed_host_unavailable")
+    expect(booted.engine.requests.length).toBe(0)
+    expect(await committed(booted)).toBe(0n)
+  })
+
+  test("a registry ref alone does not make a host verified", async () => {
+    const booted = await rig()
+    expect(booted.hostRow.attestationRef).not.toBe(`0x${"00".repeat(32)}`)
+    booted.stack.attest!.hosts.clear()
+    expect(verifiedHost(booted.stack, booted.host)).toBeNull()
+    await expect(booted.op.sealed.chat(body("x", { stream: false }))).rejects.toMatchObject({ code: "sealed_no_host" })
+  })
+
+  test("a host verified for another model is refused", async () => {
+    const booted = await rig()
+    verifiedHost(booted.stack, booted.host)!.transcript.bindings.modelDigest = `0x${"77".repeat(32)}`
+    expect((await post(booted, (await sealedBytes(booted)).bytes)).status).toBe(503)
+  })
+
+  test("a named host that is frozen or unhealthy is refused, with no failover to another host's key", async () => {
+    const booted = await rig()
+    booted.stack.probesOk.delete(booted.host)
+    expect((await post(booted, (await sealedBytes(booted)).bytes)).status).toBe(503)
+  })
+
+  test("the switch being off answers before anything is read or charged", async () => {
+    const booted = await rig()
+    booted.stack.flags.sealed = false
+    expect((await post(booted, (await sealedBytes(booted)).bytes)).status).toBe(501)
+    expect(await committed(booted)).toBe(0n)
+  })
+})
+
+describe("the ciphertext-length check", () => {
+  test("a record outside the model's range is flagged and still billed", async () => {
+    const booted = await rig()
+    booted.stack.models[0]!.sealedBytesPerToken = { low: 100_000, high: 200_000 }
+    const result = await booted.op.sealed.chat(body("outlier", { stream: false }))
+    expect((await flags(booted)).map((row) => row.reason)).toEqual(["sealed_length_outlier"])
+    expect(result.envelope.sealed).toBe(true)
+    expect((await records(booted)).length).toBe(1)
+  })
+
+  test("the default range leaves an ordinary reply alone", async () => {
+    const booted = await rig()
+    await booted.op.sealed.chat(body("normal", { stream: false }))
+    expect(await flags(booted)).toEqual([])
+  })
+
+  test.each([
+    ["one word", "ok"],
+    ["a long reply", "word ".repeat(400)],
+  ])("padded frames stay inside the default range: %s", async (_name, text) => {
+    const booted = await rig({ reply: () => ({ text }) })
+    await booted.op.sealed.chat(body("padded", { stream: false, max_tokens: 4096 }))
+    expect(await flags(booted)).toEqual([])
+    expect((await records(booted)).length).toBe(1)
+  })
+
+  test("production with no range for the model refuses rather than serves", async () => {
+    const booted = await rig()
+    booted.stack.production = true
+    const res = await post(booted, (await sealedBytes(booted)).bytes)
+    expect(res.status).toBe(503)
+    expect((await errorOf(res)).code).toBe("sealed_no_length_range")
+    expect(booted.engine.requests.length).toBe(0)
+    expect(await committed(booted)).toBe(0n)
+    booted.stack.models[0]!.sealedBytesPerToken = { low: 1, high: 512 }
+    expect((await post(booted, (await sealedBytes(booted)).bytes)).status).toBe(200)
+  })
+})
+
+describe("a host that reports too much", () => {
+  /** Changes the counts on their way to the router, as a proxy in front of the VM can. */
+  function inflate(booted: Rig, reported: { tokensIn?: number; tokensOut?: number }) {
+    const hosts = booted.stack.hosts
+    booted.stack.hosts = {
+      request: async (host, endpoint, path, init) => {
+        const res = await hosts.request(host, endpoint, path, init)
+        if (!path.includes("/sealed/counts/")) return res
+        return Response.json({ ...((await res.json()) as object), ...reported })
+      },
+    }
+  }
+
+  test("output past max_tokens bills max_tokens and is flagged", async () => {
+    const booted = await rig({ reply: () => ({ text: "w".repeat(600) }) })
+    const res = await post(booted, (await sealedBytes(booted)).bytes)
+    await res.arrayBuffer()
+    expect((await flags(booted)).map((row) => row.reason)).toContain("over_max_tokens")
+    expect((await records(booted)).map((row) => row.tokens_out)).toEqual([32])
+  })
+
+  test("counts changed on the way are not the VM's, so nothing is billed", async () => {
+    const booted = await rig()
+    inflate(booted, { tokensOut: 1_000_000 })
+    await (await post(booted, (await sealedBytes(booted)).bytes)).arrayBuffer()
+    expect((await flags(booted)).map((row) => row.reason)).toEqual(["sealed_bad_counts"])
+    expect(await records(booted)).toEqual([])
+    expect(await committed(booted)).toBe(0n)
+  })
+
+  test("input changed on the way never bills, and the hold comes back", async () => {
+    const booted = await rig()
+    inflate(booted, { tokensIn: 50_000_000 })
+    const res = await post(booted, (await sealedBytes(booted)).bytes)
+    expect(closingOf(new Uint8Array(await res.arrayBuffer()))?.error?.code).toBe("unbilled")
+    expect(await committed(booted)).toBe(0n)
+    expect((await flags(booted)).map((row) => row.reason)).toEqual(["sealed_bad_counts"])
+    expect(await records(booted)).toEqual([])
+  })
+
+  test("a proxy cannot bill for work the VM never did, however it signs", async () => {
+    const booted = await rig()
+    const sealed = await sealedBytes(booted)
+    proxyInPlace(booted, roleAccount("host"), 32, keccak256(sealed.bytes))
+    const res = await post(booted, sealed.bytes)
+    expect(closingOf(new Uint8Array(await res.arrayBuffer()))?.error?.code).toBe("unbilled")
+    expect(booted.engine.requests.length).toBe(0)
+    expect((await flags(booted)).map((row) => row.reason)).toEqual(["sealed_bad_counts"])
+    expect(await records(booted)).toEqual([])
+    expect(await committed(booted)).toBe(0n)
+  })
+
+  test("the VM's signature on another request's counts does not carry over", async () => {
+    const booted = await rig()
+    const hosts = booted.stack.hosts
+    const first: SealedCounts[] = []
+    booted.stack.hosts = {
+      request: async (host, endpoint, path, init) => {
+        const res = await hosts.request(host, endpoint, path, init)
+        if (!path.includes("/sealed/counts/")) return res
+        const signed = sealedCountsSchema.parse(await res.json())
+        first.push(signed)
+        return Response.json(first[0])
+      },
+    }
+    await (await post(booted, (await sealedBytes(booted)).bytes)).arrayBuffer()
+    await (await post(booted, (await sealedBytes(booted)).bytes)).arrayBuffer()
+    expect((await records(booted)).length).toBe(1)
+    expect((await flags(booted)).map((row) => row.reason)).toEqual(["sealed_bad_counts"])
+  })
+
+  test("signed counts over bytes other than those relayed are not billed", async () => {
+    const booted = await rig({ reply: () => ({ text: "a reply long enough to span a few frames" }) })
+    const hosts = booted.stack.hosts
+    booted.stack.hosts = {
+      request: async (host, endpoint, path, init) => {
+        const res = await hosts.request(host, endpoint, path, init)
+        if (!path.includes("/sealed/chat/")) return res
+        const bytes = new Uint8Array(await res.arrayBuffer())
+        bytes[40]! ^= 1
+        return new Response(bytes, { headers: res.headers })
+      },
+    }
+    await (await post(booted, (await sealedBytes(booted)).bytes)).arrayBuffer()
+    expect((await flags(booted)).map((row) => row.reason)).toEqual(["sealed_output_hash"])
+    expect(await records(booted)).toEqual([])
+  })
