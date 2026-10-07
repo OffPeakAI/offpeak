@@ -1,0 +1,11 @@
+{
+  "features": {
+    "channels": false,
+    "upto": false,
+    "night_jobs": false,
+    "windows": false,
+    "sealed": false,
+    "token_hooks": false,
+    "beta_cap": true
+  }
+}
