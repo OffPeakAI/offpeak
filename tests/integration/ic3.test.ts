@@ -197,3 +197,192 @@ beforeAll(async () => {
     rulers: rulerAccounts.map((r) => r.address),
   }))
   keeper = { db, reader, writer: wallet(keeperAccount as never), account: keeperAccount, contracts: chain.contracts, metrics }
+
+  const registeredAt = await chainTime()
+  hour = hourIndex(registeredAt)
+  await tick(ingest, ingestState)
+  const count = 210
+  rows = await Promise.all(
+    Array.from({ length: count }, (_, i) =>
+      signRow(
+        { i, hour, payer: i % 4 === 0 ? buyerB : buyerA, ts: Math.min(registeredAt + 1 + i, hourEnd(hour) - 1) },
+        contract("UsageLedger"),
+      ),
+    ),
+  )
+  rows.sort((a, b) => (a.req_id < b.req_id ? -1 : 1))
+  for (const row of rows) await insertRow(db, row)
+  await mineAt(hourEnd(hour) + 600)
+  await closeHour(db as never, hour, router as never, contract("UsageLedger"))
+  await settleHour()
+}, 180_000)
+
+afterAll(() => {
+  chain?.stop()
+})
+
+describe("IC3: a swap host from flag to slash", () => {
+  test("the usage the evidence rests on settled on chain", async () => {
+    const lastSettled = await reader.readContract({ address: contract("OffpeakVault"), abi: OffpeakVaultAbi, functionName: "lastSettledHour" })
+    expect(Number(lastSettled)).toBe(hour)
+    expect((await hostView()).pendingCredits).toBeGreaterThan(0n)
+    const excluded = await db.query("SELECT 1 FROM chain.settlement_rejects")
+    expect(excluded.rows).toHaveLength(0)
+  })
+
+  test("an honest host is not flagged across the calibration range", () => {
+    let flagged = 0
+    for (let seed = 1; seed <= 200; seed++) {
+      if (score(simulateWeek(mulberry32(seed), 200, 0, PUBLISHED_BASELINE.delta), PUBLISHED_BASELINE).flagged) flagged++
+    }
+    expect(flagged / 200).toBeLessThanOrEqual(0.01)
+  })
+
+  test("a challenge the data does not support is dismissed and costs the challenger half", async () => {
+    const auditorBefore = await usdgOf(auditor)
+    const hostBefore = await usdgOf(host)
+    const id = await fileChallenge(bundleFrom(weekWhere(0, false), true))
+    await send(host, contract("AuditCourt"), AuditCourtAbi, "respond", [BigInt(id), keccak256(toBytes("we served the right model"))])
+    await ruleAll()
+
+    const row = await challengeRow(id)
+    expect(row.state).toBe("finalized")
+    expect(Number(row.outcome)).toBe(0)
+    expect(await rulingReason(id)).toBe("test_not_flagged")
+    expect((await usdgOf(host)) - hostBefore).toBe(CHALLENGE_BOND / 2n)
+    expect(auditorBefore - (await usdgOf(auditor))).toBe(CHALLENGE_BOND / 2n)
+    expect((await hostView()).bondUsdg).toBe(BOND)
+  }, 60_000)
+
+  test("another host's real records cannot frame a host", async () => {
+    const framed = anvilAccount(17).address.toLowerCase() as Address
+    await send(auditor, contract("MockUSDG"), MockUSDGAbi, "mint", [framed, BOND])
+    await send(framed, contract("MockUSDG"), MockUSDGAbi, "approve", [contract("HostRegistry"), BOND])
+    await send(framed, contract("HostRegistry"), HostRegistryAbi, "register", [
+      {
+        modelDigests: [keccak256(toBytes("model"))],
+        maxTps: [100],
+        imageDigest: keccak256(toBytes("image")),
+        gpuClass: keccak256(toBytes("h100-80g-sxm")),
+        endpointHash: keccak256(toBytes("endpoint")),
+        attestationRef: `0x${"00".repeat(32)}`,
+        bondUsdg: BOND,
+        bondOfpk: 0n,
+      },
+    ])
+    const id = await fileChallenge(bundleFrom(weekWhere(0.25, true), true, framed))
+    await send(framed, contract("AuditCourt"), AuditCourtAbi, "respond", [BigInt(id), keccak256(toBytes("not my records"))])
+    await ruleAll()
+
+    expect(await rulingReason(id)).toBe("leaf_unproven")
+    const view = await reader.readContract({ address: contract("HostRegistry"), abi: HostRegistryAbi, functionName: "hostView", args: [framed] })
+    expect(view.status).toBe(ACTIVE_OR_PROBATION)
+    expect(view.bondUsdg).toBe(BOND)
+  }, 60_000)
+
+  test("if the panel never acts, the keeper dismisses and nothing is lost", async () => {
+    const pending = (await hostView()).pendingCredits
+    const id = await fileChallenge(bundleFrom(weekWhere(0.25, true), true))
+    await send(host, contract("AuditCourt"), AuditCourtAbi, "respond", [BigInt(id), keccak256(toBytes("response"))])
+    await ruleAll()
+    expect(await rulingReason(id)).toBe("both_signals")
+    expect((await hostView()).status).toBe(FROZEN)
+    expect((await hostView()).pendingCredits).toBe(0n)
+
+    const review = await db.query<{ review_ends_at: string }>("SELECT review_ends_at FROM chain.challenges WHERE id = $1", [id])
+    await mineAt(Number(review.rows[0]!.review_ends_at) + 8 * 86_400)
+    await tick(ingest, ingestState)
+    expect(await runChallengeFinalize(keeper)).toEqual([id])
+    await tick(ingest, ingestState)
+
+    const view = await hostView()
+    expect(view.status).toBe(ACTIVE_OR_PROBATION)
+    expect(view.bondUsdg).toBe(BOND)
+    expect(view.pendingCredits).toBe(pending)
+    expect((await challengeRow(id)).state).toBe("finalized")
+  }, 60_000)
+
+  let swapId = 0
+
+  test("a flagged host with a second signal is ruled a swap, frozen and not yet slashed", async () => {
+    swapId = await fileChallenge(bundleFrom(weekWhere(0.25, true), true))
+    await send(host, contract("AuditCourt"), AuditCourtAbi, "respond", [BigInt(swapId), keccak256(toBytes("response"))])
+    await ruleAll()
+
+    expect((await challengeRow(swapId)).state).toBe("panel_review")
+    const view = await hostView()
+    expect(view.status).toBe(FROZEN)
+    expect(view.bondUsdg).toBe(BOND)
+    const routable = await reader.readContract({ address: contract("HostRegistry"), abi: HostRegistryAbi, functionName: "routable", args: [host] })
+    expect(routable).toBe(false)
+  }, 60_000)
+
+  test("the panel cannot confirm before the host's appeal window closes", async () => {
+    const packet = await panelPacket({ db, reader, contracts: chain.contracts, chainId: 4663 }, swapId, "confirm")
+    const panelSig = await panelAccount.signTypedData(packet.typedData as never)
+    await expect(
+      reader.simulateContract({
+        address: contract("AuditCourt"),
+        abi: AuditCourtAbi,
+        functionName: "postPanelDecision",
+        args: [packet.typedData.message as never, panelSig],
+        account: keeperAccount,
+      }),
+    ).rejects.toThrow("ReviewNotOver")
+  }, 30_000)
+
+  test("the review packet tells the panel what it needs and holds no key", async () => {
+    await send(host, contract("AuditCourt"), AuditCourtAbi, "appeal", [BigInt(swapId), keccak256(toBytes("appeal"))])
+    await tick(ingest, ingestState)
+    const packet = await panelPacket({ db, reader, contracts: chain.contracts, chainId: 4663 }, swapId, "confirm")
+    expect(packet.evidence.samples).toBe(200)
+    expect(packet.evidence.proofsVerify).toBe(true)
+    expect(packet.evidence.rulingRecheck).toBe("both_signals")
+    expect(packet.evidence.statistic).toBeGreaterThan(packet.evidence.threshold)
+    expect(packet.appealHash).toBe(keccak256(toBytes("appeal")))
+    expect(packet.typedData.message.finalSlashBps).toBe(10_000)
+  }, 30_000)
+
+  test("panel confirm slashes everything, delists, and refunds reach buyers by spend", async () => {
+    const review = await db.query<{ review_ends_at: string }>("SELECT review_ends_at FROM chain.challenges WHERE id = $1", [swapId])
+    await mineAt(Number(review.rows[0]!.review_ends_at))
+    await tick(ingest, ingestState)
+
+    const packet = await panelPacket({ db, reader, contracts: chain.contracts, chainId: 4663 }, swapId, "confirm")
+    const panelSig = await panelAccount.signTypedData(packet.typedData as never)
+    await send(keeperAccount.address, contract("AuditCourt"), AuditCourtAbi, "postPanelDecision", [packet.typedData.message, panelSig])
+    await tick(ingest, ingestState)
+    expect((await hostView()).bondUsdg).toBe(BOND)
+
+    const auditorBefore = await usdgOf(auditor)
+    const aBefore = await usdgOf(buyerA)
+    const bBefore = await usdgOf(buyerB)
+    expect(await runChallengeFinalize(keeper)).toEqual([swapId])
+    await tick(ingest, ingestState)
+
+    const view = await hostView()
+    expect(view.bondUsdg).toBe(0n)
+    expect(view.status).toBe(DELISTED)
+    expect((await usdgOf(auditor)) - auditorBefore).toBe(CHALLENGE_BOND)
+    expect((await challengeRow(swapId)).state).toBe("finalized")
+
+    expect((await runRefundClaims(keeper)).sort()).toEqual([buyerA, buyerB].sort())
+    await tick(ingest, ingestState)
+    const toA = (await usdgOf(buyerA)) - aBefore
+    const toB = (await usdgOf(buyerB)) - bBefore
+    expect(toA).toBeGreaterThan(toB)
+    expect(toA + toB).toBeLessThanOrEqual(BOND)
+    expect(BOND - (toA + toB)).toBeLessThan(10n)
+    expect(await runRefundClaims(keeper)).toEqual([])
+  }, 60_000)
+
+  test("the refund route serves what was paid", async () => {
+    const api = createApi({ db, reader, contracts: chain.contracts, internalToken: TOKEN, metrics })
+    const res = await api.request(`/public/v1/refunds/${swapId}/${buyerA}`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { data: { claimed: boolean } }
+    expect(body.data.claimed).toBe(true)
+    const listed = await api.request(`/idx/v1/challenges?host=${host}`, { headers: { authorization: `Bearer ${TOKEN}` } })
+    expect(((await listed.json()) as { data: unknown[] }).data).toHaveLength(3)
+  })
+})
