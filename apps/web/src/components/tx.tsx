@@ -112,3 +112,62 @@ export function TxProvider({ children }: { children: ReactNode }) {
     },
     [config, queries],
   )
+
+  const value = useMemo(() => ({ run, busy: tray?.state === "running" }), [run, tray])
+  return (
+    <TxContext.Provider value={value}>
+      {children}
+      {tray && <TxTray tray={tray} onClose={() => setTray(null)} />}
+    </TxContext.Provider>
+  )
+}
+
+/** A button that fetches one transaction and sends it. */
+export function Mutate({ path, title, label, input, kind = "ghost", want }: { path: string; title: string; label: string; input?: unknown; kind?: string; want?: Want }) {
+  const { token } = useSession()
+  const { run, busy } = useTx()
+  return (
+    <button type="button" className={`btn ${kind} small`} disabled={busy} onClick={() => void run(title, async (wallet) => wallet.send(title, await trpcMutation<Tx>(path, input, token), want))}>
+      {label}
+    </button>
+  )
+}
+
+/** Approve if the allowance falls short, then send. */
+export function usePlan() {
+  const { token } = useSession()
+  const { run, busy } = useTx()
+  const go = (title: string, label: string, path: string, input: unknown, want?: { spender: Hex; amount?: bigint; call: Want }) =>
+    run(title, async (wallet) => {
+      const plan = await trpcMutation<Plan>(path, input, token)
+      await wallet.approve(plan.approval, want)
+      await wallet.send(label, plan.tx, want?.call)
+    })
+  return { go, busy }
+}
+
+function TxTray({ tray, onClose }: { tray: Tray; onClose: () => void }) {
+  return (
+    <aside className={`tray ${tray.state}`} role="status" aria-live="polite">
+      <header>
+        <strong>{tray.title}</strong>
+        {tray.state !== "running" && (
+          <button type="button" className="copy" onClick={onClose} aria-label="Dismiss">
+            close
+          </button>
+        )}
+      </header>
+      <ol>
+        {tray.lines.map((line, index) => (
+          <li key={index} className={line.state}>
+            <span>{line.label}</span>
+            {line.hash && <span className="mono">{shortHex(line.hash)}</span>}
+          </li>
+        ))}
+      </ol>
+      {tray.state === "running" && <p className="note">{tray.lines.at(-1)?.hash ? "Waiting for the chain to confirm." : "Check your wallet. Nothing moves until you sign."}</p>}
+      {tray.state === "done" && <p className="note">Done. The balance updates once the indexer sees it, usually within 2 seconds.</p>}
+      {tray.error && <p className="field-error">{tray.error}</p>}
+    </aside>
+  )
+}
