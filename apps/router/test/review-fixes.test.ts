@@ -272,3 +272,172 @@ describe("edges from the second review", () => {
     expect(res.status).toBe(200)
     expect((await usageRows(booted)).rows.length).toBe(1)
   })
+
+  test("a bad price header reserves nothing from a Window", async () => {
+    const booted = await bootStack()
+    const res = await booted.app.request("/v1/chat/completions", { method: "POST", headers: prepaid(booted.key.token, { "x-offpeak-window": "9", "x-offpeak-max-price": "nonsense" }), body: chatBody("x") })
+    expect(res.status).toBe(400)
+  })
+
+  test("exact is refused on chat", async () => {
+    const booted = await bootStack()
+    const { uptoHeader } = await import("./support/upto.ts")
+    const header = JSON.parse(await uptoHeader(booted.stack, buyerKey, keccak256(toBytes("exact-chat"))))
+    const res = await booted.app.request("/v1/chat/completions", { method: "POST", headers: { "content-type": "application/json", "payment-signature": JSON.stringify({ ...header, scheme: "exact" }) }, body: chatBody("x") })
+    expect(res.status).toBe(400)
+  })
+
+  test("a falling-back Window keeps the buyer's audit discount", async () => {
+    const booted = await bootStack()
+    await booted.stack.db.query("UPDATE serving.accounts SET audit_opt_in = true")
+    const { feeBpsFor } = await import("@offpeak/shared")
+    const payer = await (await import("../src/pipeline.ts")).auth(booted.stack, new Request("http://router/", { headers: prepaid(booted.key.token, { "x-offpeak-window": "1" }) }))
+    expect((payer as { prepaidFeeBps: number }).prepaidFeeBps).toBe(feeBpsFor({ auditOptIn: true }))
+  })
+
+  test("content parts are counted, and anything but text is refused", async () => {
+    const booted = await bootStack()
+    const parts = await booted.app.request("/v1/chat/completions", { method: "POST", headers: prepaid(booted.key.token), body: JSON.stringify({ model: "ofm-8b", max_tokens: 8, messages: [{ role: "user", content: [{ type: "text", text: "x".repeat(1000) }] }] }) })
+    expect(parts.status).toBe(200)
+    expect(((await parts.json()) as { usage: { prompt_tokens: number } }).usage.prompt_tokens).toBeGreaterThan(1000)
+    const image = await booted.app.request("/v1/chat/completions", { method: "POST", headers: prepaid(booted.key.token), body: JSON.stringify({ model: "ofm-8b", messages: [{ role: "user", content: [{ type: "image_url" }] }] }) })
+    expect(image.status).toBe(400)
+    const nulled = await booted.app.request("/v1/chat/completions", { method: "POST", headers: prepaid(booted.key.token), body: chatBody("x", { max_tokens: null }) })
+    expect(nulled.status).toBe(200)
+  })
+
+  test("one failing capture does not stop the sweep", async () => {
+    const booted = await bootStack()
+    const { queueCapture } = await import("../src/pay/captures.ts")
+    await queueCapture(booted.stack.db, { reqId: "a", kind: "upto", wallet: "0xa", holdId: "0x1", hour: 1, amount: 1n })
+    await queueCapture(booted.stack.db, { reqId: "b", kind: "prepaid", wallet: "0xb", holdId: "h", hour: 1, amount: 1n })
+    await booted.stack.db.query("UPDATE serving.pending_captures SET created_at = now() - interval '1 minute'")
+    booted.stack.facilitator.capture = async () => {
+      throw new Error("facilitator down")
+    }
+    await sweepCaptures(booted.stack)
+    const left = await booted.stack.db.query<{ req_id: string }>("SELECT req_id FROM serving.pending_captures")
+    expect(left.rows.map((row) => row.req_id)).toEqual(["a"])
+  })
+
+  test("embeddings queue their capture too", async () => {
+    const booted = await bootStack()
+    booted.stack.ledger.capture = async () => {
+      throw new Error("redis down")
+    }
+    const res = await booted.app.request("/v1/embeddings", { method: "POST", headers: prepaid(booted.key.token), body: JSON.stringify({ model: "ofm-embed", input: "hello" }) })
+    expect(res.status).toBe(200)
+    expect((await booted.stack.db.query("SELECT 1 FROM serving.pending_captures")).rows.length).toBe(1)
+  })
+})
+
+describe("routing", () => {
+  test("an under-bonded active host gets no traffic", async () => {
+    const booted = await bootStack()
+    booted.indexer.hosts.get(booted.host)!.routable = false
+    const res = await booted.app.request("/v1/chat/completions", { method: "POST", headers: prepaid(booted.key.token), body: chatBody("x") })
+    expect(res.status).toBe(503)
+  })
+
+  test("an empty stream fails over before billing", async () => {
+    const booted = await bootStack({ secondHost: true })
+    const empty = new Hono()
+    empty.post("/offpeak/v1/chat/completions", () => new Response("data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } }))
+    const cheapest = booted.host
+    booted.hostApps.set(cheapest, empty)
+    const res = await booted.app.request("/v1/chat/completions", { method: "POST", headers: prepaid(booted.key.token), body: chatBody("x") })
+    expect(res.status).toBe(200)
+    expect(res.headers.get("x-offpeak-host")).not.toBe(cheapest)
+  })
+})
+
+describe("account routes", () => {
+  test("disputes and tRPC need a session, and a key needs one too", async () => {
+    const booted = await bootStack()
+    expect((await booted.app.request("/v1/disputes", { method: "POST", body: JSON.stringify({ wallet: booted.buyer, req_ids: [], reason: "x" }) })).status).toBe(401)
+    expect((await booted.app.request("/v1/keys", { method: "POST" })).status).toBe(401)
+    expect((await booted.app.request("/trpc/usage.recent")).status).toBe(401)
+    await booted.stack.db.query("INSERT INTO serving.siwe_sessions (id, wallet, nonce, expires_at) VALUES ('sess_test', $1, '', to_timestamp($2))", [booted.buyer, booted.stack.clock() + 60])
+    const signedIn = { headers: { authorization: "Bearer sess_test" } }
+    expect((await booted.app.request("/trpc/usage.recent", signedIn)).status).toBe(200)
+    expect((await booted.app.request("/v1/keys", { method: "POST", ...signedIn })).status).toBe(200)
+  })
+
+  test("another account cannot read a file", async () => {
+    const booted = await bootStack()
+    const upload = await booted.app.request("/v1/files", { method: "POST", headers: prepaid(booted.key.token), body: JSON.stringify({ purpose: "batch", content: "secret" }) })
+    const { id } = await upload.json()
+    const { issueKey } = await import("../src/pipeline.ts")
+    const other = await issueKey(booted.stack, "0x000000000000000000000000000000000000dead")
+    expect((await booted.app.request(`/v1/files/${id}/content`, { headers: prepaid(other.token) })).status).toBe(404)
+  })
+})
+
+describe("the live chain view", () => {
+  const silent = { url: "http://127.0.0.1:1", token: "t", endpointOf: () => undefined }
+
+  function viewing(buyer: object, extra: Partial<ConstructorParameters<typeof LiveChain>[0]> = {}) {
+    const live = new LiveChain({ ...silent, ...extra })
+    ;(live as unknown as { get: () => Promise<object> }).get = async () => buyer
+    return live
+  }
+
+  const clean = { balance: "10", hourlyCap: "5", dailyCap: "5", servable: true, usagePaused: false, withdrawRequestedAt: "0", capsEffectiveAfterHour: "0" }
+
+  test("a withdraw push beats the lagging indexer, and a cancel undoes it", async () => {
+    const live = viewing(clean)
+    live.push({ type: "WithdrawAllRequested", buyer: "0xAB", requestedAt: "5", dueAt: "9" })
+    expect((await live.buyer("0xab", 0)).reason).toBe("withdraw_requested")
+    live.push({ type: "WithdrawAllCancelled", buyer: "0xab" })
+    expect((await live.buyer("0xab", 0)).servable).toBe(true)
+  })
+
+  test("a caps push applies before the indexer has it, and a pause reaches every buyer", async () => {
+    const live = viewing(clean)
+    live.push({ type: "CapsChangeRequested", buyer: "0xab", hourlyCap: "1", dailyCap: "2", effectiveAfterHour: "99" })
+    const lowered = await live.buyer("0xab", 0)
+    expect(lowered.pendingHourlyCap).toBe(1n)
+    expect(lowered.capsEffectiveAfterHour).toBe(99n)
+    live.push({ type: "Paused", usagePaused: true })
+    expect((await live.buyer("0xcd", 0)).reason).toBe("paused")
+    live.push({ type: "Paused", usagePaused: false })
+    expect((await live.buyer("0xcd", 0)).servable).toBe(true)
+  })
+
+  test("a reorg drops what a vanished transaction tightened", async () => {
+    const live = viewing(clean)
+    live.push({ type: "WithdrawAllRequested", buyer: "0xab", requestedAt: "5", dueAt: "9", block: 5 })
+    live.push({ type: "Reorg", fromBlock: 1 })
+    expect((await live.buyer("0xab", 0)).servable).toBe(true)
+  })
+
+  test("only a later block can undo a tightening, and a reorg above it leaves it alone", async () => {
+    const live = viewing(clean)
+    live.push({ type: "WithdrawAllRequested", buyer: "0xab", requestedAt: "5", dueAt: "9", block: 110 })
+    live.push({ type: "WithdrawAllCancelled", buyer: "0xab", block: 100 })
+    expect((await live.buyer("0xab", 0)).reason).toBe("withdraw_requested")
+    live.push({ type: "Reorg", fromBlock: 120 })
+    expect((await live.buyer("0xab", 0)).reason).toBe("withdraw_requested")
+    live.push({ type: "WithdrawAllCancelled", buyer: "0xab", block: 111 })
+    expect((await live.buyer("0xab", 0)).servable).toBe(true)
+  })
+
+  test("a second lowering wins over an older pending change", async () => {
+    const live = viewing({ ...clean, pendingHourlyCap: "500", pendingDailyCap: "500", capsEffectiveAfterHour: "7" })
+    live.push({ type: "CapsChangeRequested", buyer: "0xab", hourlyCap: "10", dailyCap: "20", effectiveAfterHour: "9", block: 5 })
+    const view = await live.buyer("0xab", 0)
+    expect(view.pendingHourlyCap).toBe(10n)
+    expect(view.capsEffectiveAfterHour).toBe(9n)
+  })
+
+  test("a stored endpoint that disagrees with the chain is never routed to", async () => {
+    const row = { operator: "0xh", status: 2, models: [], endpointHash: keccak256(toBytes("https://real.example")) }
+    const stored: Record<string, string> = { "0xh": "https://evil.example" }
+    const live = viewing([row], { endpointOf: (host) => stored[host] })
+    expect((await live.hostList())[0]!.endpoint).toBe("")
+    stored["0xh"] = "https://real.example"
+    live.resync()
+    expect((await live.hostList())[0]!.endpoint).toBe("https://real.example")
+  })
+})
+
