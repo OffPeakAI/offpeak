@@ -347,3 +347,152 @@ describe("re-verification", () => {
     expect((await hostsOf(booted)).hosts).toEqual([])
     expect(await rows(booted)).toEqual([])
   })
+
+  test("a verifier outage at the 24-hour check drops the host rather than keeping it", async () => {
+    const booted = await rig()
+    booted.stack.setClock(verifiedHost(booted.stack, booted.host)!.verifiedAt + 86_400)
+    booted.dcap.state.down = true
+    await sweep(booted)
+    expect(verifiedHost(booted.stack, booted.host)).toBeNull()
+  })
+
+  test("with sweeps stopped, a row expires by itself", async () => {
+    const booted = await rig()
+    booted.stack.setClock(verifiedHost(booted.stack, booted.host)!.verifiedAt + 90_001)
+    expect(verifiedHost(booted.stack, booted.host)).toBeNull()
+  })
+
+  test("a host restart is noticed on the next sweep, and it stays out until the new ref is registered", async () => {
+    const booted = await rig()
+    const next = await booted.restartHost()
+    await sweep(booted)
+    expect(verifiedHost(booted.stack, booted.host)).toBeNull()
+    expect(await rows(booted)).toEqual([])
+    booted.hostRow.attestationRef = next.attestationRef
+    booted.stack.attest!.retryAt.clear()
+    await sweep(booted)
+    const row = verifiedHost(booted.stack, booted.host)!
+    expect(row.attestationRef).toBe(next.attestationRef)
+    expect(row.transcript.bindings.hpkePublicKey).toBe(next.identity.publicKey)
+  })
+
+  test("a registry change drops the host", async () => {
+    const booted = await rig()
+    booted.hostRow.attestationRef = `0x${"44".repeat(32)}`
+    await sweep(booted)
+    expect(verifiedHost(booted.stack, booted.host)).toBeNull()
+  })
+
+  test("a host that fails waits before it is asked again", async () => {
+    const booted = await rig({ noSweep: true })
+    booted.dcap.state.down = true
+    await sweep(booted)
+    const asked = booted.dcap.seen.length
+    booted.dcap.state.down = false
+    await sweep(booted)
+    expect(booted.dcap.seen.length).toBe(asked)
+    booted.stack.setClock(booted.stack.clock() + 301)
+    await sweep(booted)
+    expect(verifiedHost(booted.stack, booted.host)).not.toBeNull()
+  })
+
+  test("a router restart trusts nothing from the table until a fresh nonce passes", async () => {
+    const booted = await rig()
+    const before = verifiedHost(booted.stack, booted.host)!
+    booted.stack.attest = new AttestBook(booted.stack.attest!.config)
+    expect((await rows(booted)).length).toBe(1)
+    expect(verifiedHost(booted.stack, booted.host)).toBeNull()
+    await sweep(booted)
+    expect(verifiedHost(booted.stack, booted.host)!.transcript.nonce).not.toBe(before.transcript.nonce)
+  })
+
+  test("a stale row from before a restart goes as soon as the host fails its first check", async () => {
+    const booted = await rig()
+    booted.stack.attest = new AttestBook(booted.stack.attest!.config)
+    booted.dcap.state.tcbStatus = "Revoked"
+    await sweep(booted)
+    expect(await rows(booted)).toEqual([])
+  })
+
+  test("a host that left the registry leaves the book and the table", async () => {
+    const booted = await rig()
+    booted.indexer.hosts.clear()
+    await sweep(booted)
+    expect(verifiedHost(booted.stack, booted.host)).toBeNull()
+    expect(await rows(booted)).toEqual([])
+  })
+})
+
+describe("the switch stays off", () => {
+  test("the code and the claims fixture both say off", () => {
+    expect(FLAGS.sealed).toBe(false)
+    const fixture = JSON.parse(readFileSync(new URL("../../../tools/status-fixture.json", import.meta.url), "utf8")) as { features: { sealed: boolean } }
+    expect(fixture.features.sealed).toBe(false)
+  })
+
+  test("/v1/status, /v1/models and the host list all agree while it is off", async () => {
+    const booted = await rig()
+    booted.stack.flags.sealed = FLAGS.sealed
+    const status = (await (await booted.app.request("/v1/status")).json()) as { features: { sealed: boolean } }
+    expect(status.features.sealed).toBe(false)
+    const models = (await (await booted.app.request("/v1/models")).json()) as { data: { offpeak: { sealed_available: boolean } }[] }
+    expect(models.data[0]!.offpeak.sealed_available).toBe(false)
+    const view = await hostsOf(booted)
+    expect(view.enabled).toBe(false)
+    expect(view.note).toContain("not switched on yet")
+  })
+
+  test("the price board says sealed only with the switch on and the host verified", async () => {
+    const booted = await rig()
+    const sealedOn = async () => ((await (await booted.app.request(`/v1/prices?model=${MODEL}`)).json()) as { hosts: { sealed: boolean }[] }).hosts[0]!.sealed
+    expect(await sealedOn()).toBe(true)
+    booted.stack.flags.sealed = false
+    expect(await sealedOn()).toBe(false)
+  })
+})
+
+describe("configuration", () => {
+  const entry = { imageDigest: `0x${"11".repeat(32)}`, configHash: OTHER_HASH, mrtd: fakeMeasurement(1), rtmrs: [fakeMeasurement(2), fakeMeasurement(3), fakeMeasurement(4), fakeMeasurement(5)] }
+
+  test("the allow-list is empty by default, and comes from the environment", () => {
+    expect(readAttestConfig({})).toEqual({ tdxVerifierUrl: undefined, gpuAttestationUrl: undefined, measurements: [] })
+    expect(readAttestConfig({ OFFPEAK_SEALED_MEASUREMENTS: JSON.stringify([entry]) }).measurements.length).toBe(1)
+  })
+
+  test("a list that cannot be read stops the boot", () => {
+    expect(() => readAttestConfig({ OFFPEAK_SEALED_MEASUREMENTS: "not json" })).toThrow()
+    expect(() => readAttestConfig({ OFFPEAK_SEALED_MEASUREMENTS: JSON.stringify([{ ...entry, mrtd: "0x12" }]) })).toThrow()
+    expect(() => readAttestConfig({ OFFPEAK_SEALED_MEASUREMENTS: JSON.stringify([{ ...entry, rtmrs: entry.rtmrs.slice(1) }]) })).toThrow()
+    expect(() => readAttestConfig({ OFFPEAK_SEALED_MEASUREMENTS: JSON.stringify([{ ...entry, configHash: undefined }]) })).toThrow()
+  })
+
+  test("production refuses a verifier reached in the clear", () => {
+    expect(() => readAttestConfig({ OFFPEAK_TDX_VERIFIER_URL: "http://verifier.example" }, true)).toThrow("https")
+    expect(() => readAttestConfig({ OFFPEAK_GPU_ATTESTATION_URL: "http://gpu.example" }, true)).toThrow("https")
+    expect(readAttestConfig({ OFFPEAK_TDX_VERIFIER_URL: "https://verifier.example" }, true).tdxVerifierUrl).toBe("https://verifier.example")
+  })
+
+  test("the summary check holds every condition", () => {
+    const good = { host: "0x1", tcbStatus: "UpToDate", gpuOk: true, measurementOk: true, reportDataOk: true }
+    expect(verifyTranscript(good)).toBe(true)
+    expect(verifyTranscript({ ...good, tcbStatus: "SWHardeningNeeded" })).toBe(true)
+    expect(verifyTranscript({ ...good, tcbStatus: "Revoked" })).toBe(false)
+    expect(verifyTranscript({ ...good, gpuOk: false })).toBe(false)
+    expect(verifyTranscript({ ...good, measurementOk: false })).toBe(false)
+    expect(verifyTranscript({ ...good, reportDataOk: false })).toBe(false)
+  })
+
+  test("padding does not read as an outlier: a short reply is mostly frames no token accounts for", () => {
+    const range = { low: 1, high: 512 }
+    expect(lengthOutlier(range, { bytes: 200, tokens: 30 }, { bytes: 16 + 6 * FRAME_WIRE_BYTES, tokens: 1 })).toBe(false)
+    expect(lengthOutlier(range, { bytes: 200, tokens: 30 }, { bytes: 16 + 40 * FRAME_WIRE_BYTES, tokens: 1 })).toBe(true)
+  })
+
+  test("the length check flags both ways and skips an empty side", () => {
+    const range = { low: 2, high: 100 }
+    expect(lengthOutlier(range, { bytes: 500, tokens: 100 }, { bytes: 500, tokens: 100 })).toBe(false)
+    expect(lengthOutlier(range, { bytes: 100, tokens: 100 }, { bytes: 500, tokens: 100 })).toBe(true)
+    expect(lengthOutlier(range, { bytes: 500, tokens: 100 }, { bytes: 50_000, tokens: 100 })).toBe(true)
+    expect(lengthOutlier(range, { bytes: 500, tokens: 100 }, { bytes: 100, tokens: 0 })).toBe(false)
+  })
+})

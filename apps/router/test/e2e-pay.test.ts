@@ -104,3 +104,91 @@ describe("upto preconfirm", () => {
     expect(buf).toContain("event: offpeak.usage")
     const rows = await stack.db.query("SELECT req_id FROM shared.usage_records")
     expect(rows.rows.length).toBe(1)
+
+    facilitator.delayMs = 40
+    const reqBad = keccak256(toBytes("upto-bad"))
+    facilitator.failReqIds.add(reqBad)
+    const bad = await uptoPayload(stack, buyer, reqBad)
+    const failed = await app.request("/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json", "payment-signature": JSON.stringify(bad) },
+      body: JSON.stringify({ model: "ofm-8b", messages: [{ role: "user", content: "longform again" }], max_tokens: 320, stream: true }),
+    })
+    const text = await failed.text()
+    expect(text).toContain("authorize_failed")
+    const after = await stack.db.query("SELECT req_id FROM shared.usage_records")
+    expect(after.rows.length).toBe(1)
+  }, 30_000)
+})
+
+describe("window draw-down", () => {
+  test("writes a window_perf sample and a zero-price record", async () => {
+    const { app, key, stack, buyer, host, indexer } = await bootStack()
+    indexer.windows.set("7", {
+      id: 7n,
+      host: host as Hex,
+      modelDigest: stack.models[0]!.digest,
+      t0: BigInt(stack.clock() - 10),
+      t1: BigInt(stack.clock() + 3600),
+      minTps: 1,
+      units: 10n,
+      hostPricePerUnit: 1n,
+      buyerPricePerUnit: 1n,
+      failed: false,
+    })
+    indexer.holders.set(`7:${buyer}`, { balance: 10n, lockedPartial: 0n, drawnTokens: 0n, costBasis: 1n })
+    const res = await app.request("/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${key.token}`, "content-type": "application/json", "x-offpeak-window": "7" },
+      body: JSON.stringify({ model: "ofm-8b", messages: [{ role: "user", content: "draw" }], max_tokens: 8 }),
+    })
+    expect(res.status).toBe(200)
+    const json = await res.json()
+    expect(json.offpeak_usage.record.payMode).toBe(4)
+    expect(json.offpeak_usage.record.priceIn).toBe("0")
+    const perf = await stack.db.query<{ demanded: boolean }>("SELECT window_id, demanded FROM shared.window_perf")
+    expect(perf.rows.length).toBe(1)
+    expect(perf.rows[0]?.demanded).toBe(true)
+  })
+})
+
+async function uptoPayload(stack: Awaited<ReturnType<typeof bootStack>>["stack"], buyer: ReturnType<typeof roleAccount>, reqId: Hex) {
+  const deadline = BigInt(Math.floor(Date.now() / 1000) + 3600)
+  const message = {
+    permitted: { token: stack.usdg as Hex, amount: 2_000_000n },
+    spender: stack.escrow as Hex,
+    nonce: BigInt(`0x${reqId.slice(2, 10)}`),
+    deadline,
+    witness: {
+      reqId,
+      payee: stack.vault as Hex,
+      maxAmount: 2_000_000n,
+      validBefore: deadline,
+      resourceHash: keccak256(toBytes("resource")),
+    },
+  }
+  const signature = await buyer.signTypedData({
+    domain: { name: "Permit2", chainId: 4663, verifyingContract: PERMIT2 },
+    types: permitWitnessTypes("UptoWitness"),
+    primaryType: "PermitWitnessTransferFrom",
+    message,
+  })
+  return {
+    x402Version: 2,
+    scheme: "upto" as const,
+    payload: {
+      signature,
+      permitted: { token: stack.usdg, amount: "2000000" },
+      spender: stack.escrow,
+      nonce: message.nonce.toString(),
+      deadline: deadline.toString(),
+      witness: {
+        reqId,
+        payee: stack.vault,
+        maxAmount: "2000000",
+        validBefore: deadline.toString(),
+        resourceHash: message.witness.resourceHash,
+      },
+    },
+  }
+}
