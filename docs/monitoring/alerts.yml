@@ -1,0 +1,105 @@
+# Prometheus alert rules for the chain services. The `page` tier is for a person; everything below it
+# resolves on its own through retries.
+groups:
+  - name: offpeak-chain
+    rules:
+      - alert: SettlementLagging
+        expr: settle_lag_seconds > 2400
+        labels: { severity: warn }
+        annotations: { summary: "The next hour is more than 40 minutes past its end" }
+      - alert: SettlementLate
+        expr: settle_lag_seconds > 3300
+        labels: { severity: page }
+        annotations: { summary: "The 55 minute settlement target is missed. See docs/runbooks/rpc-outage.md" }
+      - alert: SignersDisagree
+        expr: increase(settlement_signer_disagreement_total[15m]) > 3
+        labels: { severity: warn }
+        annotations: { summary: "Signers keep computing different batches. Check their RPC providers" }
+      - alert: IndexerBehind
+        expr: indexer_head_lag_blocks > 600
+        labels: { severity: warn }
+        annotations: { summary: "The indexer is more than a minute of blocks behind" }
+      - alert: IndexerViewMismatch
+        expr: increase(indexer_view_mismatch_total[1h]) > 0
+        labels: { severity: page }
+        annotations: { summary: "A computed reserve differs from the contract. Serving decisions may be wrong" }
+      - alert: ReserveLow
+        expr: reserve_balance_usdg < 500
+        labels: { severity: warn }
+        annotations: { summary: "The protocol reserve covers shortfalls and refunds; top it up" }
+      - alert: ChannelCloseAtRisk
+        expr: channel_close_margin_seconds < 1800
+        labels: { severity: page }
+        annotations: { summary: "A voucher is unlanded 30 minutes before its challenge ends. See docs/runbooks/stuck-channel-close.md" }
+      - alert: CaptureBacklog
+        expr: x402_capture_backlog > 200
+        for: 10m
+        labels: { severity: warn }
+        annotations: { summary: "Captures are queuing. Check the capturer's gas and the RPC" }
+      - alert: CaptureAtRisk
+        expr: increase(x402_capture_at_risk_total[10m]) > 0
+        labels: { severity: page }
+        annotations: { summary: "A capture is unlanded 10 minutes before its escrow expires. The host's money is at stake" }
+      - alert: CaptureLost
+        expr: increase(x402_capture_lost_total[1h]) > 0
+        labels: { severity: warn }
+        annotations: { summary: "An escrow expired before its capture. The host is paid from the reserve instead" }
+      - alert: UptoCostsTooMuch
+        expr: x402_gas_usdg_per_call > 0.02
+        for: 1h
+        labels: { severity: warn }
+        annotations: { summary: "An upto call costs more in gas than its 20,000 micro pre-confirmation budget" }
+      - alert: EscrowExpired
+        expr: increase(x402_escrow_expired_total[1h]) > 0
+        labels: { severity: warn }
+        annotations: { summary: "An escrow reached expiry uncaptured. There should be none, so check the capture queue" }
+      - alert: SettleBatchNearGasLimit
+        expr: settle_batch_gas > 24000000
+        labels: { severity: warn }
+        annotations: { summary: "A settle used three quarters of the 32M transaction limit. See docs/runbooks/settle-gas-limit.md" }
+      - alert: SettleBatchOverCapacity
+        expr: increase(settlement_capacity_exclusions_total[2h]) > 0
+        labels: { severity: page }
+        annotations: { summary: "An hour had more buyers than one settle holds, so records were excluded. See docs/runbooks/settle-gas-limit.md" }
+      - alert: SettleBatchOverGasLimit
+        expr: increase(settle_batch_over_gas_total[15m]) > 0
+        labels: { severity: page }
+        annotations: { summary: "An hour's batch cannot fit in one transaction, so settlement is stopped. See docs/runbooks/settle-gas-limit.md" }
+      - alert: IndexerEventNotApplied
+        expr: increase(indexer_apply_errors_total[1h]) > 0
+        labels: { severity: page }
+        annotations: { summary: "An event could not be applied. Derived state may be short of it. Read chain.events where error is set" }
+  - name: offpeak-auditor
+    rules:
+      - alert: AuditorBondLow
+        expr: auditor_bond_low == 1
+        labels: { severity: page }
+        annotations: { summary: "The auditor key holds under 1,000 USDG of challenge bonds. Top it up" }
+      - alert: AuditorFilingStuck
+        expr: increase(auditor_filing_errors[1h]) > 0
+        labels: { severity: page }
+        annotations: { summary: "A challenge did not go out cleanly. It is held in serving.audit_filings and reconciled every 15 minutes" }
+      - alert: AuditorSampleHashMismatch
+        expr: increase(auditor_sample_hash_mismatch[1h]) > 0
+        labels: { severity: page }
+        annotations: { summary: "A stored audit sample does not hash to its signed usage record" }
+      - alert: AuditorNoReference
+        expr: increase(auditor_no_reference[1h]) > 0
+        labels: { severity: warn }
+        annotations: { summary: "Responses are waiting for a reference host of the same model and GPU class, and bodies expire at 72 h" }
+      - alert: AuditorScoreGaveUp
+        expr: increase(auditor_score_gave_up[1d]) > 0
+        labels: { severity: warn }
+        annotations: { summary: "A response failed scoring past its attempt limit and was left out. Read the auditor log for its reference host" }
+      - alert: AuditorCanariesOff
+        expr: auditor_canaries_off == 1
+        labels: { severity: warn }
+        annotations: { summary: "No canary corpus is set, so hosts get no canaries. Set OFFPEAK_CANARY_CORPUS_FILE" }
+      - alert: AuditorMeteringUnprovable
+        expr: increase(auditor_metering_unprovable[1d]) > 0
+        labels: { severity: warn }
+        annotations: { summary: "A host keeps refusing to sign. Those requests have no usage record, so a person has to review them" }
+      - alert: AuditorUncalibrated
+        expr: auditor_uncalibrated_combinations > 0
+        labels: { severity: warn }
+        annotations: { summary: "A host serves a model, GPU class or image with no baseline, so its responses cannot be scored" }
