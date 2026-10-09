@@ -167,3 +167,193 @@ beforeAll(async () => {
   await send(agent, contract("MockUSDG"), MockUSDGAbi, "mint", [agent.address, 100_000_000n])
   await send(agent, contract("MockUSDG"), MockUSDGAbi, "approve", [contract("ChannelManager"), 100_000_000n])
   await send(agent, contract("MockUSDG"), MockUSDGAbi, "approve", [PERMIT2, 100_000_000n])
+
+  const engine = createHostApp({
+    operator: hostKey as never,
+    routerAddress: routerKey.address,
+    usageLedger: contract("UsageLedger"),
+    modelDigest: MODEL_DIGEST,
+    modelName: "ofm-8b",
+    imageDigest: IMAGE_DIGEST,
+    gpuClass: "h100-80g-sxm",
+    swap: false,
+    sealed: false,
+  })
+  hostServer = Bun.serve({ port: HOST_PORT, fetch: engine.app.fetch })
+
+  router = spawnRouter()
+  await until("the router", async () => (await fetch(`${ROUTER_URL}/health`)).ok)
+  services = [
+    Bun.spawn(["bun", "run", "services/indexer/src/main.ts"], { cwd: root, stdout: "ignore", stderr: "inherit", env: { ...baseEnv(), OFFPEAK_INDEXER_PORT: String(INDEXER_PORT) } }),
+    Bun.spawn(["bun", "run", "services/facilitator/src/main.ts"], {
+      cwd: root,
+      stdout: "ignore",
+      stderr: "inherit",
+      env: {
+        ...baseEnv(),
+        OFFPEAK_FACILITATOR_PORT: String(FAC_PORT),
+        OFFPEAK_FACILITATOR_RELAY_KEY: hexKey(anvilAccount(11)),
+        OFFPEAK_CAPTURER_KEY: hexKey(anvilAccount(12)),
+        OFFPEAK_AUTHORIZE_FLUSH_MS: "20",
+        OFFPEAK_CAPTURE_FLUSH_MS: "50",
+      },
+    }),
+  ]
+  await until("the indexer", async () => {
+    const res = await fetch(`http://127.0.0.1:${INDEXER_PORT}/idx/v1/hosts`, { headers: { authorization: `Bearer ${TOKEN}` } })
+    const body = (await res.json()) as { data: { status: number }[] }
+    return body.data[0]?.status === 2
+  })
+  await until("the facilitator", async () => (await fetch(`http://127.0.0.1:${FAC_PORT}/x402/supported`)).ok)
+
+  await saveEndpoint(db, hostKey.address, `http://127.0.0.1:${HOST_PORT}`)
+  const sheet: PriceSheet = {
+    host: hostKey.address.toLowerCase() as Hex,
+    modelDigest: MODEL_DIGEST,
+    baseIn: Array.from({ length: 168 }, () => 200_000n),
+    baseOut: Array.from({ length: 168 }, () => 800_000n),
+    floorIn: 100_000n,
+    floorOut: 400_000n,
+    validFrom: 0,
+    nonce: 1n,
+  }
+  const sig = await hostKey.signTypedData({
+    domain: domain("OffpeakPriceSheet", contract("HostRegistry")),
+    types: priceSheetTypes,
+    primaryType: "PriceSheet",
+    message: { ...sheet, validFrom: 0n },
+  })
+  await saveSheet(db, { ...sheet, sig, sheetHash: sheetHashOf(sheet, contract("HostRegistry")) })
+  buyerToken = (await issueKey({ db } as never, buyerKey.address)).token
+  await until("a routable host", async () => {
+    const res = await chat({ authorization: `Bearer ${buyerToken}` }, "warmup")
+    await res.text()
+    return res.status === 200
+  }, 30_000)
+}, 240_000)
+
+afterAll(async () => {
+  if (!hasPostgres) return
+  hostServer?.stop(true)
+  for (const service of [...services, router]) {
+    service?.kill()
+    await service?.exited
+  }
+  // Redis being down must not leave this Postgres running on its port, where the next run would reuse its rows.
+  await redis?.flushdb().catch(() => undefined)
+  redis?.disconnect()
+  chain?.stop()
+  Bun.spawnSync([`${PG_BIN}pg_ctl`, "-D", join(dataDir, "pg"), "-m", "immediate", "stop"], { stdout: "ignore", stderr: "ignore" })
+  rmSync(dataDir, { recursive: true, force: true })
+})
+
+describe.skipIf(!hasPostgres)("the router as a real process", () => {
+  test("a prepaid stream arrives in pieces, billed in Postgres with a verifiable envelope", async () => {
+    const res = await chat({ authorization: `Bearer ${buyerToken}` }, "longform", { stream: true, max_tokens: 400 })
+    expect(res.status).toBe(200)
+    const text = await res.text()
+    expect((text.match(/chat\.completion\.chunk/g) ?? []).length).toBeGreaterThan(2)
+    const match = /event: offpeak\.usage\ndata: (.+)\n/.exec(text)
+    const envelope = parseEnvelope(JSON.parse(match![1]!))
+    const rows = await db.query<{ payer: string; leaf: string }>("SELECT payer, leaf FROM shared.usage_records WHERE req_id = $1", [envelope.record.reqId])
+    expect(rows.rows[0]?.payer).toBe(buyerKey.address.toLowerCase())
+    expect(rows.rows[0]?.leaf).toBe(envelope.leaf)
+    const redisSpend = await redis.hvals(`offpeak:hold:{${buyerKey.address.toLowerCase()}}:spend`)
+    expect(redisSpend.length).toBeGreaterThan(0)
+  })
+
+  test("a request past the hourly cap is refused", async () => {
+    await send(buyerKey, contract("OffpeakVault"), OffpeakVaultAbi, "setCaps", [1n, 0n])
+    await until("the lower cap", async () => {
+      const res = await chat({ authorization: `Bearer ${buyerToken}` }, "cap")
+      await res.text()
+      return res.status === 402
+    })
+    await send(buyerKey, contract("OffpeakVault"), OffpeakVaultAbi, "setCaps", [HOURLY_CAP, 0n])
+  })
+
+  test("a channel keeps working across a router restart, voucher boundaries included", async () => {
+    const salt = keccak256(toBytes("live-channel"))
+    await send(agent, contract("ChannelManager"), ChannelManagerAbi, "open", [10_000_000n, BigInt(Math.floor(Date.now() / 1000) + 3 * 86_400), salt])
+    const logs = await reader.getContractEvents({ address: contract("ChannelManager"), abi: ChannelManagerAbi, eventName: "ChannelOpened", fromBlock: 0n })
+    const id = logs.at(-1)!.args.channelId! as Hex
+    await until("the channel", async () => {
+      const res = await channelChat(id, "first")
+      await res.text()
+      return res.status === 200 && Boolean(res.headers.get("x-offpeak-channel-owed"))
+    })
+    const owed = BigInt((await (await fetch(`${ROUTER_URL}/v1/channels/${id}`)).json() as { owed: string }).owed)
+    expect(owed).toBeGreaterThan(0n)
+
+    router.kill()
+    await router.exited
+    router = spawnRouter()
+    await until("the restarted router", async () => (await fetch(`${ROUTER_URL}/health`)).ok)
+    await until("hosts after restart", async () => {
+      const res = await chat({ authorization: `Bearer ${buyerToken}` }, "back")
+      await res.text()
+      return res.status === 200
+    })
+
+    const sig = await agent.signTypedData({
+      domain: domain("OffpeakChannel", contract("ChannelManager")),
+      types: voucherTypes,
+      primaryType: "Voucher",
+      message: { channelId: id, seq: 1n, cumulative: owed },
+    })
+    const next = await channelChat(id, "second", { "x-offpeak-voucher": voucherHeader(1n, owed, sig) })
+    expect(next.status).toBe(200)
+    await next.text()
+    const state = await db.query<{ cumulative: string }>("SELECT cumulative FROM shared.channel_state WHERE channel_id = $1", [id])
+    expect(BigInt(state.rows[0]!.cumulative)).toBe(owed)
+    const stale = await channelChat(id, "replay", { "x-offpeak-voucher": voucherHeader(1n, owed, sig) })
+    expect(stale.status).toBe(200)
+    await stale.text()
+    const after = await db.query<{ cumulative: string }>("SELECT cumulative FROM shared.channel_state WHERE channel_id = $1", [id])
+    expect(BigInt(after.rows[0]!.cumulative)).toBe(owed)
+  }, 60_000)
+
+  test("upto authorizes on chain through the facilitator process and hears back over Redis", async () => {
+    const reqId = keccak256(toBytes("live-upto"))
+    const deadline = BigInt(Math.floor(Date.now() / 1000) + 3600)
+    const amount = 2_000_000n
+    const witness = { reqId, payee: contract("OffpeakVault"), maxAmount: amount, validBefore: deadline, resourceHash: keccak256(toBytes("resource")) }
+    const message = { permitted: { token: contract("MockUSDG"), amount }, spender: contract("X402Escrow"), nonce: 77n, deadline, witness }
+    const signature = await agent.signTypedData({
+      domain: { name: "Permit2", chainId: 4663, verifyingContract: PERMIT2 as Address },
+      types: permitWitnessTypes("UptoWitness"),
+      primaryType: "PermitWitnessTransferFrom",
+      message,
+    } as never)
+    const payment = {
+      x402Version: 2,
+      scheme: "upto",
+      payload: {
+        signature,
+        permitted: { token: contract("MockUSDG"), amount: amount.toString() },
+        spender: contract("X402Escrow"),
+        nonce: "77",
+        deadline: deadline.toString(),
+        witness: { ...witness, maxAmount: amount.toString(), validBefore: deadline.toString() },
+      },
+    }
+    const res = await chat({ "payment-signature": JSON.stringify(payment) }, "longform", { stream: true, max_tokens: 400 })
+    expect(res.status).toBe(200)
+    const text = await res.text()
+    expect(text).toContain("event: offpeak.usage")
+    await until("the capture", async () => {
+      const row = await fetch(`http://127.0.0.1:${INDEXER_PORT}/idx/v1/escrows/${reqId}`, { headers: { authorization: `Bearer ${TOKEN}` } })
+      return ((await row.json()) as { data: { status: string } }).data.status === "captured"
+    })
+  }, 60_000)
+
+  test("a withdraw-all push stops new holds", async () => {
+    await send(buyerKey, contract("OffpeakVault"), OffpeakVaultAbi, "requestWithdrawAll")
+    await until("the push", async () => {
+      const res = await chat({ authorization: `Bearer ${buyerToken}` }, "after withdraw")
+      await res.text()
+      return res.status === 403
+    }, 8_000)
+  })
+})
+

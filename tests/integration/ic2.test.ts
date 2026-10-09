@@ -183,3 +183,186 @@ afterAll(() => {
   apiServer?.stop(true)
   chain?.stop()
 })
+
+describe("IC2: settlement from real router traffic", () => {
+  const served: { hour: number; reqId: Hex; leaf: Hex }[] = []
+  let firstHour = 0
+  let owed = 0n
+
+  test("three consecutive hours settle from live traffic with three signers", async () => {
+    firstHour = hourIndex(await chainTime())
+    for (let hour = firstHour; hour < firstHour + 3; hour++) {
+      await syncBuyer()
+      await mineAt(Math.max(await chainTime() + 1, hourStart(hour) + 60))
+      await syncBuyer()
+      for (const prompt of [`hour ${hour} first`, `hour ${hour} second`]) {
+        const usage = await serve(prompt)
+        served.push({ hour, reqId: usage.record.reqId, leaf: usage.leaf })
+        owed += costOf(usage)
+      }
+      await closeAndSettle(hour)
+      const lastSettled = await reader.readContract({ address: contract("OffpeakVault"), abi: OffpeakVaultAbi, functionName: "lastSettledHour" })
+      expect(Number(lastSettled)).toBe(hour)
+    }
+    expect(await vaultBalance()).toBe(DEPOSIT - owed)
+  }, 120_000)
+
+  test("all three signers computed the same batch and agreed", async () => {
+    const rows = await db.query<{ signers: string; hashes: string }>(
+      `SELECT count(DISTINCT signer) AS signers, count(DISTINCT batch_hash) AS hashes FROM chain.settlement_sigs
+       WHERE kind = 'settle' AND hour = $1`,
+      [firstHour],
+    )
+    expect(Number(rows.rows[0]!.hashes)).toBe(1)
+    expect(Number(rows.rows[0]!.signers)).toBeGreaterThanOrEqual(2)
+    expect(metrics.get("settlement_signer_disagreement_total")).toBe(0)
+    expect(peakLag).toBeGreaterThanOrEqual(CLOSE_GRACE)
+  })
+
+  test("every record's proof from the indexer verifies on chain", async () => {
+    for (const record of served) {
+      const { status, body } = await idx<{ hour: number; leaf: Hex; proof: Hex[]; root: Hex }>(`/idx/v1/usage/${record.reqId}/proof`)
+      expect(status).toBe(200)
+      expect(body.data.leaf).toBe(record.leaf)
+      const verified = await reader.readContract({
+        address: contract("UsageLedger"),
+        abi: UsageLedgerAbi,
+        functionName: "verifyLeaf",
+        args: [BigInt(record.hour), record.leaf, body.data.proof],
+      })
+      expect(verified).toBe(true)
+    }
+  })
+
+  test("the shared tables record the settlement", async () => {
+    const hours = await db.query<{ settle_tx: string | null }>("SELECT settle_tx FROM shared.usage_hours WHERE hour = $1", [firstHour])
+    expect(hours.rows[0]!.settle_tx).toMatch(/^0x/)
+    const open = await db.query<{ n: string }>(
+      "SELECT count(*) AS n FROM shared.usage_records WHERE hour = $1 AND settled_hour_tx IS NULL",
+      [firstHour],
+    )
+    expect(Number(open.rows[0]!.n)).toBe(0)
+  })
+
+  test("the indexer's views match the contracts exactly", async () => {
+    const { body } = await idx<{ balance: string; hourlyCap: string; dailyCap: string; reserve: string; servable: boolean }>(`/idx/v1/buyers/${buyer}`)
+    const onChain = await reader.readContract({ address: contract("OffpeakVault"), abi: OffpeakVaultAbi, functionName: "buyerState", args: [buyer] })
+    expect(body.data.balance).toBe(onChain.balance.toString())
+    expect(body.data.hourlyCap).toBe(onChain.hourlyCap.toString())
+    expect(body.data.dailyCap).toBe(onChain.dailyCap.toString())
+    expect(body.data.reserve).toBe(onChain.reserve.toString())
+    expect(await crossCheckBuyers({ db, reader, vault: contract("OffpeakVault"), metrics })).toBe(0)
+
+    const hostView = await idx<{ pendingCredits: string; releasableCredits: string; bondUsdg: string; status: number }>(`/idx/v1/hosts/${host}`)
+    const hostOnChain = await reader.readContract({ address: contract("HostRegistry"), abi: HostRegistryAbi, functionName: "hostView", args: [host] })
+    expect(hostView.body.data.pendingCredits).toBe(hostOnChain.pendingCredits.toString())
+    expect(hostView.body.data.releasableCredits).toBe(hostOnChain.releasableCredits.toString())
+    expect(hostView.body.data.bondUsdg).toBe(hostOnChain.bondUsdg.toString())
+    expect(hostView.body.data.status).toBe(hostOnChain.status)
+  })
+
+  test("a forged record is excluded automatically and the hour still lands", async () => {
+    const hour = firstHour + 3
+    await mineAt(hourStart(hour) + 60)
+    await syncBuyer()
+    const honest = await serve("honest")
+    owed += costOf(honest)
+
+    const forged = keccak256(toBytes("forged"))
+    await db.query(
+      `INSERT INTO shared.usage_records (req_id, hour, ts, payer, buyer_ref, host, model_digest, tokens_in, tokens_out,
+         prompt_hash, output_hash, price_in, price_out, host_cost_micro, fee_micro, fee_bps, pay_mode, pay_ref, sheet_hash,
+         router_sig, host_sig, leaf)
+       SELECT $1, hour, ts, payer, buyer_ref, host, model_digest, tokens_in, tokens_out, prompt_hash, output_hash,
+         price_in, price_out, host_cost_micro * 50, fee_micro * 50, fee_bps, pay_mode, pay_ref, sheet_hash, router_sig, host_sig, leaf
+       FROM shared.usage_records WHERE req_id = $2`,
+      [forged, honest.record.reqId],
+    )
+    await closeAndSettle(hour)
+
+    expect(Number(await reader.readContract({ address: contract("OffpeakVault"), abi: OffpeakVaultAbi, functionName: "lastSettledHour" }))).toBe(hour)
+    expect(await vaultBalance()).toBe(DEPOSIT - owed)
+    const rejected = await db.query<{ reason: string }>("SELECT reason FROM chain.settlement_rejects WHERE req_id = $1", [forged])
+    expect(rejected.rows).toHaveLength(1)
+    expect((await idx(`/idx/v1/usage/${forged}/proof`)).status).toBe(404)
+    expect((await idx(`/idx/v1/usage/${honest.record.reqId}/proof`)).status).toBe(200)
+  }, 60_000)
+
+  test("withdraw-all inside an hour debits that hour up to the request time, then pays out", async () => {
+    const hour = firstHour + 4
+    await mineAt(hourStart(hour) + 120)
+    await syncBuyer()
+    const before = await serve("before exit")
+    owed += costOf(before)
+
+    await mineAt(hourStart(hour) + 300)
+    await send(buyer, contract("OffpeakVault"), OffpeakVaultAbi as never, "requestWithdrawAll")
+    await tick(ingest, ingestState)
+    expect(pushes.some((p) => p.type === "WithdrawAllRequested")).toBe(true)
+
+    const refused = await ask("after exit")
+    expect(refused.status).toBe(403)
+
+    await closeAndSettle(hour)
+    expect(await vaultBalance()).toBe(DEPOSIT - owed)
+
+    const usdgBefore = await reader.readContract({ address: contract("MockUSDG"), abi: MockUSDGAbi, functionName: "balanceOf", args: [buyer] })
+    const keeperAccount = roleAccount("rulingA")
+    const executed = await runWithdrawAll({
+      db,
+      reader,
+      writer: createWalletClient({ account: keeperAccount, transport: http(chain.rpcUrl), chain: null }) as never,
+      account: keeperAccount,
+      contracts: chain.contracts,
+      metrics,
+    })
+    expect(executed).toEqual([buyer])
+    await tick(ingest, ingestState)
+    const usdgAfter = await reader.readContract({ address: contract("MockUSDG"), abi: MockUSDGAbi, functionName: "balanceOf", args: [buyer] })
+    expect(usdgAfter - usdgBefore).toBe(DEPOSIT - owed)
+    expect(await vaultBalance()).toBe(0n)
+    expect((await idx<{ balance: string }>(`/idx/v1/buyers/${buyer}`)).body.data.balance).toBe("0")
+  }, 60_000)
+
+  test("an upheld dispute is paid from the reserve into the payer's vault balance", async () => {
+    const amount = 3_000_000n
+    await send(host, contract("MockUSDG"), MockUSDGAbi as never, "approve", [contract("OffpeakVault"), amount])
+    await send(host, contract("OffpeakVault"), OffpeakVaultAbi as never, "fundReserve", [amount])
+    await db.query("INSERT INTO shared.refunds (id, payer, amount, reason, req_ids) VALUES ($1,$2,$3,$4,$5)", [
+      "dispute-1",
+      buyer,
+      amount.toString(),
+      "metering",
+      [],
+    ])
+    await mineAt(hourStart(hourIndex(await chainTime()) + 1) + 60)
+    await tick(ingest, ingestState)
+
+    for (const worker of workers) await refundPass(worker)
+    await tick(ingest, ingestState)
+    expect(await vaultBalance()).toBe(amount)
+    const row = await db.query<{ paid_hour: string | null }>("SELECT paid_hour FROM shared.refunds WHERE id = 'dispute-1'")
+    expect(row.rows[0]!.paid_hour).not.toBeNull()
+
+    for (const worker of workers) await refundPass(worker)
+    expect(await vaultBalance()).toBe(amount)
+  }, 60_000)
+
+  test("the keeper activates a host once probation ends", async () => {
+    const view = await reader.readContract({ address: contract("HostRegistry"), abi: HostRegistryAbi, functionName: "hostView", args: [host] })
+    await mineAt(Number(view.probationEnds) + 1)
+    await tick(ingest, ingestState)
+    const keeperAccount = roleAccount("rulingB")
+    const activated = await runHostActivate({
+      db,
+      reader,
+      writer: createWalletClient({ account: keeperAccount, transport: http(chain.rpcUrl), chain: null }) as never,
+      account: keeperAccount,
+      contracts: chain.contracts,
+      metrics,
+    })
+    expect(activated).toEqual([host])
+    await tick(ingest, ingestState)
+    expect((await idx<{ routable: boolean }>(`/idx/v1/hosts/${host}`)).body.data.routable).toBe(true)
+  }, 60_000)
+})
