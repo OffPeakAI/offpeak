@@ -1,0 +1,11 @@
+{
+  "name": "offpeak-website",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build-offpeak.mjs",
+    "start": "node scripts/serve.mjs",
+    "check": "node scripts/check-offpeak.mjs"
+  }
+}
