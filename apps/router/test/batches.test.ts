@@ -161,3 +161,171 @@ describe("planning a job", () => {
     const tooSoon = await createBatch(booted, [line("b")], { metadata: { offpeak_deadline: new Date((now + 1800) * 1000).toISOString() } })
     expect(tooSoon.status).toBe(400)
   })
+
+  test("a deadline that cannot be read says so, and the cap can come in metadata", async () => {
+    const booted = await bootStack()
+    const unreadable = await createBatch(booted, [line("a")], { metadata: { offpeak_deadline: "tomorrow" } })
+    expect(unreadable.status).toBe(400)
+    expect(((await unreadable.json()) as { error: { code: string } }).error.code).toBe("bad_deadline")
+    const capped = await createBatch(booted, [line("b")], { metadata: { offpeak_max_price: "in=0.000001,out=0.000001" } })
+    expect(capped.status).toBe(429)
+  })
+
+  test("a cap the job cannot meet is refused with a deadline, and the buyer sees the price with fee", async () => {
+    const booted = await bootStack()
+    const refused = await createBatch(booted, [line("a")], {}, { "x-offpeak-max-price": "in=0.000001,out=0.000001" })
+    expect(refused.status).toBe(429)
+    expect(((await refused.json()) as { error: { code: string } }).error.code).toBe("price_above_cap")
+    const job = await created(booted, [line("a")])
+    expect(job.offpeak.locked_price.in).toBe("145600")
+  })
+
+  test("the whole job has to fit the buyer's balance, counting what is open and other jobs", async () => {
+    const booted = await bootStack()
+    const first = await created(booted, [line("a")])
+    const estimate = BigInt(first.offpeak.estimated_cost)
+    booted.indexer.buyers.get(booted.buyer)!.balance = estimate + 1n
+    const res = await createBatch(booted, [line("b")])
+    expect(res.status).toBe(402)
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("insufficient_reserve")
+  })
+
+  test("two jobs share an hour's idle allowance, so they spread", async () => {
+    const booted = await bootStack()
+    const big = (name: string) => Array.from({ length: 10 }, (_, i) => line(`${name}${i}`, { max_tokens: 4096 }))
+    const a = await created(booted, big("a"))
+    const b = await created(booted, big("b"))
+    const hours = await booted.stack.db.query<{ hour: string; tokens: string }>("SELECT hour, SUM(tokens) AS tokens FROM serving.job_slots GROUP BY hour")
+    for (const row of hours.rows) expect(Number(row.tokens)).toBeLessThanOrEqual(50_400)
+    expect(new Set([...a.offpeak.planned_hours, ...b.offpeak.planned_hours]).size).toBeGreaterThan(1)
+  })
+})
+
+describe("running a slot", () => {
+  /** Puts a job in the book with a locked price below the live one, and lines in its first hour. */
+  async function underLive(booted: Booted, deadlineHours = 6) {
+    const metadata = { offpeak_deadline: new Date((hourIndex(booted.stack.clock()) + deadlineHours) * 3600 * 1000).toISOString() }
+    const job = await created(booted, [line("a"), line("b")], { metadata })
+    await booted.stack.db.query("UPDATE serving.jobs SET locked_price_in = 100000, locked_price_out = 400000")
+    return job
+  }
+
+  test("above the locked price, lines move to a later eligible hour instead of running", async () => {
+    const booted = await bootStack()
+    const job = await underLive(booted)
+    const hour = job.offpeak.planned_hours[0]!
+    booted.stack.setClock(hour * 3600 + 5)
+    booted.stack.load.util = () => 0.5
+    booted.stack.candidateCache.clear()
+    const step = await runBatch(booted.stack, job.id, { hour })
+    expect(step.moved).toBe(2)
+    expect(step.ran).toBe(0)
+    expect((await records(booted)).rows.length).toBe(0)
+    const moved = await lines(booted, job.id)
+    expect(moved.rows.every((row) => row.status === "queued" && Number(row.hour) > hour)).toBe(true)
+    const slots = await booted.stack.db.query<{ hour: string }>("SELECT hour FROM serving.job_slots WHERE job_id = $1", [job.id])
+    expect(slots.rows.some((row) => Number(row.hour) === hour)).toBe(false)
+    expect((await view(booted, job.id)).offpeak.planned_hours.every((h) => h > hour)).toBe(true)
+  })
+
+  test("in the last eligible hour it runs anyway, at the locked price", async () => {
+    const booted = await bootStack()
+    const job = await underLive(booted, 3)
+    const last = hourIndex(booted.stack.clock()) + 1
+    expect(job.offpeak.planned_hours).toEqual([last])
+    booted.stack.setClock(last * 3600 + 5)
+    booted.stack.load.util = () => 0.5
+    booted.stack.candidateCache.clear()
+    const step = await drain(booted, job.id, last)
+    expect(step.moved).toBe(0)
+    expect((await records(booted)).rows.map((row) => String(row.price_in))).toEqual(["100000", "100000"])
+  })
+
+  test("a host whose floor is above the locked price is never asked", async () => {
+    const booted = await bootStack()
+    const job = await underLive(booted, 3)
+    await booted.stack.db.query("UPDATE serving.jobs SET locked_price_in = 99999")
+    const last = job.offpeak.planned_hours[0]!
+    booted.stack.setClock(last * 3600 + 5)
+    await drain(booted, job.id, last)
+    expect((await records(booted)).rows.length).toBe(0)
+  })
+
+  test("the hour's hold is placed once, lines are carved from it, and what is left is released", async () => {
+    const booted = await bootStack()
+    const job = await created(booted, Array.from({ length: 12 }, (_, i) => line(`l${i}`)))
+    const hour = job.offpeak.planned_hours[0]!
+    booted.stack.setClock(hour * 3600 + 5)
+    const { ledger } = booted.stack
+    const real = ledger.admit.bind(ledger)
+    const admits: { amount: bigint; fromHold?: string; ttl?: number }[] = []
+    ledger.admit = async (wallet, amount, held, holdId, now, ttl, fromHold) => {
+      admits.push({ amount, fromHold, ttl })
+      return real(wallet, amount, held, holdId, now, ttl, fromHold)
+    }
+    expect((await runBatch(booted.stack, job.id, { hour })).left).toBe(4)
+    expect(admits[0]!.fromHold).toBeUndefined()
+    expect(admits[0]!.ttl).toBeGreaterThan(3600)
+    expect(admits.slice(1).every((row) => row.fromHold === admits.slice(1)[0]!.fromHold && row.fromHold?.startsWith("slot_"))).toBe(true)
+    await drain(booted, job.id, hour)
+    expect(admits.filter((row) => row.ttl !== undefined).length).toBe(1)
+    expect(await ledger.committed(booted.buyer, 0n)).toBe(BigInt(((await view(booted, job.id)).offpeak.actual_cost)))
+  })
+
+  test("a withdraw-all stops lines the same as any request, and a lowered cap binds them", async () => {
+    const booted = await bootStack()
+    const job = await created(booted, [line("a"), line("b")])
+    const hour = job.offpeak.planned_hours[0]!
+    booted.stack.setClock(hour * 3600 + 5)
+    booted.indexer.buyers.get(booted.buyer)!.withdrawRequestedAt = 5n
+    const step = await runBatch(booted.stack, job.id, { hour })
+    expect(step.ran).toBe(0)
+    expect((await records(booted)).rows.length).toBe(0)
+  })
+
+  test("a line the pipeline refuses for good is written out as failed, and the job finishes", async () => {
+    const booted = await bootStack()
+    const job = await created(booted, [line("a")])
+    await booted.stack.db.query("UPDATE serving.file_chunks SET content = convert_to($1, 'UTF8') WHERE storage_key IN (SELECT input_file_id FROM serving.jobs)", [JSON.stringify({ body: { model: "ofm-8b", messages: "nope" } })])
+    await runTo(booted, job.id, job.offpeak.planned_hours[0]!)
+    const seen = await view(booted, job.id)
+    expect(seen.status).toBe("failed")
+    expect(seen.request_counts.failed).toBe(1)
+    const text = await (await booted.app.request(`/v1/files/${job.output_file_id}/content`, { headers: owner(booted) })).text()
+    expect(JSON.parse(text.trim()).error.code).toBe("bad_messages")
+  })
+
+  test("past its deadline a job expires, unbilled", async () => {
+    const booted = await bootStack()
+    const job = await created(booted, [line("a")])
+    booted.stack.setClock(Date.parse(job.offpeak.deadline) / 1000 + 1)
+    expect(await dueNightSlots(booted.stack)).toEqual([])
+    expect((await view(booted, job.id)).status).toBe("expired")
+  })
+
+  test("after a crash a line with no record runs again, and one that billed is refunded, never billed twice", async () => {
+    const booted = await bootStack()
+    const job = await created(booted, [line("a"), line("b")])
+    const hour = job.offpeak.planned_hours[0]!
+    booted.stack.setClock(hour * 3600 + 5)
+    const { db } = booted.stack
+    await db.query("UPDATE serving.job_lines SET status = 'running', attempt = 1, claimed_at = $1", [booted.stack.clock()])
+    const { serveChat } = await import("../src/pipeline.ts")
+    const { accountPayer } = await import("../src/pipeline.ts")
+    const actor = (await accountPayer(booted.stack, booted.key.accountId, 400))!
+    const billed = lineReqId(job.id, 0, 1)
+    await serveChat(booted.stack, new Request("http://router/", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "ofm-8b", messages: [{ role: "user", content: "line a" }], max_tokens: 8 }) }), { lockedPrice: { in: 140_000n, out: 560_000n }, actor, reqId: billed })
+    expect(await dueNightSlots(booted.stack)).toEqual([])
+    booted.stack.setClock(booted.stack.clock() + MAX_REQUEST_S + 121)
+    const due = await dueNightSlots(booted.stack)
+    expect(due).toEqual([{ jobId: job.id, hour }])
+    const after = await lines(booted, job.id)
+    expect(after.rows.map((row) => row.status)).toEqual(["failed", "queued"])
+    const refunds = await db.query<{ amount: string; payer: string }>("SELECT amount, payer FROM shared.refunds")
+    expect(refunds.rows.length).toBe(1)
+    expect(refunds.rows[0]!.payer).toBe(booted.buyer)
+    await drain(booted, job.id, hour)
+    expect((await records(booted)).rows.length).toBe(2)
+    expect((await view(booted, job.id)).status).toBe("completed")
+  })
+})
