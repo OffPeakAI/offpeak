@@ -260,3 +260,173 @@ describe("x402 upto", () => {
     const verified = await booted.facilitator.verify({ paymentPayload: JSON.parse(payment.header), paymentRequirements: { payTo: offer.payTo, asset: offer.asset } })
     expect(verified).toMatchObject({ isValid: true, payer: booted.buyer })
   })
+
+  test("two payments never share a nonce", async () => {
+    const op = client(await bootRouter())
+    const [a, b] = await Promise.all([op.x402.payUpto(requirement()), op.x402.payUpto(requirement())])
+    expect(a.payload.payload.nonce).not.toBe(b.payload.payload.nonce)
+  })
+
+  const elsewhere = "0x000000000000000000000000000000000000dead"
+  const bad: [string, Partial<UptoRequirement> & { extra?: Partial<UptoRequirement["extra"]> }][] = [
+    ["another token", { asset: elsewhere }],
+    ["another payee", { payTo: elsewhere }],
+    ["another spender", { extra: { spender: elsewhere } }],
+    ["another Permit2", { extra: { permit2: elsewhere } }],
+    ["a validBefore far ahead", { extra: { validBefore: now() + 86_400 } }],
+    ["a validBefore in the past", { extra: { validBefore: now() - 1 } }],
+  ]
+  for (const [name, overrides] of bad) {
+    test(`refuses to sign ${name}`, async () => {
+      const op = client(await bootRouter())
+      await expect(op.x402.payUpto(requirement(overrides))).rejects.toMatchObject({ code: "bad_requirement" })
+    })
+  }
+
+  test("refuses another network and a malformed offer", async () => {
+    const op = client(await bootRouter())
+    await expect(op.x402.payUpto({ ...requirement(), network: "eip155:1" })).rejects.toThrow()
+    await expect(op.x402.payUpto({ scheme: "upto" })).rejects.toThrow()
+  })
+
+  test("the cap stops a large ask, and the caller can raise it", async () => {
+    const booted = await bootRouter()
+    const ask2m = requirement({ maxAmountRequired: "2000000" })
+    await expect(client(booted).x402.payUpto(ask2m)).rejects.toMatchObject({ code: "above_upto_cap" })
+    const raised = await client(booted, { uptoCapMicro: 5_000_000n }).x402.payUpto(ask2m)
+    expect(raised.maxAmount).toBe(2_000_000n)
+  })
+
+  test("an explicit maxAmount cannot go under the requirement", async () => {
+    const op = client(await bootRouter())
+    await expect(op.x402.payUpto(requirement(), { maxAmount: 1n })).rejects.toMatchObject({ code: "bad_requirement" })
+    expect((await op.x402.payUpto(requirement(), { maxAmount: 80_000n })).maxAmount).toBe(80_000n)
+  })
+
+  test("a bad 402 stops the request instead of signing", async () => {
+    const booted = await bootDear()
+    const send = inProcess(booted.app)
+    const op = client(booted, {
+      fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (new Headers(init?.headers).has("payment-signature")) throw new Error("should not pay")
+        const res = await send(input, init)
+        const body = (await res.json()) as { accepts: { extra: Record<string, unknown> }[] }
+        for (const row of body.accepts) if (row.extra.spender) row.extra.spender = "0x000000000000000000000000000000000000dead"
+        return Response.json(body, { status: res.status })
+      }) as typeof fetch,
+    })
+    await expect(op.chat(ask("phish", 4000))).rejects.toMatchObject({ code: "bad_requirement" })
+  })
+})
+
+describe("op.proof", () => {
+  const reader = (answer: boolean | Error) =>
+    ({
+      readContract: async (args: unknown) => {
+        calls.push(args)
+        if (answer instanceof Error) throw answer
+        return answer
+      },
+    }) as unknown as PublicClient
+  const calls: unknown[] = []
+
+  async function settled() {
+    const booted = await bootRouter()
+    const op = client(booted, { apiKey: booted.key.token, publicClient: reader(true) })
+    const { envelope } = (await op.chat(ask("prove me"))) as ChatResult
+    const other = keccak256(toBytes("other leaf"))
+    const leaf = leafFor(envelope.record, envelope.routerSig, envelope.hostSig)
+    const leaves = [leaf, other]
+    const proofRow = { hour: 500_000, leaf, proof: merkleProof(leaves, 0), root: merkleRoot(leaves), txHash: `0x${"aa".repeat(32)}` }
+    return { booted, op, envelope, leaf, proofRow }
+  }
+
+  test("a settled record verifies locally and on the ledger", async () => {
+    const { booted, op, envelope, leaf, proofRow } = await settled()
+    booted.indexer.proofs.set(envelope.record.reqId, proofRow)
+    calls.length = 0
+    const report = await op.proof(envelope.record.reqId)
+    expect(report).toMatchObject({ ok: true, onchain: true, status: "verified", hour: 500_000 })
+    expect(calls[0]).toMatchObject({ functionName: "verifyLeaf", address: addressOf("UsageLedger").toLowerCase(), args: [500_000n, leaf, proofRow.proof] })
+  })
+
+  test("before settlement the proof is pending", async () => {
+    const { op, envelope } = await settled()
+    expect(await op.proof(envelope.record.reqId)).toMatchObject({ ok: false, onchain: false, status: "pending" })
+  })
+
+  test("a proof that does not reach its root fails without asking the chain", async () => {
+    const { booted, op, envelope, proofRow } = await settled()
+    booted.indexer.proofs.set(envelope.record.reqId, { ...proofRow, root: keccak256(toBytes("wrong root")) })
+    calls.length = 0
+    expect(await op.proof(envelope.record.reqId)).toMatchObject({ ok: false, onchain: false, status: "mismatch" })
+    expect(calls.length).toBe(0)
+  })
+
+  test("a proof for a leaf other than yours fails", async () => {
+    const { booted, op, envelope, proofRow } = await settled()
+    const leaves = [keccak256(toBytes("swap a")), keccak256(toBytes("swap b"))]
+    booted.indexer.proofs.set(envelope.record.reqId, { ...proofRow, leaf: leaves[0]!, proof: merkleProof(leaves, 0), root: merkleRoot(leaves) })
+    expect(await op.proof(envelope.record.reqId)).toMatchObject({ ok: false, status: "mismatch" })
+  })
+
+  test("a router that forges a leaf with a matching proof is caught by the leaf you hold", async () => {
+    const { booted, proofRow } = await settled()
+    const forged = [keccak256(toBytes("not your leaf")), keccak256(toBytes("forged neighbour"))]
+    const send = inProcess(booted.app)
+    const lying = client(booted, {
+      apiKey: booted.key.token,
+      publicClient: reader(true),
+      fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const res = await send(input, init)
+        if (!String(input).includes("/v1/usage/")) return res
+        const body = (await res.json()) as { envelope: { leaf: string } }
+        body.envelope.leaf = forged[0]!
+        return Response.json(body)
+      }) as typeof fetch,
+    })
+    const { envelope: mine } = (await lying.chat(ask("again"))) as ChatResult
+    booted.indexer.proofs.set(mine.record.reqId, { ...proofRow, leaf: forged[0]!, proof: merkleProof(forged, 0), root: merkleRoot(forged) })
+    expect(await lying.proof(mine.record.reqId)).toMatchObject({ ok: false, onchain: false, status: "mismatch" })
+  })
+
+  test("the ledger saying no is a failure, whatever the proof says", async () => {
+    const { booted, envelope, proofRow } = await settled()
+    booted.indexer.proofs.set(envelope.record.reqId, proofRow)
+    const op = client(booted, { apiKey: booted.key.token, publicClient: reader(false) })
+    expect(await op.proof(envelope.record.reqId)).toMatchObject({ ok: false, onchain: false, status: "mismatch" })
+  })
+
+  test("without an RPC the result says the chain was not asked", async () => {
+    const { booted, envelope, proofRow } = await settled()
+    booted.indexer.proofs.set(envelope.record.reqId, proofRow)
+    const op = client(booted, { apiKey: booted.key.token })
+    expect(await op.proof(envelope.record.reqId)).toMatchObject({ ok: true, onchain: false, status: "local_only" })
+  })
+
+  test("a failed RPC read is not reported as proven", async () => {
+    const { booted, envelope, proofRow } = await settled()
+    booted.indexer.proofs.set(envelope.record.reqId, proofRow)
+    const op = client(booted, { apiKey: booted.key.token, publicClient: reader(new Error("rpc down")) })
+    expect(await op.proof(envelope.record.reqId)).toMatchObject({ ok: true, onchain: false, status: "local_only" })
+  })
+
+  test("an unknown request is not found, and a bad id is refused", async () => {
+    const { op } = await settled()
+    expect(await op.proof(`0x${"12".repeat(32)}`)).toMatchObject({ ok: false, status: "not_found" })
+    await expect(op.proof("nonsense")).rejects.toThrow()
+  })
+})
+
+describe("usage log", () => {
+  test("keeps what this client saw, newest first, filtered by time", async () => {
+    const booted = await bootRouter()
+    const op = client(booted, { apiKey: booted.key.token })
+    const first = (await op.chat(ask("one"))) as ChatResult
+    const second = (await op.chat(ask("two"))) as ChatResult
+    const ids = op.recentUsage().map((env) => env.record.reqId)
+    expect(ids).toEqual([second.envelope.record.reqId, first.envelope.record.reqId])
+    expect(op.recentUsage(booted.stack.clock() + 1)).toEqual([])
+    expect(op.usageRecord(first.envelope.record.reqId.toUpperCase().replace("0X", "0x"))?.leaf).toBe(first.envelope.leaf)
+  })
+})

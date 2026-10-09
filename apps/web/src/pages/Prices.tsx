@@ -102,3 +102,91 @@ function LiveTicket({ model }: { model: string }) {
     </aside>
   )
 }
+
+function ModelDetail({ model }: { model: string }) {
+  const board = useBoard(model)
+  const status = useStatus()
+  const [leg, setLeg] = useState<Leg>("out")
+  const sealedOn = status.data?.features.sealed ?? false
+  return (
+    <>
+      <Section title="The next 168 hours" aside={<Segmented label="Price leg" value={leg} options={LEGS} onChange={setLeg} />}>
+        <Data query={board} lines={6}>
+          {(data) =>
+            data.next168h.length > 0 ? (
+              <>
+                <ForecastChart slots={data.next168h} leg={leg} />
+                {!data.forecastFromHistory && <p className="note">Not enough load history yet, so this forecast assumes 30% load. A forecast is not a quote: the live price at request start is what you pay.</p>}
+              </>
+            ) : (
+              <Empty title="No forecast yet.">A forecast needs at least one active host with a price sheet.</Empty>
+            )
+          }
+        </Data>
+      </Section>
+      <Section title="Hosts">
+        <Data query={board}>
+          {(data) =>
+            data.hosts.length > 0 ? (
+              <>
+                <table className="ledger">
+                  <thead>
+                    <tr>
+                      <th>Host</th>
+                      <th className="num">Live in / out</th>
+                      <th className="num">Base in / out</th>
+                      <th className="num">Floor in / out</th>
+                      <th className="num">30-day discount</th>
+                      <th className="num">Bond</th>
+                      <th>Status</th>
+                      <th>Sealed</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.hosts.map((host) => (
+                      <tr key={host.host}>
+                        <td data-label="Host">
+                          <span>
+                            <Mono value={host.host} />
+                            {host.host === data.now?.host && <span className="pill gold">cheapest</span>}
+                          </span>
+                        </td>
+                        <td data-label="Live" className="num">
+                          <span>
+                            <Pair leg={host.live} />
+                            <span className="note below">{belowPercent(BigInt(host.live.out), BigInt(host.base.out))}% below base</span>
+                          </span>
+                        </td>
+                        <td data-label="Base" className="num">
+                          <Pair leg={host.base} />
+                        </td>
+                        <td data-label="Floor" className="num">
+                          <Pair leg={host.floor} />
+                        </td>
+                        <td data-label="30-day discount" className="num">
+                          {host.effective_discount_30d_bps === null ? <span className="note">no data yet</span> : formatBps(host.effective_discount_30d_bps)}
+                        </td>
+                        <td data-label="Bond" className="num">
+                          <Usdg micro={host.bond} />
+                        </td>
+                        <td data-label="Status">
+                          <span className={host.routable ? "pill ok" : "pill wait"}>{HOST_STATUS[host.status] ?? "Unknown"}</span>
+                        </td>
+                        <td data-label="Sealed">{host.sealed ? <span className="pill ok">Attested</span> : <span className="note">{sealedOn ? "No" : "Not switched on yet"}</span>}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <p className="note">Buyer prices per 1M tokens at this hour, all with the {formatBps(data.feeBps)} fee so they compare directly. The 30-day discount is what buyers actually paid against base.</p>
+              </>
+            ) : (
+              <Empty title="No hosts have posted a price sheet for this model yet.">
+                Run a GPU? <a href="/hosts">Host with Offpeak</a>.
+              </Empty>
+            )
+          }
+        </Data>
+      </Section>
+    </>
+  )
+}
