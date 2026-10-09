@@ -127,3 +127,118 @@ describe("shared.window_perf", () => {
     const row = (await samples(booted)).rows.find((r) => r.demanded)!
     expect(row.tokens_per_s).toBe(0)
   })
+
+  test("an idle minute of an active Window is on record as no demand, and a closed Window stops", async () => {
+    const booted = await bootStack()
+    holdWindow(booted)
+    for (let i = 0; i < 4; i++) await sweepAfter(booted, 1)
+    expect((await samples(booted)).rows.length).toBeGreaterThan(0)
+    expect((await samples(booted)).rows.every((row) => !row.demanded)).toBe(true)
+    booted.indexer.windows.clear()
+    const count = (await samples(booted)).rows.length
+    await sweepAfter(booted, 2)
+    await sweepAfter(booted, 2)
+    expect((await samples(booted)).rows.length).toBeLessThanOrEqual(count + 1)
+  })
+
+  test("two routers merge one minute, and it is written once", async () => {
+    const booted = await bootStack()
+    holdWindow(booted)
+    const { db } = booted.stack
+    const minute = Math.floor(booted.stack.clock() / MINUTE)
+    const flush = (tokens: number, busy: number) =>
+      db.query(
+        `INSERT INTO serving.window_minutes (window_id, minute, tokens, busy_ms, demanded) VALUES (7,$1,$2,$3,true)
+         ON CONFLICT (window_id, minute) DO UPDATE SET tokens = serving.window_minutes.tokens + EXCLUDED.tokens, busy_ms = GREATEST(serving.window_minutes.busy_ms, EXCLUDED.busy_ms)`,
+        [minute, tokens, busy],
+      )
+    await flush(100, 1_000)
+    await flush(100, 500)
+    await sweepAfter(booted, 2)
+    await sweepAfter(booted, 1)
+    const row = (await samples(booted)).rows.find((r) => r.demanded)!
+    expect(row.tokens_per_s).toBe(200)
+  })
+
+  test("a failure to write a sample cannot fail a request", async () => {
+    const booted = await bootStack()
+    holdWindow(booted)
+    await booted.stack.db.exec("ALTER TABLE shared.window_perf RENAME TO window_perf_gone")
+    expect((await draw(booted, "draw")).status).toBe(200)
+  })
+
+  test("a demanded minute stays demanded when the sweep finds no flush for it, as after a crash", async () => {
+    const booted = await bootStack()
+    holdWindow(booted)
+    expect((await draw(booted, "one")).status).toBe(200)
+    booted.stack.windowPerf.take(booted.stack.clock() + MINUTE)
+    await booted.stack.db.query("UPDATE shared.window_perf SET tokens_per_s = 42")
+    const minute = Math.floor(booted.stack.clock() / MINUTE)
+    await booted.stack.db.query("INSERT INTO serving.window_minutes (window_id, minute) VALUES (7, $1)", [minute])
+    await sweepAfter(booted, 2)
+    const row = (await samples(booted)).rows.find((r) => Number(r.minute) === minute)!
+    expect(row.demanded).toBe(true)
+    expect(row.tokens_per_s).toBe(42)
+  })
+})
+
+describe("X-Offpeak-Window", () => {
+  test("a Window for another model does not draw, and says why", async () => {
+    const booted = await bootStack()
+    holdWindow(booted)
+    const row = booted.indexer.windows.get(WINDOW)! as { modelDigest: Hex }
+    row.modelDigest = keccak256(toBytes("another-model"))
+    const res = await draw(booted, "wrong")
+    expect(res.status).toBe(402)
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("window_wrong_model")
+    expect((await draw(booted, "fallback", false, { "x-offpeak-window-fallback": "prepaid" })).status).toBe(200)
+    const records = await booted.stack.db.query<{ pay_mode: number }>("SELECT pay_mode FROM shared.usage_records")
+    expect(records.rows.map((r) => r.pay_mode)).toEqual([0])
+  })
+
+  test("outside its hours a Window says so", async () => {
+    const booted = await bootStack()
+    holdWindow(booted)
+    booted.stack.setClock(booted.stack.clock() + 8_000)
+    const res = await draw(booted, "late")
+    expect(res.status).toBe(402)
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("window_not_active")
+  })
+
+  test("a price cap does not apply to tokens already paid for, and the price shown is zero", async () => {
+    const booted = await bootStack()
+    holdWindow(booted)
+    const res = await draw(booted, "capped", false, { "x-offpeak-max-price": "in=0.000001,out=0.000001" })
+    expect(res.status).toBe(200)
+    expect(res.headers.get("x-offpeak-price")).toBe("in=0,out=0")
+  })
+
+  test("everyone else is served from what is left of a Window's host", async () => {
+    const booted = await bootStack()
+    holdWindow(booted, 70)
+    await sweepWindows(booted.stack)
+    expect(booted.stack.windowShares.get(`${booted.host}:${booted.modelDigest}`)).toBe(0.7)
+    const prepaid = () =>
+      booted.app.request("/v1/chat/completions", {
+        method: "POST",
+        headers: { authorization: `Bearer ${booted.key.token}`, "content-type": "application/json" },
+        body: JSON.stringify({ model: "ofm-8b", messages: [{ role: "user", content: "outside" }], max_tokens: 8 }),
+      })
+    expect((await prepaid()).status).toBe(200)
+    booted.stack.load.note(booted.host, booted.modelDigest, "output", 40, booted.stack.clock() - 1)
+    booted.stack.candidateCache.clear()
+    booted.stack.load.util = () => 0.5
+    expect((await prepaid()).status).toBe(503)
+    expect((await draw(booted, "holder")).status).toBe(200)
+  })
+
+  test("the share a Window keeps is capped, and an ended Window keeps none", async () => {
+    const booted = await bootStack()
+    holdWindow(booted, 500)
+    await sweepWindows(booted.stack)
+    expect(booted.stack.windowShares.get(`${booted.host}:${booted.modelDigest}`)).toBe(0.7)
+    booted.stack.setClock(booted.stack.clock() + 8_000)
+    await sweepWindows(booted.stack)
+    expect(booted.stack.windowShares.size).toBe(0)
+  })
+})
