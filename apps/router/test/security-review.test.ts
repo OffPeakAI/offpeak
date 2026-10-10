@@ -363,3 +363,196 @@ describe("contract vouchers", () => {
     expect((await channelChat(booted, id, chatBody("fine"))).status).toBe(200)
   })
 })
+
+describe("flex with a cap", () => {
+  const flexChat = (booted: Booted, cap: string) => chat(booted, chatBody("cap me"), prepaid(booted, { "x-offpeak-max-price": cap, "x-offpeak-flex": new Date((booted.stack.clock() + 12 * 3600) * 1000).toISOString() }))
+
+  async function capLocked() {
+    const booted = await bootStack()
+    booted.stack.load.util = () => 0.5
+    const res = await flexChat(booted, "in=0.105,out=0.42")
+    expect(res.status).toBe(202)
+    const { id } = (await res.json()) as { id: string }
+    const job = (await booted.stack.db.query<{ hour: string; last_hour: string; deadline: string; locked_price_in: string; cap_locked: boolean }>("SELECT l.hour, j.last_hour, j.deadline, j.locked_price_in, j.cap_locked FROM serving.jobs j JOIN serving.job_lines l ON l.job_id = j.id WHERE j.id = $1", [id])).rows[0]!
+    expect(job.cap_locked).toBe(true)
+    expect(BigInt(job.locked_price_in)).toBeLessThan(140_000n)
+    booted.stack.setClock(Number(job.last_hour) * 3600 + 5)
+    booted.stack.candidateCache.clear()
+    return { booted, id, job }
+  }
+
+  test("does not run above its price in the last hour, and lapses unbilled", async () => {
+    const { booted, id, job } = await capLocked()
+    expect(await runBatch(booted.stack, id, { hour: Number(job.hour) })).toEqual({ ran: 0, moved: 0, left: 1 })
+    expect(await runBatch(booted.stack, id)).toEqual({ ran: 0, moved: 0, left: 1 })
+    booted.stack.setClock(Number(job.deadline))
+    await dueNightSlots(booted.stack)
+    const after = await booted.stack.db.query<{ status: string }>("SELECT status FROM serving.jobs WHERE id = $1", [id])
+    expect(after.rows[0]!.status).toBe("expired")
+    expect((await records(booted)).rows.length).toBe(0)
+  })
+
+  test("runs if the live price comes down to it", async () => {
+    const { booted, id, job } = await capLocked()
+    booted.stack.load.util = () => 0
+    expect((await runBatch(booted.stack, id, { hour: Number(job.hour) })).ran).toBe(1)
+    expect((await records(booted)).rows[0]!.price_in).toBe(job.locked_price_in)
+  })
+
+  test("a job whose average sits under the cap keeps the ordinary last-hour rule", async () => {
+    const booted = await bootStack()
+    booted.stack.load.util = () => 0.7
+    const res = await flexChat(booted, "in=0.17,out=0.65")
+    expect(res.status).toBe(202)
+    const { id } = (await res.json()) as { id: string }
+    const job = (await booted.stack.db.query<{ hour: string; last_hour: string; cap_locked: boolean }>("SELECT l.hour, j.last_hour, j.cap_locked FROM serving.jobs j JOIN serving.job_lines l ON l.job_id = j.id WHERE j.id = $1", [id])).rows[0]!
+    expect(job.cap_locked).toBe(false)
+    booted.stack.setClock(Number(job.last_hour) * 3600 + 5)
+    booted.stack.candidateCache.clear()
+    expect((await runBatch(booted.stack, id, { hour: Number(job.hour) })).ran).toBe(1)
+    expect((await records(booted)).rows.length).toBe(1)
+  })
+})
+
+describe("upto before confirmation", () => {
+  test("one wallet can have 8 requests waiting for the chain, and a slot frees when it answers", async () => {
+    const booted = await bootStack()
+    booted.facilitator.delayMs = 150
+    const streams = await Promise.all(Array.from({ length: 8 }, (_, i) => uptoChat(booted, `parallel-${i}`, chatBody(`p${i}`, { stream: true }))))
+    expect(streams.map((res) => res.status)).toEqual(Array(8).fill(200))
+    const settle = spyOn(booted.stack.facilitator, "settle")
+    const ninth = await uptoChat(booted, "parallel-8", chatBody("p8", { stream: true }))
+    expect(ninth.status).toBe(429)
+    expect(await errorCode(ninth)).toBe("unconfirmed_limit")
+    expect(settle).not.toHaveBeenCalled()
+    settle.mockRestore()
+    for (const text of await Promise.all(streams.map((res) => res.text()))) expect(text).toContain("offpeak.usage")
+    const again = await uptoChat(booted, "parallel-9", chatBody("p9", { stream: true }))
+    expect(again.status).toBe(200)
+    await again.text()
+  })
+
+  test("a failed authorization frees its slot too", async () => {
+    const booted = await bootStack()
+    booted.facilitator.delayMs = 5
+    for (let i = 0; i < 12; i++) {
+      const seed = `failing-${i}`
+      booted.facilitator.failReqIds.add(keccak256(toBytes(seed)))
+      expect(await (await uptoChat(booted, seed, chatBody("x", { stream: true }))).text()).toContain("authorize_failed")
+    }
+  })
+
+  test("the budget counts the input, so a dear prompt pauses at its first token", async () => {
+    const booted = await bootStack()
+    booted.stack.sheets[0]!.baseIn = booted.stack.sheets[0]!.baseIn.map(() => 20_000_000_000n)
+    booted.stack.preconfirmTimeoutMs = 20
+    booted.facilitator.delayMs = 2_000
+    const text = await (await uptoChat(booted, "dear-prompt", chatBody("longform", { stream: true, max_tokens: 800 }))).text()
+    expect(text).toContain("authorize_failed")
+    expect(text.split('"content"').length - 1).toBe(1)
+  })
+})
+
+describe("after Redis loses its data", () => {
+  function fakeRedis() {
+    const values = new Map<string, string>()
+    return {
+      values,
+      get: async (key: string) => values.get(key) ?? null,
+      set: async (key: string, value: string) => void values.set(key, String(value)),
+      hset: async () => 1,
+      expire: async () => 1,
+      incrby: async (key: string, by: string) => {
+        const next = Number(values.get(key) ?? 0) + Number(by)
+        values.set(key, String(next))
+        return next
+      },
+    }
+  }
+
+  test("Window draws are rebuilt from the records, so a holder cannot draw them twice", async () => {
+    const booted = await bootStack()
+    const redis = fakeRedis()
+    booted.stack.counters = new RedisCounters(redis as never)
+    holdWindow(booted)
+    expect((await chat(booted, chatBody("draw"), prepaid(booted, { "x-offpeak-window": WINDOW }))).status).toBe(200)
+    const before = await pending(booted)
+    expect(before).toBeGreaterThan(0n)
+    redis.values.clear()
+    expect(await pending(booted)).toBe(0n)
+    const hour = hourIndex(booted.stack.clock())
+    await rebuildSpend(booted.stack.db, redis as never, hour - 48)
+    expect(await pending(booted)).toBe(before)
+    await rebuildSpend(booted.stack.db, redis as never, hour - 48)
+    expect(await pending(booted)).toBe(before)
+  })
+})
+
+describe("the cheap ends of the API", () => {
+  const signedSheet = async (booted: Booted, signer: ReturnType<typeof roleAccount>) => {
+    const sheet = sheetFromJson({
+      host: signer.address.toLowerCase(),
+      modelDigest: booted.modelDigest,
+      baseIn: Array(168).fill("200000"),
+      baseOut: Array(168).fill("800000"),
+      floorIn: "100000",
+      floorOut: "400000",
+      validFrom: booted.stack.clock() + 7200,
+      nonce: "2",
+    } as never)
+    return { sheet: sheetToJson(sheet), sig: await signer.signTypedData(sheetTypedData(sheet, booted.stack.registry) as never) }
+  }
+
+  test("a price sheet needs a host in the registry", async () => {
+    const booted = await bootStack()
+    const post = async (signer: ReturnType<typeof roleAccount>) => booted.app.request("/v1/hosts/price-sheet", { method: "POST", body: JSON.stringify(await signedSheet(booted, signer)) })
+    const stranger = await post(roleAccount("settlerB"))
+    expect(stranger.status).toBe(400)
+    expect(((await stranger.json()) as { error: string }).error).toBe("host_not_registered")
+    expect((await booted.stack.db.query("SELECT 1 FROM serving.price_sheets")).rows.length).toBe(0)
+    booted.indexer.hosts.get(booted.host)!.status = 5
+    expect((await post(roleAccount("host"))).status).toBe(400)
+    booted.indexer.hosts.get(booted.host)!.status = 2
+    expect((await post(roleAccount("host"))).status).toBe(200)
+  })
+
+  test("uploads stop at an account's quota, and expired files do not count", async () => {
+    const booted = await bootStack()
+    const upload = () => booted.app.request("/v1/files", { method: "POST", headers: prepaid(booted), body: JSON.stringify({ purpose: "batch", content: "hello" }) })
+    const { accountId } = booted.key
+    const fill = (expiresAt: number) => booted.stack.db.query("INSERT INTO serving.files (id, account_id, purpose, bytes, sha256, storage_key, expires_at) VALUES ('file_full',$1,'batch',$2,'','file_full',to_timestamp($3))", [accountId, 512 * 1024 * 1024, expiresAt])
+    await fill(booted.stack.clock() + 3600)
+    const full = await upload()
+    expect(full.status).toBe(429)
+    expect(await errorCode(full)).toBe("file_quota")
+    await booted.stack.db.query("UPDATE serving.files SET expires_at = to_timestamp($1)", [booted.stack.clock() - 1])
+    expect((await upload()).status).toBe(200)
+    await booted.stack.db.query("INSERT INTO serving.files (id, account_id, purpose, bytes, sha256, storage_key, expires_at) SELECT 'f' || n, $1, 'batch', 1, '', 'f' || n, to_timestamp($2) FROM generate_series(1, 200) AS n", [accountId, booted.stack.clock() + 3600])
+    expect((await upload()).status).toBe(429)
+  })
+
+  test("a buyer who cannot be served gets that answer before any line is tokenized", async () => {
+    const booted = await bootStack()
+    const line = JSON.stringify({ custom_id: "a", body: { model: "ofm-8b", messages: [{ role: "user", content: "x".repeat(10_000) }] } })
+    const { id } = (await (await booted.app.request("/v1/files", { method: "POST", headers: prepaid(booted), body: JSON.stringify({ purpose: "batch", content: line }) })).json()) as { id: string }
+    booted.indexer.buyers.get(booted.buyer)!.withdrawRequestedAt = 5n
+    const res = await booted.app.request("/v1/batches", { method: "POST", headers: prepaid(booted), body: JSON.stringify({ input_file_id: id, completion_window: "24h" }) })
+    expect(res.status).toBe(403)
+    expect(await errorCode(res)).toBe("withdraw_pending")
+  })
+
+  test("internal tokens compare whole, at any length", async () => {
+    expect(sameSecret("token", "token")).toBe(true)
+    expect(sameSecret("token", "tokem")).toBe(false)
+    expect(sameSecret("to", "token")).toBe(false)
+    expect(sameSecret(undefined, "token")).toBe(false)
+    const booted = await bootStack()
+    booted.stack.internalToken = "secret"
+    const app = (await import("../src/app.ts")).createApp(booted.stack)
+    const canary = (headers: Record<string, string>) => app.request("/internal/audit/canary", { method: "POST", headers, body: "{}" })
+    expect((await canary({ "x-offpeak-internal": "wrong-length" })).status).toBe(403)
+    expect((await canary({ "x-offpeak-internal": "secret" })).status).toBe(400)
+    expect((await app.request("/internal/night-jobs/due", { headers: { authorization: "Bearer secret" } })).status).toBe(200)
+    expect((await app.request("/internal/night-jobs/due", { headers: { authorization: "Bearer other" } })).status).toBe(403)
+  })
+})
