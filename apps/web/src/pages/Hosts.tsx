@@ -160,3 +160,116 @@ function Challenges() {
     </Section>
   )
 }
+
+function ChallengeRow({ row, serverTime }: { row: Challenge; serverTime: number }) {
+  const { token } = useSession()
+  const { run, busy } = useTx()
+  const now = useNow(serverTime)
+  const [text, setText] = useState("")
+  const open = row.state === 1 && now <= row.respondBy
+  const submit = (event: FormEvent) => {
+    event.preventDefault()
+    void run(`Respond to challenge ${row.id}`, async (wallet) => {
+      const plan = await trpcMutation<{ tx: Tx; responseHash: Hex }>("hosts.respondTx", { challengeId: row.id, response: text.trim() }, token)
+      await wallet.send("Commit your response", plan.tx)
+    })
+  }
+  return (
+    <li className="channel">
+      <header>
+        <strong>
+          Challenge {row.id}: {EVIDENCE_KIND[row.kind] ?? "Unknown"}
+        </strong>
+        <span className="pill wait">{CHALLENGE_STATE[row.state] ?? "Unknown"}</span>
+      </header>
+      <p className="note">{open ? `Respond within ${formatDuration(row.respondBy - now)}.` : `Filed ${formatUtc(row.filedAt)}.`}</p>
+      {open && (
+        <form className="panel" onSubmit={submit}>
+          <Field label="Your response" hint="Keep this document. Only its hash goes on chain.">
+            <textarea rows={4} value={text} onChange={(event) => setText(event.target.value)} />
+          </Field>
+          <button type="submit" className="btn small" disabled={busy || text.trim() === ""}>
+            Commit response
+          </button>
+        </form>
+      )}
+    </li>
+  )
+}
+
+const DIGEST = /^0x[0-9a-fA-F]{64}$/
+
+function Register() {
+  const { token, wallet: operator } = useSession()
+  const { run, busy } = useTx()
+  const models = useQuery({ queryKey: ["models"], queryFn: () => rest<{ data: ModelRow[] }>("/v1/models"), staleTime: 60_000 })
+  const [endpoint, setEndpoint] = useState("")
+  const [digest, setDigest] = useState("")
+  const [maxTps, setMaxTps] = useState("100")
+  const [imageDigest, setImageDigest] = useState("")
+  const [gpuClass, setGpuClass] = useState<string>("h100-80g-sxm")
+  const [bond, setBond] = useState(formatUsdg(HOST_MIN_BOND).replaceAll(",", ""))
+  const parsedBond = parseUsdg(bond)
+  const tps = /^[1-9]\d{0,8}$/.test(maxTps) ? Number(maxTps) : 0
+  const urlOk = /^https?:\/\/\S+$/.test(endpoint)
+  const belowMin = parsedBond.ok && parsedBond.micro < HOST_MIN_BOND
+  const ready = urlOk && DIGEST.test(digest) && DIGEST.test(imageDigest) && tps > 0 && parsedBond.ok && !belowMin
+  const submit = (event: FormEvent) => {
+    event.preventDefault()
+    if (!ready || !parsedBond.ok || !operator) return
+    const bondUsdg = parsedBond.micro.toString()
+    void run("Register host", async (wallet) => {
+      // Keys sort the same way as the router's canonical JSON.
+      const message = JSON.stringify({ endpoint, operator })
+      const sig = await wallet.sign("Sign the endpoint", () => wallet.client.signMessage({ message }))
+      const plan = await trpcMutation<Plan>("hosts.registerPlan", { endpoint, models: [{ digest, maxTps: tps }], imageDigest, gpuClass, bondUsdg, sig }, token)
+      await wallet.approve(plan.approval)
+      await wallet.send("Register and post the bond", plan.tx)
+    })
+  }
+  return (
+    <form className="panel" onSubmit={submit}>
+      <h3>Registration helper</h3>
+      <p className="note">This prepares calldata for your wallet. Offpeak does not send the transaction for you.</p>
+      <div className="fields">
+        <Field label="Public endpoint" error={endpoint !== "" && !urlOk ? "Use a full https URL." : null}>
+          <input value={endpoint} autoComplete="off" onChange={(event) => setEndpoint(event.target.value)} placeholder="https://gpu.example" />
+        </Field>
+        <Field label="GPU class">
+          <select value={gpuClass} onChange={(event) => setGpuClass(event.target.value)}>
+            {GPU_CLASSES.filter((name) => name !== DEV_ONLY_GPU_CLASS).map((name) => (
+              <option key={name} value={name}>
+                {name}
+              </option>
+            ))}
+          </select>
+        </Field>
+        <Field label="Model digest" hint="From offpeak-host verify." error={digest !== "" && !DIGEST.test(digest) ? "0x and 64 hex characters." : null}>
+          <input value={digest} list="model-digests" autoComplete="off" onChange={(event) => setDigest(event.target.value)} placeholder="0x…" />
+          <datalist id="model-digests">
+            {models.data?.data.map((row) => (
+              <option key={row.id} value={row.offpeak.digest}>
+                {row.id}
+              </option>
+            ))}
+          </datalist>
+        </Field>
+        <Field label="Max tokens per second" error={maxTps !== "" && tps === 0 ? "Enter a whole number." : null}>
+          <input inputMode="numeric" value={maxTps} autoComplete="off" onChange={(event) => setMaxTps(event.target.value)} />
+        </Field>
+        <Field label="Image digest" error={imageDigest !== "" && !DIGEST.test(imageDigest) ? "0x and 64 hex characters." : null}>
+          <input value={imageDigest} autoComplete="off" onChange={(event) => setImageDigest(event.target.value)} placeholder="0x…" />
+        </Field>
+        <Field label="Bond" error={belowMin ? "The minimum bond is 2,000 USDG." : !parsedBond.ok ? parsedBond.error : null} hint="Slashable. Paid in USDG.">
+          <span className="input-unit">
+            <input inputMode="decimal" value={bond} autoComplete="off" onChange={(event) => setBond(event.target.value)} />
+            <span>USDG</span>
+          </span>
+        </Field>
+      </div>
+      <button type="submit" className="btn" disabled={busy || !ready}>
+        Prepare and sign
+      </button>
+    </form>
+  )
+}

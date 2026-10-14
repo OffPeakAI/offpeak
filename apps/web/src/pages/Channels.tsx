@@ -142,3 +142,82 @@ function ChannelRow({ row, now }: { row: Channel; now: number }) {
     </li>
   )
 }
+
+/** Both parties sign the final amount, so the deposit comes back at once instead of after 2 hours. */
+function CooperativeClose({ row }: { row: Channel }) {
+  const { run, busy } = useTx()
+  const network = useNetwork()
+  const close = () =>
+    void run("Close channel now", async (wallet) => {
+      const channelManager = deployedBook.channelManager
+      const finalCumulative = finalOwed(row).toString()
+      const refused = finalAmountProblem(finalOwed(row), BigInt(row.deposit))
+      if (refused) throw new Refused(refused)
+      const deadline = (Math.floor(Date.now() / 1000) + CLOSE_TTL_S).toString()
+      const payerSig = await wallet.sign("Sign the final amount", () =>
+        wallet.client.signTypedData({
+          domain: domain("OffpeakChannel", channelManager),
+          types: coopCloseTypes,
+          primaryType: "CooperativeClose",
+          message: { channelId: row.id, finalCumulative: BigInt(finalCumulative), deadline: BigInt(deadline) },
+        }),
+      )
+      const reply = await rest<Tx & { routerSig: Hex }>(`/v1/channels/${row.id}/close`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ finalCumulative, deadline, payerSig }),
+      }).catch((error) => {
+        throw error instanceof ApiError && error.status === 404 ? new ApiError("close_unavailable", 404, "close_unavailable") : error
+      })
+      const wrong = closeCallError(reply, deployedBook, { id: row.id, finalCumulative: BigInt(finalCumulative), deadline: BigInt(deadline), payerSig })
+      if (wrong) throw new Refused(wrong)
+      await wallet.send("Close the channel", { to: reply.to, data: reply.data, value: "0", chainId: reply.chainId }, { fn: "cooperativeClose" })
+    })
+  return (
+    <button type="button" className="btn small" disabled={busy || !network.data} onClick={close}>
+      Close now
+    </button>
+  )
+}
+
+function OpenChannel() {
+  const { token, wallet: me } = useSession()
+  const { run, busy } = useTx()
+  const [deposit, setDeposit] = useState("")
+  const [hours, setHours] = useState("24")
+  const parsed = parseUsdg(deposit)
+  const hoursValue = /^\d{1,5}$/.test(hours) ? Number(hours) : 0
+  const tooShort = hoursValue * 3_600 < CHANNEL_MIN_LIFETIME_S
+  const tooSmall = parsed.ok && parsed.micro < 1_000_000n
+  const open = (event: FormEvent) => {
+    event.preventDefault()
+    if (!parsed.ok || tooShort || tooSmall) return
+    void run(`Open a ${formatUsdg(parsed.micro)} USDG channel`, async (wallet) => {
+      const plan = await trpcMutation<Plan & { channelId: Hex }>("channels.openPlan", { deposit: parsed.micro.toString(), lifetimeSeconds: hoursValue * 3_600 }, token)
+      await wallet.approve(plan.approval, { spender: deployedBook.channelManager, amount: parsed.micro })
+      await wallet.send("Open the channel", plan.tx, { fn: "open", args: [parsed.micro] })
+      if (me) rememberChannel(me, plan.channelId)
+    }).then((ok) => ok && setDeposit(""))
+  }
+  return (
+    <form className="panel" onSubmit={open}>
+      <div className="fields">
+        <Field label="Deposit" hint="At least 1 USDG." error={deposit !== "" && !parsed.ok ? parsed.error : tooSmall ? "A channel needs at least 1 USDG." : null}>
+          <span className="input-unit">
+            <input inputMode="decimal" autoComplete="off" value={deposit} onChange={(event) => setDeposit(event.target.value)} placeholder="0.00" />
+            <span>USDG</span>
+          </span>
+        </Field>
+        <Field label="Lifetime" hint="At least 6 hours. The router stops 2 hours before expiry." error={tooShort ? "At least 6 hours." : null}>
+          <span className="input-unit">
+            <input inputMode="numeric" autoComplete="off" value={hours} onChange={(event) => setHours(event.target.value)} />
+            <span>hours</span>
+          </span>
+        </Field>
+      </div>
+      <button type="submit" className="btn ghost" disabled={busy || !parsed.ok || tooShort || tooSmall}>
+        Open channel
+      </button>
+    </form>
+  )
+}
