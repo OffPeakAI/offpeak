@@ -1,0 +1,9 @@
+/* Native transparent projection; the renderer owns all approved mechanical motion. */
+.approved-logo{position:relative;display:inline-block;aspect-ratio:1;vertical-align:middle;overflow:visible;animation:none!important;transform:none!important;transform-origin:center;isolation:isolate}
+.approved-logo>.approved-logo-art{position:relative!important;inset:auto!important;display:block;width:100%!important;height:100%!important;max-width:none;overflow:visible;object-fit:contain;animation:none!important;transform:none!important;stroke:none;stroke-width:0;fill:none;pointer-events:none}
+.approved-logo>.mark-blink,.approved-logo>.mark-scan,.approved-logo>.hero-eye-overlay{display:none!important}
+.approved-logo::before,.approved-logo::after{animation:none!important}
+.faithful-header .nav-icon-layer .approved-logo{width:34px;height:34px;aspect-ratio:1}
+#hero .hero-premium-stage .hero-premium-logo .approved-logo{width:64px;height:60px;aspect-ratio:auto}
+@media(max-width:639px){#hero .hero-premium-stage .hero-premium-logo .approved-logo{width:56px;height:52px}}
+@media(prefers-reduced-motion:reduce){.approved-logo,.approved-logo *{animation:none!important;transition:none!important}}
