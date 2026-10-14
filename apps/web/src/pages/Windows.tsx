@@ -194,3 +194,157 @@ function Listings({ windows }: { windows: WindowRow[] }) {
     </Data>
   )
 }
+
+function BuyListing({ listing }: { listing: Listing }) {
+  const { stage } = useSession()
+  const { go, busy } = usePlan()
+  if (stage !== "ready") return null
+  const buy = () => void go(`Buy listing ${listing.listingId}`, `Buy for ${formatUsdg(listing.units * listing.pricePerUnit)} USDG`, "windows.buyListingPlan", { listingId: listing.listingId.toString(), units: listing.units.toString(), maxPricePerUnit: listing.pricePerUnit.toString() })
+  return (
+    <button type="button" className="btn small" disabled={busy} onClick={buy}>
+      Buy all
+    </button>
+  )
+}
+
+function Delist({ listing }: { listing: Listing }) {
+  const { token } = useSession()
+  const { run, busy } = useTx()
+  const pull = () => void run(`Take down listing ${listing.listingId}`, async (wallet) => wallet.send("Take down the listing", await trpcMutation<Tx>("windows.delistTx", { listingId: listing.listingId.toString() }, token)))
+  return (
+    <button type="button" className="btn ghost small" disabled={busy} onClick={pull}>
+      Take down
+    </button>
+  )
+}
+
+function Holdings({ windows, serverTime }: { windows: WindowRow[]; serverTime: number }) {
+  const holdings = useAuthed<Holding[]>("windows.holdings", undefined, { refetchInterval: 30_000 })
+  const now = useNow(serverTime)
+  return (
+    <Data query={holdings} lines={2}>
+      {(rows) =>
+        rows.length > 0 ? (
+          <ul className="windows">
+            {rows.map((row) => (
+              <HoldingCard key={row.id} holding={row} window={windows.find((item) => item.id === row.id)} now={now} />
+            ))}
+          </ul>
+        ) : (
+          <Empty title="You hold no Windows.">Buy one from the board above.</Empty>
+        )
+      }
+    </Data>
+  )
+}
+
+function HoldingCard({ holding, window: row, now }: { holding: Holding; window: WindowRow | undefined; now: number }) {
+  const { token } = useSession()
+  const { run, busy } = useTx()
+  const phase = row ? windowPhase(row, now) : "ended"
+  const balance = BigInt(holding.balance)
+  const claim = () =>
+    void run(`Claim Window ${holding.id}`, async (wallet) => {
+      const plan = await trpcMutation<{ kind: string; tx: Tx }>("windows.claimTx", { id: holding.id }, token)
+      await wallet.send(plan.kind === "failure" ? "Claim the failure refund" : "Claim the expiry refund", plan.tx)
+    })
+  return (
+    <li className="window">
+      <header>
+        <span className="window-id">Window {holding.id}</span>
+        <span className="pill ok">{formatTokens(holding.balance)} held</span>
+      </header>
+      <dl className="facts wide">
+        <dt>Your cost per unit</dt>
+        <dd>
+          <Usdg micro={holding.costBasis} />
+        </dd>
+        <dt>Tokens drawn</dt>
+        <dd>{formatTokens(holding.drawnTokens)}</dd>
+      </dl>
+      {phase !== "ended" && balance > 0n && <Resell holding={holding} />}
+      {phase === "before" && balance > 0n && <Cancel holding={holding} />}
+      {phase === "ended" && (
+        <div className="row">
+          <button type="button" className="btn small" disabled={busy || balance === 0n} onClick={claim}>
+            {row?.failed ? "Claim failure refund" : "Claim expiry refund"}
+          </button>
+          <p className="note">{row?.failed ? "A failed Window refunds undrawn tokens plus a share of the host's collateral." : "Unused tokens refund 50% of the host price plus the full fee, once the Window's hours settle."}</p>
+        </div>
+      )}
+    </li>
+  )
+}
+
+function Resell({ holding }: { holding: Holding }) {
+  const { token } = useSession()
+  const { run, busy } = useTx()
+  const [units, setUnits] = useState("1")
+  const [price, setPrice] = useState("")
+  const count = parseCount(units)
+  const parsed = parseUsdg(price)
+  const balance = BigInt(holding.balance)
+  const costBasisPerUnit = BigInt(holding.costBasis)
+  const ready = count.ok && parsed.ok && parsed.micro > 0n && count.value <= balance
+  const input = ready ? { units: count.value, pricePerUnit: parsed.micro, costBasisPerUnit } : null
+  const preview = input ? resalePreview(input) : null
+  const submit = (event: FormEvent) => {
+    event.preventDefault()
+    if (!input) return
+    void run(`List ${input.units} of Window ${holding.id}`, async (wallet) => {
+      const plan = await trpcMutation<{ tx: Tx }>("windows.listTx", { id: holding.id, units: input.units.toString(), pricePerUnit: input.pricePerUnit.toString() }, token)
+      await wallet.send("List for resale", plan.tx)
+    })
+  }
+  return (
+    <form className="panel" onSubmit={submit}>
+      <div className="fields">
+        <Field label="Units to list" error={count.ok && count.value > balance ? "That is more units than you hold." : units !== "" && !count.ok ? count.error : null}>
+          <input inputMode="numeric" autoComplete="off" value={units} onChange={(event) => setUnits(event.target.value)} />
+        </Field>
+        <Field label="Price per unit" error={price !== "" && !parsed.ok ? parsed.error : null}>
+          <span className="input-unit">
+            <input inputMode="decimal" autoComplete="off" value={price} onChange={(event) => setPrice(event.target.value)} placeholder="0.00" />
+            <span>USDG</span>
+          </span>
+        </Field>
+      </div>
+      {input && preview ? (
+        <p className="fee-line">
+          <strong>{resaleFeeLine(input)}</strong>
+          <span className="note">You receive {formatUsdg(preview.proceeds)} USDG if all of it sells.</span>
+        </p>
+      ) : (
+        <p className="note">Fee: {RESALE_RULE}.</p>
+      )}
+      <button type="submit" className="btn ghost small" disabled={busy || !input}>
+        List for resale
+      </button>
+    </form>
+  )
+}
+
+function Cancel({ holding }: { holding: Holding }) {
+  const { token } = useSession()
+  const { run, busy } = useTx()
+  const [units, setUnits] = useState("1")
+  const count = parseCount(units)
+  const over = count.ok && count.value > BigInt(holding.balance)
+  const submit = (event: FormEvent) => {
+    event.preventDefault()
+    if (!count.ok || over) return
+    void run(`Cancel ${count.value} of Window ${holding.id}`, async (wallet) => {
+      await wallet.send("Cancel for a refund", await trpcMutation<Tx>("windows.cancelTx", { id: holding.id, units: count.value.toString() }, token))
+    })
+  }
+  return (
+    <form className="row end" onSubmit={submit}>
+      <Field label="Cancel units" hint={`Before the start you get back ${CANCEL_RULE}.`} error={over ? "That is more units than you hold." : null}>
+        <input inputMode="numeric" autoComplete="off" value={units} onChange={(event) => setUnits(event.target.value)} />
+      </Field>
+      <button type="submit" className="btn ghost small" disabled={busy || !count.ok || over}>
+        Cancel (95%)
+      </button>
+    </form>
+  )
+}
