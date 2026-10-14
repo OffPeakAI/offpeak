@@ -79,3 +79,100 @@ beforeAll(async () => {
   redis.disconnect()
   chain = await startLocalChain(CHAIN_PORT)
   indexer = Bun.serve({ port: INDEXER_PORT, fetch: () => Response.json({ head: { block: 1, blockTs: 1, finalizedBlock: 1 }, data: [] }) })
+
+  db = await openDb(DATABASE)
+  const now = Math.floor(Date.now() / 1000)
+  await db.query("INSERT INTO serving.audit_day_keys (id, day, wrapped, retire_at) VALUES ('day-1', 1, 'wrapped-key', to_timestamp($1))", [now - 60])
+  await db.query("INSERT INTO serving.audit_samples (req_id, host, model_digest, enc_body, day_key_id, ts, created_at, expires_at) VALUES ('0xold','0xh','0xm','sealed','day-1',0,to_timestamp($1),to_timestamp($2))", [now - 200_000, now - 60])
+  await db.query("INSERT INTO serving.audit_samples (req_id, host, model_digest, enc_body, day_key_id, ts, created_at, expires_at) VALUES ('0xnew','0xh','0xm','sealed','day-2',0,to_timestamp($1),to_timestamp($2))", [now, now + 3_600])
+}, 240_000)
+
+afterAll(async () => {
+  service?.kill()
+  await service?.exited
+  indexer?.stop(true)
+  chain?.stop()
+  redisServer?.kill()
+  await redisServer?.exited
+  if (dataDir) {
+    Bun.spawnSync([`${PG_BIN}pg_ctl`, "-D", join(dataDir, "pg"), "-m", "immediate", "stop"], { stdout: "ignore", stderr: "ignore", env: pgEnv })
+    rmSync(dataDir, { recursive: true, force: true })
+  }
+})
+
+describe.skipIf(!hasServices)("the auditor as a real process", () => {
+  test("refuses to start without its encryption key", async () => {
+    const child = Bun.spawn(["bun", "run", "apps/auditor/src/main.ts"], { cwd: root, env: environment({ OFFPEAK_AUDIT_SAMPLE_KEK: undefined }), stdout: "pipe", stderr: "pipe" })
+    expect(await child.exited).not.toBe(0)
+    expect(await new Response(child.stderr).text()).toContain("OFFPEAK_AUDIT_SAMPLE_KEK")
+  }, 30_000)
+
+  test("refuses to start holding another role's key", async () => {
+    const child = Bun.spawn(["bun", "run", "apps/auditor/src/main.ts"], { cwd: root, env: environment({ OFFPEAK_ROUTER_SIGNER_KEY: routerKey }), stdout: "pipe", stderr: "pipe" })
+    expect(await child.exited).not.toBe(0)
+    expect(await new Response(child.stderr).text()).toContain("OFFPEAK_ROUTER_SIGNER_KEY")
+  }, 30_000)
+
+  test("boots from its environment and serves health", async () => {
+    service = Bun.spawn(["bun", "run", "apps/auditor/src/main.ts"], { cwd: root, env: environment(), stdout: "pipe", stderr: "pipe" })
+    void (async () => {
+      for await (const chunk of service!.stdout) lines += new TextDecoder().decode(chunk)
+    })()
+    await waitFor(async () => (await fetch(`http://127.0.0.1:${AUDITOR_PORT}/health`)).ok, "health")
+    expect(lines).toContain('"event":"started"')
+    expect(lines).not.toContain("op_live_sample")
+    expect(lines).not.toContain("abababab")
+  }, 30_000)
+
+  test("every job is scheduled in BullMQ, on the configured Redis database", async () => {
+    const queue = auditQueue(REDIS_URL)
+    const schedulers = await queue.getJobSchedulers(0, 50)
+    expect(schedulers.map((row) => row.key).sort()).toEqual(["bond", "coverage", "metering", "outcomes", "plan-canaries", "recalibrate", "refresh-accepted", "retention", "score", "sequential", "throughput"])
+    await queue.close()
+    const own = new Redis(REDIS_URL)
+    const other = new Redis(`redis://127.0.0.1:${REDIS_PORT}/0`)
+    expect((await own.keys("bull:offpeak-audit:*")).length).toBeGreaterThan(0)
+    expect(await other.keys("bull:*")).toEqual([])
+    own.disconnect()
+    other.disconnect()
+  }, 15_000)
+
+  test("the retention job deletes expired bodies and destroys their key, and leaves live ones", async () => {
+    await waitFor(async () => (await db.query("SELECT 1 FROM serving.audit_samples WHERE req_id = '0xold'")).rows.length === 0, "retention")
+    expect((await db.query("SELECT 1 FROM serving.audit_samples WHERE req_id = '0xnew'")).rows).toHaveLength(1)
+    expect((await db.query("SELECT 1 FROM serving.audit_day_keys WHERE id = 'day-1'")).rows).toHaveLength(0)
+  }, 30_000)
+
+  test("canary accounts reach the database without their keys", async () => {
+    const rows = await db.query<{ wallet: string; label: string }>("SELECT * FROM serving.canary_accounts")
+    expect(rows.rows).toHaveLength(1)
+    expect(JSON.stringify(rows.rows)).not.toContain("op_live")
+  })
+
+  test("the low-bond alert shows on metrics and in the log", async () => {
+    await waitFor(async () => (await (await fetch(`http://127.0.0.1:${AUDITOR_PORT}/metrics`)).text()).includes("auditor_bond_low 1"), "bond metric")
+    await waitFor(async () => lines.includes('"event":"auditor_bond_low"'), "bond log")
+  }, 30_000)
+
+  test("a failing job is logged and the process keeps running", async () => {
+    const queue = auditQueue(REDIS_URL)
+    await queue.add("canary", { host: "0xnot-a-model", modelDigest: "0xnone", delayS: 0 })
+    await queue.close()
+    await Bun.sleep(300)
+    expect((await fetch(`http://127.0.0.1:${AUDITOR_PORT}/health`)).ok).toBe(true)
+  }, 15_000)
+
+  test("SIGTERM closes it cleanly", async () => {
+    service!.kill("SIGTERM")
+    expect(await service!.exited).toBe(0)
+    service = undefined
+  }, 20_000)
+
+  test("a restart picks the same schedules up again", async () => {
+    service = Bun.spawn(["bun", "run", "apps/auditor/src/main.ts"], { cwd: root, env: environment(), stdout: "pipe", stderr: "pipe" })
+    await waitFor(async () => (await fetch(`http://127.0.0.1:${AUDITOR_PORT}/health`)).ok, "health after restart")
+    const queue = auditQueue(REDIS_URL)
+    expect(await queue.getJobSchedulers(0, 50)).toHaveLength(11)
+    await queue.close()
+  }, 30_000)
+})
