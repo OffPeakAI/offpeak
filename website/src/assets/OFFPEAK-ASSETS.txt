@@ -1,0 +1,15 @@
+OFFPEAK artwork
+
+Exact current artwork copied from the user's 2026-10-13 graphics handoff.
+Accent #CCFF00; neutral gray hardware and charcoal screens.
+
+*-base.png: text-free 1254px source illustrations.
+*.mp4: silent 6-second loops.
+*-poster.png: finished static alternatives.
+The square scenes include social headlines. To fit a website card without duplicating its heading, display the illustration band (roughly y=230..920 of the 1024px square) inside an overflow-hidden slot; do not stretch it.
+
+The wordmark uses exact Nuixyber vector outlines. Font binaries are not bundled.
+Six small icon SVGs are original native vector drawings from prepare-assets.mjs; they follow the existing neutral hardware materials and lime accent.
+
+Provenance, usages, sizes and SHA-256 hashes are in offpeak-assets-manifest.json.
+Rebuild with: node scripts/prepare-assets.mjs [path-to-original-usi-outputs]

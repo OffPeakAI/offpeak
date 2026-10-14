@@ -1,0 +1,361 @@
+{
+  "brand": "OFFPEAK",
+  "revision": "2026-10-13 approved white mechanical logo",
+  "accent": "#CCFF00",
+  "notes": [
+    "Exact existing artwork is copied byte for byte. No generative replacements or raster edits.",
+    "Banner and mascot use the latest toon treatment; the five current technology studies retain their original detailed industrial illustration.",
+    "All illustrations depict product concepts. Receipt checks show inclusion/signatures, not proof of correct computation or metering.",
+    "Commercial font binaries are not redistributed. Existing supplied brand lettering is reused as vector outlines.",
+    "Six small interface icons are native SVG drawings created for this adaptation, using neutral isometric hardware and the same neon accent."
+  ],
+  "files": [
+    {
+      "file": "offpeak-mark.png",
+      "bytes": 618708,
+      "sha256": "6435ac67c836131a9d67663414ce02daa9bcda8c625489acba161c62a1c9435a",
+      "source": "offpeak-toon-pfp/source/center-computer.png",
+      "method": "exact byte-for-byte copy",
+      "usage": "Historical dark CRT reference only; replaced in active brand placements by approved white logo.",
+      "dimensions": [
+        759,
+        704
+      ]
+    },
+    {
+      "file": "offpeak-bot-left.png",
+      "bytes": 43861,
+      "sha256": "947d4c87569a41463ed80ab3d70c0e8c867aa8f7b523e92a4a63c628e5420486",
+      "source": "offpeak-center-banner-toon/left-bot.png",
+      "method": "exact byte-for-byte copy",
+      "usage": "Small accompanying isometric box bot; transparent.",
+      "dimensions": [
+        155,
+        166
+      ]
+    },
+    {
+      "file": "offpeak-bot-right.png",
+      "bytes": 46209,
+      "sha256": "5cfa994edee40eb3cd48e1ee8f246698a4fa690cd8d735af0ccf4b129440fbab",
+      "source": "offpeak-center-banner-toon/right-bot.png",
+      "method": "exact byte-for-byte copy",
+      "usage": "Small accompanying isometric round bot; transparent.",
+      "dimensions": [
+        155,
+        183
+      ]
+    },
+    {
+      "file": "offpeak-hero-assets.png",
+      "bytes": 996062,
+      "sha256": "b127b0ed4fdbb6df0f906c24b93035c981cd4be661f39ec4cd63545b56f90cf2",
+      "source": "offpeak-center-banner-toon/hero-assets.png",
+      "method": "exact byte-for-byte copy",
+      "usage": "Wide group of three exact current characters; transparent.",
+      "dimensions": [
+        2172,
+        724
+      ]
+    },
+    {
+      "file": "offpeak-banner.mp4",
+      "bytes": 99532,
+      "sha256": "f662960056b3625b1906052597500314424f5a0e092f469a61b8e4fda8f83811",
+      "source": "offpeak-center-banner-toon/offpeak-center-banner-toon.mp4",
+      "method": "exact byte-for-byte copy",
+      "usage": "Wide 3:1 animated character group with wordmark, six seconds, silent.",
+      "dimensions": [
+        1500,
+        500
+      ]
+    },
+    {
+      "file": "offpeak-banner.png",
+      "bytes": 278228,
+      "sha256": "717bde434c1208f291b8c9e21fd052c7e4f0f4d0560132a01e8cb7547237f789",
+      "source": "offpeak-center-banner-toon/offpeak-center-banner-toon.png",
+      "method": "exact byte-for-byte copy",
+      "usage": "Static / reduced-motion alternative for wide character group.",
+      "dimensions": [
+        1500,
+        500
+      ]
+    },
+    {
+      "file": "offpeak-capacity-base.png",
+      "bytes": 1701796,
+      "sha256": "7a10fa8f895916b7c0458dfde61c79e3396aacb59c289a6c85fbb36fd2866912",
+      "source": "offpeak-x-series/01-night-shift-base.png",
+      "method": "exact byte-for-byte copy",
+      "usage": "Spare GPU capacity, open-model routing and provider supply. Text-free source illustration.",
+      "dimensions": [
+        1254,
+        1254
+      ]
+    },
+    {
+      "file": "offpeak-capacity.mp4",
+      "bytes": 289451,
+      "sha256": "a8edd140401adc404d86eddcb9bf1e1645bcfbcb759a5721d5a41b27cbc64d26",
+      "source": "offpeak-x-series/01-night-shift.mp4",
+      "method": "exact byte-for-byte copy",
+      "usage": "Spare GPU capacity, open-model routing and provider supply. Finished 6-second silent animated concept.",
+      "dimensions": [
+        1024,
+        1024
+      ]
+    },
+    {
+      "file": "offpeak-capacity-poster.png",
+      "bytes": 1271064,
+      "sha256": "fe1906c345d3ededf342c03afbb47caf0632b2d29b5c6a6337933260505ab4d1",
+      "source": "offpeak-x-series/01-night-shift.png",
+      "method": "exact byte-for-byte copy",
+      "usage": "Spare GPU capacity, open-model routing and provider supply. Finished poster / reduced-motion fallback.",
+      "dimensions": [
+        1024,
+        1024
+      ]
+    },
+    {
+      "file": "offpeak-quote-base.png",
+      "bytes": 1519753,
+      "sha256": "4f10cb099b5df06d42376e29c2861e9b6df05d9d6957a497a9bd87e629bd1141",
+      "source": "offpeak-x-series/02-price-lock-base.png",
+      "method": "exact byte-for-byte copy",
+      "usage": "A capacity-based quote, fixed once accepted. Text-free source illustration.",
+      "dimensions": [
+        1254,
+        1254
+      ]
+    },
+    {
+      "file": "offpeak-quote.mp4",
+      "bytes": 288891,
+      "sha256": "d7e5a5efe0f59bef3d8ad87c6ab5e95de563e705c79764b6ec258a759dcb6d5c",
+      "source": "offpeak-x-series/02-price-lock.mp4",
+      "method": "exact byte-for-byte copy",
+      "usage": "A capacity-based quote, fixed once accepted. Finished 6-second silent animated concept.",
+      "dimensions": [
+        1024,
+        1024
+      ]
+    },
+    {
+      "file": "offpeak-quote-poster.png",
+      "bytes": 1150274,
+      "sha256": "e7f62a507f4a030d38770b8179ab94adbf33418fb9031d4c63c8241686e54760",
+      "source": "offpeak-x-series/02-price-lock.png",
+      "method": "exact byte-for-byte copy",
+      "usage": "A capacity-based quote, fixed once accepted. Finished poster / reduced-motion fallback.",
+      "dimensions": [
+        1024,
+        1024
+      ]
+    },
+    {
+      "file": "offpeak-authorize-base.png",
+      "bytes": 1650337,
+      "sha256": "bd51cabc103352f3fbfa4d0944265e1a7933f795cce652521de880a951c96d83",
+      "source": "offpeak-x-series/03-spend-guard-base.png",
+      "method": "exact byte-for-byte copy",
+      "usage": "Signed per-call authorization and spending caps. Text-free source illustration.",
+      "dimensions": [
+        1254,
+        1254
+      ]
+    },
+    {
+      "file": "offpeak-authorize.mp4",
+      "bytes": 260817,
+      "sha256": "58fb758bd2273a3c89d97c6f70c788e37fccca8fd68713296e380961676b2ce3",
+      "source": "offpeak-x-series/03-spend-guard.mp4",
+      "method": "exact byte-for-byte copy",
+      "usage": "Signed per-call authorization and spending caps. Finished 6-second silent animated concept.",
+      "dimensions": [
+        1024,
+        1024
+      ]
+    },
+    {
+      "file": "offpeak-authorize-poster.png",
+      "bytes": 1186479,
+      "sha256": "7c0ecc9761fcb5a1f6d58e5adc924df6d751c7a304d287af4277ffbe5415f123",
+      "source": "offpeak-x-series/03-spend-guard.png",
+      "method": "exact byte-for-byte copy",
+      "usage": "Signed per-call authorization and spending caps. Finished poster / reduced-motion fallback.",
+      "dimensions": [
+        1024,
+        1024
+      ]
+    },
+    {
+      "file": "offpeak-meter-base.png",
+      "bytes": 1571840,
+      "sha256": "7f94f870e379b3d54885574ed3bd61c3ad55c3bdae394cf011daf1f68894cb40",
+      "source": "offpeak-x-series/04-pay-what-runs-base.png",
+      "method": "exact byte-for-byte copy",
+      "usage": "Usage metering, charged usage and release of unused balance. Text-free source illustration.",
+      "dimensions": [
+        1254,
+        1254
+      ]
+    },
+    {
+      "file": "offpeak-meter.mp4",
+      "bytes": 299556,
+      "sha256": "ffa7b6fb425d7499514e9613515faca7e0b1564705a7371726324dda965bb350",
+      "source": "offpeak-x-series/04-pay-what-runs.mp4",
+      "method": "exact byte-for-byte copy",
+      "usage": "Usage metering, charged usage and release of unused balance. Finished 6-second silent animated concept.",
+      "dimensions": [
+        1024,
+        1024
+      ]
+    },
+    {
+      "file": "offpeak-meter-poster.png",
+      "bytes": 1185256,
+      "sha256": "32ab698cb681efaa4dbccc17ba7de62865e9787f2b71f13412c1ada72480c853",
+      "source": "offpeak-x-series/04-pay-what-runs.png",
+      "method": "exact byte-for-byte copy",
+      "usage": "Usage metering, charged usage and release of unused balance. Finished poster / reduced-motion fallback.",
+      "dimensions": [
+        1024,
+        1024
+      ]
+    },
+    {
+      "file": "offpeak-receipt-base.png",
+      "bytes": 1564088,
+      "sha256": "cfdb0b0e95ee9ba40852517d7f4e99aa7b9e3e8ed3279bb7982e7ad89e39d0c6",
+      "source": "offpeak-x-series/05-private-receipts-base.png",
+      "method": "exact byte-for-byte copy",
+      "usage": "Private receipts, public roots, signature / inclusion checks. Text-free source illustration.",
+      "dimensions": [
+        1254,
+        1254
+      ]
+    },
+    {
+      "file": "offpeak-receipt.mp4",
+      "bytes": 259542,
+      "sha256": "d695fdd9cf8f5a7cbbfd0968cefe57212f22099ad7b3503ced88aee422784849",
+      "source": "offpeak-x-series/05-private-receipts.mp4",
+      "method": "exact byte-for-byte copy",
+      "usage": "Private receipts, public roots, signature / inclusion checks. Finished 6-second silent animated concept.",
+      "dimensions": [
+        1024,
+        1024
+      ]
+    },
+    {
+      "file": "offpeak-receipt-poster.png",
+      "bytes": 1180650,
+      "sha256": "db84c71fec38924c4df9fd3793d89fd45ceda1bdca186695ab486aa43ac8eeab",
+      "source": "offpeak-x-series/05-private-receipts.png",
+      "method": "exact byte-for-byte copy",
+      "usage": "Private receipts, public roots, signature / inclusion checks. Finished poster / reduced-motion fallback.",
+      "dimensions": [
+        1024,
+        1024
+      ]
+    },
+    {
+      "file": "offpeak-wordmark.svg",
+      "bytes": 8523,
+      "sha256": "181de035c4b81cfd97d088799afe75379c99050fdcbcf26cb4e89d33ec59566d",
+      "source": "offpeak-center-banner-toon/source/offpeak-headline.json",
+      "method": "Exact existing Nuixyber wordmark path, tight viewBox and accessible title",
+      "usage": "Wordmark on light surfaces."
+    },
+    {
+      "file": "offpeak-wordmark-light.svg",
+      "bytes": 8523,
+      "sha256": "bec6749630668c2170e71076239310795d07cae6f0cc08346c6a6aab4a71043c",
+      "source": "offpeak-center-banner-toon/source/offpeak-headline.json",
+      "method": "Exact existing Nuixyber wordmark path, tight viewBox and accessible title",
+      "usage": "Wordmark on dark surfaces."
+    },
+    {
+      "file": "offpeak-icon-capacity.svg",
+      "bytes": 7456,
+      "sha256": "4684d4e503672d117c9579d8e3b6517d755afa65ae7329fa9feb2191c32fe27d",
+      "source": "scripts/prepare-assets.mjs",
+      "method": "Native vector interface illustration",
+      "usage": "Small capacity interface/card icon. Transparent background.",
+      "dimensions": [
+        320,
+        256
+      ]
+    },
+    {
+      "file": "offpeak-icon-quote.svg",
+      "bytes": 3079,
+      "sha256": "96a391257d76e13b9300b59c20dfc6d6b679bf95926396e0445a83d55a59a598",
+      "source": "scripts/prepare-assets.mjs",
+      "method": "Native vector interface illustration",
+      "usage": "Small quote interface/card icon. Transparent background.",
+      "dimensions": [
+        320,
+        256
+      ]
+    },
+    {
+      "file": "offpeak-icon-authorize.svg",
+      "bytes": 3351,
+      "sha256": "5f13c068f847e2f08b72a34ac20fe893fd9a965539c4e35efb18f9897dc04d87",
+      "source": "scripts/prepare-assets.mjs",
+      "method": "Native vector interface illustration",
+      "usage": "Small authorize interface/card icon. Transparent background.",
+      "dimensions": [
+        320,
+        256
+      ]
+    },
+    {
+      "file": "offpeak-icon-meter.svg",
+      "bytes": 4126,
+      "sha256": "b98414c68faac19ec55f10d9c6f0c36ca71723d13e3353d2be22fbf8c3d68494",
+      "source": "scripts/prepare-assets.mjs",
+      "method": "Native vector interface illustration",
+      "usage": "Small meter interface/card icon. Transparent background.",
+      "dimensions": [
+        320,
+        256
+      ]
+    },
+    {
+      "file": "offpeak-icon-withdraw.svg",
+      "bytes": 3147,
+      "sha256": "c779a0d6bcd9805df5d4ffbd9cb4eb9ebab3da4bd4deb6c51354f7c1f6652f41",
+      "source": "scripts/prepare-assets.mjs",
+      "method": "Native vector interface illustration",
+      "usage": "Small withdraw interface/card icon. Transparent background.",
+      "dimensions": [
+        320,
+        256
+      ]
+    },
+    {
+      "file": "offpeak-icon-receipt.svg",
+      "bytes": 3704,
+      "sha256": "686bbc56100c028705c4744e14c14f43b29cdd9f66a89c13ae741b2e052a72ee",
+      "source": "scripts/prepare-assets.mjs",
+      "method": "Native vector interface illustration",
+      "usage": "Small receipt interface/card icon. Transparent background.",
+      "dimensions": [
+        320,
+        256
+      ]
+    }
+  ],
+  "approvedLogo": {
+    "reference": "offpeak-white-logo-light-1080.mp4",
+    "referenceSha256": "206721a52915b7f073c344ae61f78af99a8c91ba8c4b774a7e80d915cd0ed9d0",
+    "webMotion": "Original model geometry and eight-second timeline ported verbatim into approved-logo.js; transparent native SVG, not a replacement design.",
+    "static": "offpeak-white-mark.svg",
+    "replaces": "offpeak-mark.png in active brand placements; older asset retained as historical source."
+  }
+}
