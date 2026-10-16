@@ -1,0 +1,22 @@
+/* Size can be overridden by the control; geometry never inherits legacy SVG paint. */
+svg.ui-icon {
+  display: inline-block;
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  vertical-align: middle;
+  overflow: visible;
+  fill: none;
+  stroke: none;
+  stroke-width: 0;
+  pointer-events: none;
+  shape-rendering: geometricPrecision;
+}
+
+[data-ui-icon] {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  line-height: 1;
+}
