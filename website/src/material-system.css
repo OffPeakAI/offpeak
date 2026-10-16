@@ -1,0 +1,239 @@
+/* OFFPEAK material and full-card explanation layer.
+   Loaded after scenes.css. Geometry, type sizes, animation names and durations remain in scenes.css. */
+:root {
+  --material-neon: #ccff00;
+  --material-edge: #747574;
+  --material-ink: #ebebeb;
+  --material-muted: #acafac;
+  --material-ease: cubic-bezier(.22, 1, .36, 1);
+}
+/* The dissolve reveals only the explainer, in place, without distorting its surface. */
+@property --material-dissolve { syntax:"<length>"; inherits:false; initial-value:0px; }
+@property --material-hover { syntax:"<number>"; inherits:false; initial-value:0; }
+
+/* The card plane stays straight in every state; illustration descendants retain their 3D. */
+:is(.material-card,.material-panel) {
+  transform:none!important;
+  rotate:none!important;
+  scale:1!important;
+  perspective:none!important;
+}
+
+/* Apply the approved graphite chassis to the objects, not to their surrounding page. */
+.material-card .offpeak-scene {
+  --scene-ink: #e4e4e4;
+  --scene-muted: #a3a7a3;
+  --scene-line: #5f625f;
+  --scene-paper: #3d3e3d;
+  --scene-lime: #ccff00;
+  background: transparent;
+}
+.material-card [data-material-surface] {
+  background-color: #3d3e3d;
+  background-image: linear-gradient(155deg, #636463e8 0%, #474847 32%, #353635 78%, #2d2e2d 100%);
+  border-color: #727472;
+  color: var(--material-ink);
+  box-shadow: inset 0 1px 0 #f3f3f33b, inset 1px 0 0 #dfe0df1f,
+    inset 0 -2px 0 #14141480, 0 3px 0 -1px #242624, 0 11px 24px #25262515;
+}
+.material-card [data-material-surface] :is(h3,strong,b) { color: #e5e6e5; }
+.material-card [data-material-surface] :is(p,small,.scene-subtitle) { color: #abaeab; }
+.material-card [data-material-surface] :is(.scene-kicker,.scene-small-icon,.scene-demo) { color: #b1b4b1; }
+.material-card [data-material-surface] .scene-demo {
+  background: #22232250;
+  border-color: #737873;
+  box-shadow: inset 0 1px 0 #ffffff08;
+}
+.material-card [data-material-surface] :is(.scene-small-icon svg,.endpoint-icon svg) {
+  transform: none;
+  stroke: currentColor;
+  filter: drop-shadow(0 1px 0 #17181766);
+}
+.material-card .quote-document {
+  isolation: isolate;
+  color: #e3e4e3;
+  background: none;
+  box-shadow: none;
+}
+.material-card .quote-document::before {
+  content: "";
+  position: absolute;
+  inset: -22px -5px -22px -22px;
+  z-index: -1;
+  border-radius: 15px;
+  border: 1px solid #6d726d;
+  background: linear-gradient(155deg,#5b5e5b,#3f433f 45%,#2f312f);
+  box-shadow: inset 0 1px 0 #f2f3f24a,inset 0 -2px 0 #17181780,0 10px 30px #34353415;
+}
+.material-card .quote-copy { border-color: #6c716c5c; }
+.material-card .quote-copy>span { color: #adb2ad; }
+.material-card .quote-selected strong { color: #dddedd; }
+.material-card .quote-selection { background: #ccff0025; outline: 1px solid #ccff0050; }
+.material-card .quote-context { background: #393c39ed; border-color: #79817a; color: #cecece; backdrop-filter: blur(12px); }
+.material-card .scene-key { background: #262726; border: 1px solid #6b726b; color: #cacaca; }
+.material-card :is(.quote-faint-line,.sheet-rule) { background: #a1a6a124; }
+.material-card .model-sheet-back { background: linear-gradient(145deg,#919391,#6f736f); color:#d0d2d0; }
+.material-card .model-sheet-middle { background: linear-gradient(145deg,#717571,#515551); color:#c2c5c2; }
+.material-card .model-paper-art { color: #878c87; }
+.material-card .model-center { fill: #ccff00; stroke: #bebfbe; filter: drop-shadow(0 0 7px #ccff0059); }
+.material-card .model-reveal { background: #323232ee; border-color: #7d847d; color: #e4e5e4; backdrop-filter: blur(12px); }
+.material-card .model-reveal p { border-color:#767d764d; }
+.material-card .model-reveal p span { color:#dddedd; }
+.material-card :is(.endpoint-icon,.endpoint-connection>span) {
+  background: linear-gradient(145deg,#5e635f,#3d403d);
+  border-color:#838a83;
+  color:#d1d1d1;
+  box-shadow:inset 0 1px 0 #f2f3f233,0 2px 0 #212221;
+}
+.material-card .endpoint-preview { background:#2c2f2c; border-color:#6269634a; }
+.material-card .endpoint-model { background:linear-gradient(140deg,#717872,#3b3c3b); border-color:#999a99; }
+.material-card .endpoint-flow-labels { color:#a3a8a3; }
+.material-card .endpoint-connection>span svg { stroke:#c3c4c3; }
+.material-card .endpoint-connection i { background:#868e8666; }
+.material-card .endpoint-connection i::after { background:#ccff00; box-shadow:0 0 8px #ccff0066; }
+.material-card .endpoint-caret { background:#ccff00; }
+.material-card .endpoint-code,.material-card .endpoint-code small { color:#adaead; }
+.material-card .endpoint-code>span { color:#ccff00; }
+.material-card .availability-tile { background-image:linear-gradient(140deg,#606360,#393d39 60%,#2e2e2e); border-color:#7c847c; }
+.material-card .availability-header { color:#bdbebd; }
+.material-card .availability-tile p,.material-card .availability-foot { color:#a3a9a3; }
+.material-card :is(.scene-dot,.availability-pulse,.radar-table i,.assistant-thinking i) {
+  background:#ccff00;
+  box-shadow:0 0 8px #ccff0047;
+}
+.material-card .capacity-state { color:#dedfde; }
+.material-card .availability-glyph i { background:#ccff00; border-color:#babbba; box-shadow:inset 0 1px 0 #e7e8e7,0 0 12px #ccff0030; }
+.material-card .meter-wave { background:#232523; border-color:#656c6547; box-shadow:inset 0 2px 5px #12131238; }
+.material-card .wave-bar { background:#a4a6a4; }
+.material-card .meter-playhead { background:#ccff00; box-shadow:0 0 10px #ccff0055; }
+.material-card .meter-controls,.material-card .meter-note,.material-card .meter-settlement span { color:#acadac; }
+.material-card .meter-token-pill { background:#2c2c2c; border-color:#6d6f6d; color:#c2c2c2; }
+.material-card .meter-play { color:#ccff00; }
+.material-card .meter-divider { background:#7880794d; }
+.material-card .meter-settlement strong { color:#dbdcdb; }
+.material-card .signature-sheet { background-image:linear-gradient(150deg,#696c69,#4b4e4b 47%,#383938); }
+.material-card .signature-title { color:#e9eae9; }
+.material-card .signature-header,.material-card .signature-field { color:#b7b7b7; border-color:#8a918a4f; }
+.material-card .signature-rule { background:#7d847e4d; }
+.material-card :is(.signature-line,.signature-understroke,.signature-tick) { stroke:#ccff00; filter:drop-shadow(0 0 2px #ccff0029); }
+.material-card .signature-pen { fill:#545a55; stroke:#cccccc; filter:drop-shadow(2px 4px 2px #1e1f1e33); }
+.material-card .radar-heading,.material-card .radar-footer { color:#bfc3bf; }
+.material-card .radar-grid { stroke:#848c84; opacity:.54; }
+.material-card .radar-area { fill:#ccff0022; stroke:#ccff00; }
+.material-card .radar-points { fill:#ccff00; stroke:#c5c6c5; }
+.material-card .radar-labels { fill:#b9bab9; }
+.material-card .radar-table>div { border-color:#8485843b; }
+.material-card .radar-table span,.material-card .radar-table strong { color:#c7c8c7; }
+.material-card .radar-table i.limited { background:#8d8e8d; box-shadow:none; }
+.material-card .radar-toggle { background:#2a2d2a; border-color:#686968; }
+.material-card .radar-toggle i { background:#b3b3b3; }
+.material-card :is(.assistant-prompt,.assistant-followup) { color:#dedfde; border-radius:12px; }
+.material-card .assistant-source { color:#b9bab9; border-radius:9px; }
+.material-card .assistant-output>div { color:#d8d8d8; border-color:#8890886b; }
+.material-card .assistant-output i { color:#afb0af; }
+.material-card .assistant-answer { color:#b6bab7; }
+.material-card .assistant-thinking,.material-card .assistant-complete { color:#a8aaa8; }
+.material-card .assistant-complete svg { stroke:#ccff00; }
+.material-card .wallet-browser { background:#393939; }
+.material-card .wallet-browser-tabs { background:linear-gradient(#a9aaa9,#909490); }
+.material-card .wallet-browser-tabs>span { background:#606460; color:#e4e4e4; }
+.material-card .wallet-browser-tabs>span i { background:#ccff00; border-color:#bababa; box-shadow:0 0 7px #ccff002e; }
+.material-card .wallet-browser-tabs :is(b,em) { color:#d9d9d9; }
+.material-card .wallet-browser-toolbar { background:#595e59; border-color:#939a9466; color:#cecece; }
+.material-card .wallet-browser-toolbar>div { background:#3a3e3a; color:#b7b8b7; box-shadow:inset 0 1px 4px #1f201f40; }
+.material-card .wallet-toolbar-icon { background:#373737; color:#ccff00; }
+.material-card .wallet-browser-skeleton i { background:#82888336; }
+.material-card .wallet-authorization p,.material-card .wallet-sign-row { color:#a9aaa9; }
+.material-card .wallet-authorization strong { color:#dedfde; }
+.material-card .wallet-cap { border-color:#868e864f; }
+.material-card .wallet-sign-row>strong { background:linear-gradient(#5b5d5b,#434343); border-color:#8b8d8b; color:#dfe0df; box-shadow:inset 0 1px 0 #dfe0df38; }
+.material-card .wallet-sign-row svg { stroke:#ccff00; }
+.material-card .wallet-approved>span { background:#2f302f; border-color:#858785; color:#ccff00; box-shadow:inset 0 1px 0 #ccff002a,0 0 15px #ccff000c; }
+.material-card .wallet-approved h3 { color:#dddedd; }
+.material-card .request-canvas { background-color:#363636; background-image:radial-gradient(circle,#96989645 .8px,transparent 1px); }
+.material-card :is(.request-canvas-label,.request-canvas-foot,.quote-after) { color:#b1b2b1; }
+.material-card .request-log-paper { box-shadow:inset 1px 0 0 #f3f4f329,-9px 0 25px #34353412; }
+.material-card .request-log-lines>div { color:#adaead; border-color:#8f908f40; }
+.material-card .request-log-lines strong { color:#d9d9d9; }
+.material-card .request-inserted { background:#363636; border-color:#7778775c; }
+.material-card .request-inserted-icon { background:#2a2a2a; border-color:#8b8d8b; color:#ccff00; }
+.material-card .request-inserted :is(strong,p) { color:#cccdcc; }
+.material-card .request-drop-line { background:#ccff00; box-shadow:0 0 8px #ccff003d; }
+.material-card .export-button { background:linear-gradient(145deg,#636a64,#3e3e3e); border:1px solid #848684; color:#cecece; box-shadow:inset 0 1px 0 #e6e7e62e; }
+.material-card .export-tooltip { background:#2b2b2b; color:#d5d6d5; border:1px solid #7b7c7b; }
+.material-card .export-menu>div { color:#bdbdbd; }
+.material-card .export-menu>div:first-child { background:#52535238; }
+.material-card .export-check-icon { stroke:#ccff00; }
+.material-card .scene-cursor { fill:#e2e3e2; stroke:#373737; filter:drop-shadow(0 2px 3px #19191935); }
+.material-card .scene-bottom-fade { background:linear-gradient(0deg,#323232,#32323299 22%,#32323200); }
+.material-card .material-eye { stroke:#ccff00!important; stroke-width:2.8; stroke-linecap:round; filter:drop-shadow(0 0 2px #ccff0066); }
+
+/* Physical graphite casing; all card interactions retain a straight front face. */
+.material-card {
+  position:relative; isolation:isolate;
+  background-color:#4c504d;
+  background-image:
+    repeating-linear-gradient(110deg,#ffffff03 0 1px,#00000002 1px 3px,transparent 3px 6px),
+    radial-gradient(ellipse at 20% 0%,#b9bab966,transparent 57%),
+    linear-gradient(150deg,#747975 0%,#4b504b 38%,#373837 78%,#292a29 100%);
+  box-shadow:inset 0 1px 0 #e1e3e19e,inset 1px 0 0 #aaaeab57,
+    inset -1px 0 0 #191b1999,inset 0 -3px 0 #131413b3,
+    0 1px 1px #181b191a,0 7px 12px -8px #21232180;
+}
+.material-card::before {
+  content:""; position:absolute; inset:8px; z-index:0; border-radius:inherit;
+  border:1px solid #1e1f1e;
+  background:
+    radial-gradient(ellipse at 35% -20%,#8f939029,transparent 64%),
+    repeating-linear-gradient(0deg,#ffffff02 0 1px,transparent 1px 3px),
+    linear-gradient(160deg,#3b3b3b,#2f302f 76%,#323232);
+  box-shadow:inset 0 2px 5px #0e0f0e4d,inset 0 0 0 1px #c7cac70c,
+    0 1px 0 #cbcfcb3b;
+  pointer-events:none;
+}
+.material-card::after {
+  content:""; position:absolute; inset:0; z-index:10; border-radius:inherit;
+  border:1px solid #aaafaa52;
+  background:
+    linear-gradient(#ccff00,#ccff00) calc(50% - 4px) calc(100% - 3px)/2px 3px no-repeat,
+    linear-gradient(#ccff00,#ccff00) calc(50% + 4px) calc(100% - 3px)/2px 3px no-repeat,
+    linear-gradient(160deg,#e7e9e726,transparent 25% 72%,#1112112b);
+  box-shadow:inset 0 1px 0 #f3f3f34d,inset 0 -1px 0 #0c0c0c80;
+  transition:border-color .38s var(--material-ease),box-shadow .38s var(--material-ease);
+  pointer-events:none;
+}
+.material-card>.scene-frame { background:transparent; z-index:1; }
+.material-card>p { color:#d6d8d6; text-shadow:0 1px 4px #12131273; }
+/* The whole feature card opens the explanation; the native button also supports keyboards. */
+.material-card.material-card-interactive { cursor:pointer; }
+.material-card.material-card-interactive::after {
+  --material-hover:0;
+  background:
+    radial-gradient(ellipse at var(--panel-light-x,35%) var(--panel-light-y,20%),rgb(204 255 0 / calc(var(--material-hover) * .035)),transparent 62%),
+    linear-gradient(#ccff00,#ccff00) calc(50% - 4px) calc(100% - 3px)/2px 3px no-repeat,
+    linear-gradient(#ccff00,#ccff00) calc(50% + 4px) calc(100% - 3px)/2px 3px no-repeat,
+    linear-gradient(160deg,#e7e9e726,transparent 25% 72%,#1112112b);
+  transition:--material-hover .38s var(--material-ease),border-color .38s var(--material-ease),box-shadow .38s var(--material-ease);
+}
+.material-card.material-card-interactive:is(:hover,:focus-within)::after {
+  --material-hover:1;
+  border-color:#c5d59866;
+  box-shadow:inset 0 1px 0 #f3f3f363,inset 0 0 22px #ccff0007,inset 0 -1px 0 #0c0c0c80;
+}
+.material-explore {
+  position:absolute;z-index:12;top:12px;right:12px;
+  display:flex;align-items:center;gap:7px;min-height:31px;padding:5px 9px;
+  border:1px solid #868c866b;border-radius:6px;
+  background:linear-gradient(150deg,#50534f,#30322f);color:#c9cebf;
+  box-shadow:inset 0 1px 0 #e1e5d729,0 1px 2px #12151240;
+  font:500 10px/1.2 Manrope,Arial,sans-serif;letter-spacing:.015em;
+  cursor:pointer;touch-action:manipulation;
+  transition:color .38s var(--material-ease),border-color .38s var(--material-ease),box-shadow .38s var(--material-ease);
+}
+.material-explore svg { width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round; }
+.material-card:hover .material-explore,.material-explore:focus-visible {
+  color:#e2ebd1;border-color:#ccff0059;
+  box-shadow:inset 0 1px 0 #e1e5d747,0 1px 2px #12151240,0 0 0 1px #ccff000c;
+}
+.material-explore:focus-visible { outline:2px solid #ccff00;outline-offset:4px; }
+.material-card[data-material-active="true"]::after { border-color:#b8c89b70; }
