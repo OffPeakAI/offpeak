@@ -282,3 +282,153 @@ describe("keys and audit responses", () => {
     const rows = await booted.stack.db.query<{ audit_opt_in: boolean }>("SELECT audit_opt_in FROM serving.accounts WHERE wallet = $1", [booted.buyer])
     expect(rows.rows[0]!.audit_opt_in).toBe(true)
   })
+
+  test("audit-response calldata goes to this deployment's court", async () => {
+    const booted = await bootStack()
+    booted.stack.auditCourt = "0x00000000000000000000000000000000000c0a7c"
+    const res = await booted.app.request("/v1/hosts/audit-response", { method: "POST", body: JSON.stringify({ challengeId: "7", response: "my answer" }) })
+    const body = (await res.json()) as { to: string; data: Hex; responseHash: Hex }
+    expect(body.to).toBe(booted.stack.auditCourt)
+    expect(decodeFunctionData({ abi: auditCourtAbi, data: body.data }).args).toEqual([7n, body.responseHash])
+    expect((await booted.app.request("/v1/hosts/audit-response", { method: "POST", body: "{}" })).status).toBe(400)
+    booted.stack.auditCourt = ""
+    expect((await booted.app.request("/v1/hosts/audit-response", { method: "POST", body: JSON.stringify({ challengeId: "7", response: "x" }) })).status).toBe(503)
+  })
+})
+
+describe("channel view", () => {
+  test("shows the vouchered cumulative beside what is owed", async () => {
+    const booted = await bootStack()
+    const id = keccak256(toBytes("view-channel"))
+    booted.indexer.channels.set(id, { payer: booted.buyer as Hex, deposit: 50_000_000n, claimed: 0n, lastSeq: 0n, expiry: BigInt(booted.stack.clock() + 86_400), challengeEndsAt: 0n, status: 1, closeRequested: false })
+    const view = async () => (await (await booted.app.request(`/v1/channels/${id}`)).json()) as { cumulative: string; owed: string }
+    expect(await view()).toMatchObject({ cumulative: "0", owed: "0" })
+    const body = JSON.stringify(chatBody())
+    const auth = await channelAuthHeader(roleAccount("buyer"), { channelId: id, ts: booted.stack.clock(), body })
+    const res = await booted.app.request("/v1/chat/completions", { method: "POST", headers: { "x-offpeak-channel": id, "x-offpeak-channel-auth": auth }, body })
+    const owed = res.headers.get("x-offpeak-channel-owed")!
+    expect(await view()).toMatchObject({ cumulative: "0", owed })
+    const sig = await roleAccount("buyer").signTypedData({ domain: domain("OffpeakChannel", booted.stack.channelManager), types: voucherTypes, primaryType: "Voucher", message: { channelId: id, seq: 1n, cumulative: BigInt(owed) } })
+    expect((await booted.app.request(`/v1/channels/${id}/voucher`, { method: "POST", body: JSON.stringify({ seq: "1", cumulative: owed, sig }) })).status).toBe(200)
+    expect(await view()).toMatchObject({ cumulative: owed, owed })
+  })
+})
+
+describe("load and stats", () => {
+  test("recordLoad writes one row per host and model, with requests in flight", async () => {
+    const booted = await bootStack()
+    booted.stack.load.enter(booted.host, booted.modelDigest)
+    booted.stack.load.enter(booted.host, booted.modelDigest)
+    booted.stack.load.leave(booted.host, booted.modelDigest)
+    await recordLoad(booted.stack)
+    const rows = await booted.stack.db.query<{ host: string; inflight: number; healthy: boolean }>("SELECT host, inflight, healthy FROM serving.host_load")
+    expect(rows.rows).toEqual([{ host: booted.host, inflight: 1, healthy: true }])
+  })
+
+  test("a finished chat leaves nothing in flight", async () => {
+    const booted = await bootStack()
+    expect((await chat(booted, chatBody())).status).toBe(200)
+    await (await chat(booted, chatBody({ stream: true }))).text()
+    expect(booted.stack.load.inflight(booted.host, booted.modelDigest)).toBe(0)
+  })
+
+  test("the stats job fills host_stats, the price board shows the discount, and it can run again", async () => {
+    const booted = await bootStack()
+    expect((await chat(booted, chatBody())).status).toBe(200)
+    await writeHostStats(booted.stack)
+    await writeHostStats(booted.stack)
+    const rows = await booted.stack.db.query<{ host: string; served_tokens: string; billed_host_micro: string; base_value_micro: string; effective_discount_bps: number }>("SELECT * FROM serving.host_stats")
+    expect(rows.rows).toHaveLength(1)
+    const row = rows.rows[0]!
+    expect(row.host).toBe(booted.host)
+    expect(Number(row.served_tokens)).toBeGreaterThan(0)
+    expect(BigInt(row.base_value_micro)).toBeGreaterThan(BigInt(row.billed_host_micro))
+    expect(row.effective_discount_bps).toBeGreaterThan(0)
+    const board = (await (await booted.app.request("/v1/prices")).json()) as { hosts: { effective_discount_30d_bps: number }[] }
+    expect(board.hosts[0]!.effective_discount_30d_bps).toBe(row.effective_discount_bps)
+  })
+
+  test("Window draws say nothing about a discount", async () => {
+    const booted = await bootStack()
+    const ts = booted.stack.clock()
+    const hash = `0x${"12".repeat(32)}`
+    await insertUsage(booted.stack.db, {
+      reqId: hash,
+      hour: hourIndex(ts),
+      ts,
+      payer: booted.buyer,
+      buyerRef: hash,
+      host: booted.host,
+      modelDigest: booted.modelDigest,
+      tokensIn: 1_000,
+      tokensOut: 1_000,
+      promptHash: hash,
+      outputHash: hash,
+      priceIn: 0n,
+      priceOut: 0n,
+      hostCostMicro: 0n,
+      feeMicro: 0n,
+      feeBps: 0,
+      payMode: 4,
+      payRef: hash,
+      sheetHash: booted.stack.sheets[0]!.sheetHash,
+      windowId: "1",
+      routerSig: "0x00",
+      hostSig: "0x00",
+      leaf: hash,
+      sealed: false,
+    })
+    await writeHostStats(booted.stack)
+    expect((await booted.stack.db.query("SELECT * FROM serving.host_stats")).rows).toEqual([])
+  })
+})
+
+describe("router boot", () => {
+  const key = (byte: string) => `0x${byte.repeat(32)}`
+  const dir = mkdtempSync(join(tmpdir(), "offpeak-boot-"))
+  const models = join(dir, "models.json")
+  writeFileSync(models, JSON.stringify([{ name: "ofm-8b", digest: `0x${"12".repeat(32)}`, contextLength: 8192, kind: "chat" }]))
+  const env = {
+    OFFPEAK_ENV: "mainnet",
+    OFFPEAK_DEPLOYMENT_FILE: "unused",
+    OFFPEAK_MODELS_FILE: models,
+    OFFPEAK_DATABASE_URL: "pglite://memory",
+    OFFPEAK_REDIS_URL: "redis://127.0.0.1:36999",
+    OFFPEAK_INDEXER_URL: "http://127.0.0.1:36999",
+    OFFPEAK_FACILITATOR_URL: "http://127.0.0.1:36999",
+    OFFPEAK_INTERNAL_TOKEN: "x".repeat(32),
+    OFFPEAK_ROUTER_SIGNER_KEY: key("11"),
+    OFFPEAK_CHANNEL_PAYEE: roleAccount("host").address,
+    OFFPEAK_PUBLIC_BASE_URL: "http://127.0.0.1:36999",
+  }
+
+  test("on mainnet a model with no tokenizer stops the boot, before anything opens", async () => {
+    await expect(bootRouter(env)).rejects.toThrow("no tokenizer for model ofm-8b")
+  })
+
+  test("the payee key is read from the environment, empty means none, and the wrong one stops the boot", async () => {
+    await expect(bootRouter({ ...env, OFFPEAK_CHANNEL_PAYEE_KEY: "" })).rejects.toThrow("no tokenizer")
+    await expect(bootRouter({ ...env, OFFPEAK_CHANNEL_PAYEE_KEY: key("22") })).rejects.toThrow("not the key of OFFPEAK_CHANNEL_PAYEE")
+    await expect(bootRouter({ ...env, OFFPEAK_CHANNEL_PAYEE_KEY: key("11") })).rejects.toThrow("two roles on one key")
+  })
+
+  const own: Parameters<typeof assertKeySeparation>[1] = ["OFFPEAK_ROUTER_SIGNER_KEY", "OFFPEAK_CHANNEL_PAYEE_KEY"]
+
+  test("the router may hold its signer and the payee key, as two keys", () => {
+    expect(() => assertKeySeparation({ OFFPEAK_ROUTER_SIGNER_KEY: key("11"), OFFPEAK_CHANNEL_PAYEE_KEY: key("22") }, own)).not.toThrow()
+    expect(() => assertKeySeparation({ OFFPEAK_ROUTER_SIGNER_KEY: key("11") }, own)).not.toThrow()
+  })
+
+  test("a payee key for another address stops the boot, and no key leaves close off", () => {
+    const account = roleAccount("host")
+    expect(() => payeeAccount(key("11"), account.address)).toThrow("not the key of OFFPEAK_CHANNEL_PAYEE")
+    expect(payeeAccount(undefined, account.address)).toBeUndefined()
+    const own = `0x${Buffer.from(account.getHdKey().privateKey!).toString("hex")}`
+    expect(payeeAccount(own, account.address)?.address).toBe(account.address)
+  })
+
+  test("one key in both roles, or another service's key, stops the boot", () => {
+    expect(() => assertKeySeparation({ OFFPEAK_ROUTER_SIGNER_KEY: key("11"), OFFPEAK_CHANNEL_PAYEE_KEY: key("11") }, own)).toThrow("two roles on one key")
+    expect(() => assertKeySeparation({ OFFPEAK_ROUTER_SIGNER_KEY: key("11"), OFFPEAK_KEEPER_KEY: key("22") }, own)).toThrow("another role key")
+  })
+})

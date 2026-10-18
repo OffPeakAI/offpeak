@@ -207,3 +207,9 @@ export async function bootStack(opts?: { swap?: boolean; failHost?: boolean; sec
   const app = createApp(stack)
   return { app, stack, key, hostApps, imageDigest, chain, buyer: buyerAddr, host: operator, modelDigest, indexer, facilitator, now: () => now }
 }
+
+export function liveBuyer(stack: Stack, host: string) {
+  const sheet = stack.sheets.find((s) => s.host === host)!
+  const price = livePrice(sheet, hourOfWeek(stack.clock()), loadFactorBps(0))
+  return { ...price, buyerIn: buyerUnitPrice(price.in, 400), buyerOut: buyerUnitPrice(price.out, 400) }
+}
