@@ -1,0 +1,59 @@
+/* A shallow engraved grid behind the useful-work section. Content stays level. */
+#productivity[data-feature-backdrop="ready"] {
+  position:relative;
+  isolation:isolate;
+  --feature-grid-size:72px;
+  --feature-grid-y:0px;
+}
+#productivity[data-feature-backdrop="ready"] > .feature-backdrop-content {
+  position:relative;
+  z-index:1;
+}
+#productivity > .feature-backdrop {
+  position:absolute;
+  z-index:0;
+  inset:0;
+  overflow:hidden;
+  overflow:clip;
+  pointer-events:none;
+  user-select:none;
+  -webkit-mask-image:linear-gradient(to bottom,transparent 0,#000 160px,#000 calc(100% - 150px),transparent 100%);
+  mask-image:linear-gradient(to bottom,transparent 0,#000 160px,#000 calc(100% - 150px),transparent 100%);
+}
+.feature-backdrop-grid {
+  position:absolute;
+  inset:-80px -1px;
+  opacity:.82;
+  background-image:
+    linear-gradient(90deg,#90909026 0 1px,#ffffffd9 1px 2px,transparent 2px),
+    linear-gradient(0deg,#90909026 0 1px,#ffffffd9 1px 2px,transparent 2px);
+  background-size:var(--feature-grid-size) var(--feature-grid-size);
+  background-position:center top;
+  transform:translateY(var(--feature-grid-y));
+  -webkit-mask-image:linear-gradient(90deg,transparent 0,#000 15%,#000 85%,transparent 100%);
+  mask-image:linear-gradient(90deg,transparent 0,#000 15%,#000 85%,transparent 100%);
+}
+/* A tiny raised highlight at each intersection gives the grid a material edge. */
+.feature-backdrop-grid::after {
+  content:"";
+  position:absolute;
+  inset:0;
+  background-image:radial-gradient(circle at 1px 1px,#fafafa 0 1px,transparent 1.5px);
+  background-size:var(--feature-grid-size) var(--feature-grid-size);
+  background-position:center top;
+  opacity:.72;
+}
+#productivity[data-feature-backdrop-visible="true"] .feature-backdrop-grid {
+  will-change:transform;
+}
+@media(max-width:700px) {
+  #productivity[data-feature-backdrop="ready"] { --feature-grid-size:48px; }
+  #productivity > .feature-backdrop {
+    -webkit-mask-image:linear-gradient(to bottom,transparent 0,#000 135px,#000 calc(100% - 110px),transparent 100%);
+    mask-image:linear-gradient(to bottom,transparent 0,#000 135px,#000 calc(100% - 110px),transparent 100%);
+  }
+  .feature-backdrop-grid { opacity:.68; }
+}
+@media(prefers-reduced-motion:reduce) {
+  #productivity .feature-backdrop-grid { transform:none;will-change:auto; }
+}
