@@ -1,0 +1,7 @@
+{
+  "name": "offpeak-compute-city",
+  "private": true,
+  "type": "module",
+  "scripts": { "preview": "node render-city.mjs", "render": "node render-city.mjs --render" },
+  "dependencies": { "sharp": "0.35.5" }
+}

@@ -1,0 +1,38 @@
+{
+  "dimensions": [
+    1600,
+    700
+  ],
+  "mode": "RGBA",
+  "projection": "front-facing orthographic, horizontal facades",
+  "camera": {
+    "x": 2.25,
+    "yx": -0.2,
+    "yy": 0.9,
+    "z": 1.35,
+    "ox": 800,
+    "oy": 435
+  },
+  "alpha_extrema": [
+    0,
+    255
+  ],
+  "fully_transparent_pixels": 287672,
+  "transparent_fraction": 0.2569,
+  "corner_alpha": [
+    0,
+    0,
+    0,
+    0
+  ],
+  "background_rectangle": false,
+  "overall_floor_slab": false,
+  "districts": 6,
+  "fan_anchors": 19,
+  "led_anchors": 41,
+  "analytics_instruments": 3,
+  "analytics_mode": "illustrative; district-selected; 1Hz; deterministic 20s period",
+  "source_0s_20s_raw_pixel_difference": 0,
+  "svg_bytes": 264546,
+  "runtime": "../city-interactive.js"
+}
