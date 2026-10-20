@@ -1,0 +1,25 @@
+/* Straight card faces with a thin physical casing; depth stays inside the artwork. */
+.isometric-card{
+  transform:none!important;
+  rotate:none!important;
+  scale:1!important;
+  perspective:none!important;
+  box-shadow:inset 0 1px 0 #efeeed61,inset 1px 0 0 #d3d2d129,
+    inset -1px 0 0 #17161561,inset 0 -1px 0 #15141394,
+    0 2px 0 #363736,0 4px 7px #17191812;
+}
+.isometric-card.material-panel::after{
+  border-color:#dcdbda29;
+  box-shadow:inset 0 1px 0 #f9f8f71a;
+}
+.isometric-card[data-iso-hover="true"].material-panel::after{border-color:#ccff0054;}
+/* Legacy decorative side-wall nodes must never appear alongside the new casing. */
+.isometric-depth{display:none!important;pointer-events:none!important;}
+/* Click explanations share the straight source plane on keyboard, mouse and touch. */
+.material-portal .material-volume,
+.material-stage.is-open .material-portal .material-volume{
+  transform:none!important;
+  rotate:none!important;
+  scale:1!important;
+}
+.material-portal{perspective:none;}
