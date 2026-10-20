@@ -1,0 +1,139 @@
+/* Hero only: a little shared space for the mark, the words, and three useful objects. */
+#hero {
+  --hero-ink: #272925;
+  --hero-muted: #94988d;
+  --hero-soft-line: #e4e8dd;
+  --hero-ease: cubic-bezier(.16, 1, .3, 1);
+  position: relative;
+}
+
+#hero .hero-premium-stage {
+  position: relative;
+  isolation: isolate;
+  padding-top: 7px;
+  overflow: visible;
+}
+
+#hero .hero-premium-logo {
+  position: relative;
+  width: 70px;
+  height: 65px;
+  margin-bottom: 29px;
+  z-index: 2;
+}
+
+#hero .hero-premium-logo .hero-logo-slot,
+#hero .hero-premium-logo .hero-logo {
+  width: 70px;
+  height: 65px;
+}
+
+#hero [data-intro="title"] {
+  position: relative;
+  z-index: 2;
+  max-width: min(960px, 100%);
+  font-weight: 450;
+  letter-spacing: -.055em;
+  line-height: 1.105;
+  text-wrap: balance;
+}
+
+#hero .hero-line {
+  display: block;
+  overflow: clip;
+  padding-bottom: .1em;
+  margin-bottom: -.1em;
+}
+
+#hero [data-intro="subhead"] {
+  position: relative;
+  z-index: 3;
+  line-height: 1.7;
+  color: #969a90;
+}
+
+#hero .hero-affordances {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 0 .3em;
+}
+
+#hero .hero-affordances button {
+  position: relative;
+  display: inline-block;
+  border: 0;
+  border-radius: 2px;
+  padding: 0;
+  margin: 0;
+  background: transparent;
+  font: inherit;
+  color: #7d8473;
+  line-height: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: color .25s ease;
+}
+
+#hero .hero-affordances button::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: .12em;
+  height: 1px;
+  background: #c9d2b9;
+  opacity: .7;
+  transform-origin: left center;
+  transition: background .3s, transform .4s var(--hero-ease), opacity .3s;
+}
+
+#hero .hero-affordances button:hover,
+#hero .hero-affordances button[aria-expanded="true"] {
+  color: #39472b;
+}
+
+#hero .hero-affordances button:hover::after,
+#hero .hero-affordances button[aria-expanded="true"]::after {
+  height: 2px;
+  background: #adbf89;
+  opacity: 1;
+  transform: translateY(1px);
+}
+
+#hero button:focus-visible,
+#hero .hero-token:focus-visible,
+#hero .hero-example-panel:focus-visible {
+  outline: 2px solid #869e5c;
+  outline-offset: 5px;
+}
+
+#hero .hero-token-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  overflow: visible;
+}
+
+#hero .hero-token {
+  --token-angle: 0deg;
+  --token-scale: 1;
+  position: absolute;
+  width: 60px;
+  height: 62px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  border-radius: 9px;
+  color: #768169;
+  pointer-events: auto;
+  touch-action: manipulation;
+  cursor: pointer;
+  will-change: transform;
+  transform: translate3d(var(--token-x, 0px), var(--token-y, 0px), 0)
+    rotate(var(--token-angle)) scale(var(--token-scale));
+}
