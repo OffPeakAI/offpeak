@@ -1,0 +1,62 @@
+{
+  "style": "Quiet native SVG product symbols; neutral paper, hairlines, restrained muted-lime details.",
+  "placement": "Mixed-size floating items around centered about paragraph, using original Causal media-item geometry. Do not arrange as a grid.",
+  "files": [
+    {
+      "file": "offpeak-reveal-model.svg",
+      "width": 204,
+      "height": 180,
+      "title": "Open model",
+      "meaning": "An open model available through one inference API."
+    },
+    {
+      "file": "offpeak-reveal-quote.svg",
+      "width": 184,
+      "height": 218,
+      "title": "Accepted quote slip",
+      "meaning": "A quote fixed when the user accepts it."
+    },
+    {
+      "file": "offpeak-reveal-authorization.svg",
+      "width": 234,
+      "height": 157,
+      "title": "Wallet signature and spend cap",
+      "meaning": "A signed authorization grants one call within a chosen cap."
+    },
+    {
+      "file": "offpeak-reveal-usage.svg",
+      "width": 242,
+      "height": 174,
+      "title": "Metered token usage",
+      "meaning": "Measured token usage determines the charge."
+    },
+    {
+      "file": "offpeak-reveal-receipt.svg",
+      "width": 174,
+      "height": 230,
+      "title": "Private receipt with signature",
+      "meaning": "A compact private record with signature verification."
+    },
+    {
+      "file": "offpeak-reveal-capacity.svg",
+      "width": 212,
+      "height": 180,
+      "title": "Available compute capacity",
+      "meaning": "Spare compute capacity made available to model requests."
+    },
+    {
+      "file": "offpeak-reveal-prompt.svg",
+      "width": 224,
+      "height": 163,
+      "title": "Prompt note",
+      "meaning": "A simple input prompt, kept separate from billing and authorization."
+    },
+    {
+      "file": "offpeak-reveal-response.svg",
+      "width": 246,
+      "height": 198,
+      "title": "Structured model response",
+      "meaning": "The model returns a structured response through the compatible API."
+    }
+  ]
+}

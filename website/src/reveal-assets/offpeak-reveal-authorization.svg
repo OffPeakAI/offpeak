@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="234" height="157" viewBox="0 0 234 157" role="img" aria-labelledby="authorization-title">
+  <title id="authorization-title">Front-facing authorization wallet with a capped spending latch</title>
+  <defs>
+    <linearGradient id="authorization-case" x1="0" y1="0" x2=".75" y2="1"><stop stop-color="#989a99"/><stop offset=".12" stop-color="#737675"/><stop offset=".52" stop-color="#4a4d4b"/><stop offset="1" stop-color="#747775"/></linearGradient>
+    <linearGradient id="authorization-edge" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#818481"/><stop offset=".4" stop-color="#252826"/><stop offset=".85" stop-color="#333634"/><stop offset="1" stop-color="#969992"/></linearGradient>
+    <linearGradient id="authorization-glass" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#30332e"/><stop offset=".45" stop-color="#141711"/><stop offset="1" stop-color="#25291f"/></linearGradient>
+    <linearGradient id="authorization-steel" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#e1e3dc"/><stop offset=".25" stop-color="#969a92"/><stop offset=".6" stop-color="#62665f"/><stop offset="1" stop-color="#b8bcb3"/></linearGradient>
+    <linearGradient id="authorization-key" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#636760"/><stop offset="1" stop-color="#363a33"/></linearGradient>
+    <filter id="authorization-shadow" x="-35%" y="-25%" width="170%" height="170%"><feDropShadow dx="0" dy="6" stdDeviation="4" flood-color="#20241c" flood-opacity=".2"/></filter>
+    <filter id="authorization-grain" x="0" y="0" width="100%" height="100%"><feTurbulence type="fractalNoise" baseFrequency=".82" numOctaves="2" seed="8"/><feColorMatrix type="saturate" values="0"/><feComposite in2="SourceGraphic" operator="in"/></filter>
+    <filter id="authorization-glow" x="-70%" y="-70%" width="240%" height="240%"><feGaussianBlur stdDeviation="2"/></filter>
+  </defs>
+  <g stroke-linecap="round" stroke-linejoin="round">
+    <g filter="url(#authorization-shadow)">
+      <rect x="21" y="35" width="188" height="98" rx="17" fill="url(#authorization-edge)" stroke="#282b27" stroke-width="1.3"/>
+      <rect x="20" y="29" width="190" height="98" rx="17" fill="url(#authorization-case)" stroke="#2b2e29" stroke-width="1.3"/>
+      <rect x="21.6" y="30.6" width="186.8" height="94.8" rx="15.4" fill="none" stroke="#daddd5" stroke-opacity=".7" stroke-width="1"/>
+      <rect x="20" y="29" width="190" height="98" rx="17" fill="#fff" filter="url(#authorization-grain)" opacity=".065"/>
+      <path d="M37 31.2H193" stroke="#f3f4ec" stroke-opacity=".7" stroke-width=".8"/>
+    </g><path d="M35 23h156a9 9 0 0 1 9 9v4H30v-6a7 7 0 0 1 5-7Z" fill="url(#authorization-steel)" stroke="#454b3e"/><path d="M37 46h153" stroke="#343b2c" stroke-width="1.2"/><path d="M37 48h153" stroke="#b9c1ad" stroke-opacity=".32" stroke-width=".8"/><rect x="33" y="59" width="117" height="52" rx="10" fill="#1b1e18" stroke="#989d90" stroke-width=".8"/>
+    <rect x="35" y="61" width="113" height="48" rx="8" fill="url(#authorization-glass)" stroke="#090c07" stroke-width="1.3"/>
+    <path d="M40 66H98.28L40 87.4Z" fill="#fff" opacity=".07"/>
+    <path d="M43 63H140" stroke="#edf2e4" opacity=".24" stroke-width=".8"/><path d="M61 71 48 77v9c0 10 13 16 13 16s13-6 13-16v-9L61 71Z" fill="none" stroke="#a4b294" stroke-width="1.5"/><path d="m54 86 5 5 10-12" fill="none" stroke="#CCFF00" stroke-width="2"/><text x="87" y="81" fill="#9fac8d" font-family="Manrope,Segoe UI,Arial,sans-serif" font-size="6" letter-spacing=".6" text-anchor="start">SPEND CAP</text><text x="87" y="96" fill="#d4dfc4" font-family="Manrope,Segoe UI,Arial,sans-serif" font-size="7" letter-spacing=".6" text-anchor="start">YOU SET IT</text><rect x="160" y="66" width="60" height="45" rx="10" fill="url(#authorization-edge)" stroke="#252c1d"/><rect x="159" y="62" width="61" height="43" rx="10" fill="url(#authorization-case)" stroke="#bcc4b0" stroke-width=".8"/><circle cx="190" cy="84" r="11" fill="#1c2315" stroke="#899779"/><circle cx="190" cy="83" r="3" fill="#CCFF00"/><path d="M190 86v4" stroke="#CCFF00" stroke-width="2"/><circle cx="29" cy="38" r="3" fill="#282d25" stroke="#b1b5aa" stroke-width=".75"/><path d="M27.4 38h3.2" stroke="#090d06" stroke-width="1.1"/><circle cx="29" cy="117" r="3" fill="#282d25" stroke="#b1b5aa" stroke-width=".75"/><path d="M27.4 117h3.2" stroke="#090d06" stroke-width="1.1"/><circle cx="201" cy="117" r="3" fill="#282d25" stroke="#b1b5aa" stroke-width=".75"/><path d="M199.4 117h3.2" stroke="#090d06" stroke-width="1.1"/>
+  </g>
+</svg>
