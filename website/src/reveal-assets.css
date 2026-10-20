@@ -1,0 +1,18 @@
+/* Images retain their own varied paper/object proportions.
+   The original about-scene media wrappers own placement, scale and reveal timing. */
+.offpeak-reveal-art {
+  display: block;
+  width: 100%;
+  height: auto;
+  object-fit: contain;
+  overflow: visible;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+.offpeak-reveal-art-wrap {
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  overflow: visible;
+}
