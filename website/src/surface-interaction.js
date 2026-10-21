@@ -101,3 +101,125 @@
     state.element.classList.toggle('is-surface-pressed', value);
     wake(state);
   }
+
+  function release(state) {
+    state.pointerId = null;
+    if (!state.hover) center(state);
+    setPressed(state, false);
+  }
+
+  function setup(element) {
+    if (states.has(element) || !interactive(element)) return;
+    const state = {
+      element, x: 50, y: 50, tx: 50, ty: 50, rx: 0, ry: 0, trx: 0, try: 0,
+      press: 0, velocity: 0, down: false, hover: false, pointerId: null
+    };
+    states.set(element, state);
+    element.dataset.surfaceReady = 'true';
+    paint(state);
+
+    element.addEventListener('pointerenter', event => {
+      if (disabled(element) || event.pointerType === 'touch' || !fine.matches) return;
+      state.hover = true;
+      hovered.add(state);
+      element.classList.add('is-surface-hover');
+      position(state, event, !reduce.matches);
+    }, {passive: true});
+    element.addEventListener('pointermove', event => {
+      if (state.hover && !disabled(element)) position(state, event, !reduce.matches && fine.matches);
+    }, {passive: true});
+    element.addEventListener('pointerleave', () => {
+      state.hover = false;
+      hovered.delete(state);
+      element.classList.remove('is-surface-hover');
+      center(state);
+      wake(state);
+    }, {passive: true});
+    element.addEventListener('pointerdown', event => {
+      if (event.button !== 0 || disabled(element) || state.pointerId !== null) return;
+      state.pointerId = event.pointerId;
+      pointers.set(event.pointerId, state);
+      position(state, event, state.hover && !reduce.matches);
+      setPressed(state, true);
+    }, {passive: true});
+    element.addEventListener('keydown', event => {
+      if (event.repeat || event.target !== element || disabled(element)) return;
+      const spaceActivates = element.matches('button,[role="button"],input[type="button"],input[type="submit"]');
+      if (event.key !== 'Enter' && !(event.key === ' ' && spaceActivates)) return;
+      keys.add(state);
+      center(state);
+      setPressed(state, true);
+    });
+    element.addEventListener('blur', () => {
+      if (!keys.delete(state)) return;
+      release(state);
+    });
+  }
+
+  function mount(root = document) {
+    if (root.nodeType === 1 && root.matches(selector)) setup(root);
+    if (root.querySelectorAll) root.querySelectorAll(selector).forEach(setup);
+  }
+
+  function pointerEnd(event) {
+    const state = pointers.get(event.pointerId);
+    if (!state) return;
+    pointers.delete(event.pointerId);
+    release(state);
+  }
+  window.addEventListener('pointerup', pointerEnd, {passive: true});
+  window.addEventListener('pointercancel', pointerEnd, {passive: true});
+  window.addEventListener('keyup', event => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    for (const state of keys) release(state);
+    keys.clear();
+  });
+
+  function reset() {
+    const resetStates = new Set([...active, ...hovered, ...pointers.values(), ...keys]);
+    for (const state of resetStates) {
+      state.hover = false; state.down = false; state.pointerId = null;
+      state.press = 0; state.velocity = 0; state.rx = 0; state.ry = 0;
+      state.x = 50; state.y = 50; center(state);
+      state.element.classList.remove('is-surface-hover', 'is-surface-pressed');
+      paint(state);
+    }
+    pointers.clear(); keys.clear(); hovered.clear(); active.clear();
+    if (frame) cancelAnimationFrame(frame);
+    frame = 0;
+  }
+  window.addEventListener('blur', reset);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) reset(); });
+  reduce.addEventListener('change', reset);
+  fine.addEventListener('change', reset);
+
+  function start() {
+    mount();
+    // Only inspect inserted subtrees; attribute/style writes never re-trigger mounting.
+    const observer = new MutationObserver(records => {
+      const pending = new Set();
+      let removed = false;
+      for (const record of records) {
+        if (record.removedNodes.length) removed = true;
+        for (const node of record.addedNodes) {
+          if (node.nodeType === 1 && node.isConnected && interactive(node)) pending.add(node);
+        }
+      }
+      for (const node of pending) {
+        if (![...pending].some(parent => parent !== node && parent.contains(node))) mount(node);
+      }
+      if (removed) {
+        for (const state of new Set([...active, ...hovered, ...pointers.values(), ...keys])) {
+          if (state.element.isConnected) continue;
+          active.delete(state); hovered.delete(state); keys.delete(state);
+          if (state.pointerId !== null) pointers.delete(state.pointerId);
+        }
+      }
+    });
+    observer.observe(document.body, {childList: true, subtree: true});
+  }
+
+  window.OffpeakSurfaces = {mount};
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, {once: true});
+  else start();
+})();
