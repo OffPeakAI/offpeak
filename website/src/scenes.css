@@ -1,0 +1,174 @@
+/* OFFPEAK native UI illustrations. Coordinates mirror the reference's 640px scenes. */
+.offpeak-scene {
+  --scene-ink: #353633;
+  --scene-muted: #8b8d86;
+  --scene-line: #e6e7e2;
+  --scene-paper: #fff;
+  --scene-lime: #e9f1cc;
+  --pointer-x: 0px;
+  --pointer-y: 0px;
+  --scene-delay: 0s;
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 640px;
+  height: 640px;
+  overflow: hidden;
+  transform-origin: 0 0;
+  background: #f6f6f4;
+  color: var(--scene-ink);
+  font-family: "Manrope", Arial, sans-serif;
+  font-size: 20px;
+  font-weight: 400;
+  line-height: 1.5;
+  text-align: left;
+  -webkit-font-smoothing: antialiased;
+  isolation: isolate;
+}
+.offpeak-scene-wide { width: 960px; }
+.offpeak-scene * { box-sizing: border-box; }
+.offpeak-scene h3, .offpeak-scene p { margin: 0; }
+.offpeak-scene h3 { color: inherit; font-size: 30px; font-weight: 500; letter-spacing: -.9px; line-height: 1.25; }
+.offpeak-scene strong { font-weight: 500; }
+.offpeak-scene svg { fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.offpeak-scene small { font-size: 14px; }
+.offpeak-scene .scene-hover-plane { position: absolute; inset: 0; transform: translate(var(--pointer-x), var(--pointer-y)); transition: transform .8s cubic-bezier(.2,.7,.2,1); }
+.offpeak-scene .scene-kicker { font-size: 15px; letter-spacing: 1.3px; color: #91948a; }
+.offpeak-scene .scene-demo { display: inline-block; border: 1px solid #e2e5da; border-radius: 5px; padding: 3px 7px; font-size: 10px; line-height: 1.4; letter-spacing: .7px; color: #92998a; font-weight: 400; vertical-align: middle; }
+.offpeak-scene .scene-small-icon { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; width: 28px; height: 28px; color: #85897c; }
+.offpeak-scene .scene-small-icon svg { width: 24px; height: 24px; }
+.offpeak-scene .scene-dot { width: 8px; height: 8px; border-radius: 50%; background: #9eaa7b; display: inline-block; margin-right: 10px; }
+.offpeak-scene .scene-cursor { position: absolute; width: 28px; height: 35px; fill: #fff; stroke: #33362e; stroke-width: 1.8; filter: drop-shadow(0 2px 3px #00000012); z-index: 8; }
+.offpeak-scene .scene-bottom-fade { position: absolute; z-index: 5; pointer-events: none; bottom: 0; left: 0; right: 0; height: 175px; background: linear-gradient(0deg, #f9f9f7, #f9f9f7c9 22%, #f9f9f700); }
+.offpeak-scene .scene-key { font-size: 19px; color: #92968b; background: #eeeeea; padding: 1px 7px; border-radius: 5px; }
+.offpeak-scene [data-scene-motion], .offpeak-scene * { animation-play-state: paused !important; }
+.offpeak-scene.is-inview *, .offpeak-scene.is-inview::before, .offpeak-scene.is-inview::after { animation-play-state: running !important; }
+.offpeak-scene.is-hover { --scene-line: #dee3d2; }
+
+/* 01 / A text editor turns into a clear, capped quote. */
+.scene-quote { background: #fcfcfa; }
+.quote-document { width: 535px; position: absolute; left: 63px; top: 79px; }
+.quote-document .scene-kicker { display: flex; justify-content: space-between; align-items: center; width: 480px; margin-bottom: 22px; }
+.quote-document h3 { font-size: 41px; letter-spacing: -1.3px; line-height: 1.16; margin-bottom: 14px; }
+.quote-document .scene-subtitle { font-size: 16px; color: #96988f; margin-bottom: 33px; }
+.quote-copy { position: relative; display: flex; justify-content: space-between; width: 484px; padding: 13px 0; border-bottom: 1px solid #eee; font-size: 20px; }
+.quote-copy>span { color: #85897e; }
+.quote-selected { padding-left: 7px; margin-left: -7px; width: 498px; }
+.quote-selected strong { position: relative; z-index: 1; }
+.quote-selection { position: absolute; right: -4px; top: 11px; width: 211px; height: 32px; background: #e6eccc; transform-origin: left; opacity: .8; animation: scene-quote-highlight 9s var(--scene-delay) infinite; }
+.quote-context { position: absolute; top: 366px; right: 38px; z-index: 4; background: #f4f5f0f5; border: 1px solid #e4e6dd; box-shadow: 0 5px 22px #24282210; border-radius: 13px; display: flex; align-items: center; gap: 13px; padding: 11px 14px; font-size: 17px; color: #676e5d; transform-origin: top center; animation: scene-quote-menu 9s var(--scene-delay) infinite; }
+.quote-after { margin-top: 33px !important; color: #8c9085; font-size: 20px; line-height: 1.7; }
+.quote-faint-line { width: 440px; height: 7px; border-radius: 4px; background: #eceee8; margin-top: 28px; }
+.quote-faint-line.short { width: 330px; margin-top: 16px; }
+.quote-cursor { left: 390px; top: 420px; animation: scene-quote-cursor 9s var(--scene-delay) infinite; }
+@keyframes scene-quote-highlight { 0%,12%,92%,100% { transform: scaleX(0); opacity: 0; } 27%,80% { transform: scaleX(1); opacity: .8; } }
+@keyframes scene-quote-menu { 0%,30%,87%,100% { transform: translateY(7px) scale(.97); opacity: 0; } 40%,77% { transform: translateY(0) scale(1); opacity: 1; } }
+@keyframes scene-quote-cursor { 0%,10% { transform: translate(28px,45px); opacity: 0; } 18% { transform: translate(2px,3px); opacity: 1; } 35%,55% { transform: translate(-150px,0); opacity: 1; } 68%,100% { transform: translate(-130px,34px); opacity: 0; } }
+
+/* 02 / One front-facing model module, keeping the reference's picture-card scale. */
+.model-sheet { position: absolute; width: 455px; height: 455px; left: 93px; top: 92px; border: 1px solid #e4e5df; border-radius: 11px; background: #fff; box-shadow: 0 5px 20px #20241a06; }
+.model-sheet-back,.model-sheet-middle { display:none; }
+.sheet-rule { height: 6px; width: 90%; background: #e4e7dc; margin-top: 20px; border-radius: 4px; }
+.sheet-rule.short { width: 60%; }
+.model-sheet-front { overflow: hidden; }
+.model-paper-header { position: absolute; top: 26px; left: 30px; right: 28px; display: flex; align-items: center; justify-content: space-between; }
+.model-paper-art { width: 235px; height: 235px; position: absolute; left: 110px; top: 73px; color: #c5c9bc; }
+.model-paper-art svg { width: 100%; height: 100%; stroke-width: 1.25; }
+.model-orbits { transform-origin: 115px 115px; animation: scene-model-orbits 15s var(--scene-delay) infinite ease-in-out; }
+.model-center { fill: #dce6bd; stroke: #b8c597; }
+.model-paper-caption { position: absolute; bottom: 29px; left: 32px; }
+.model-paper-caption h3 { font-size: 30px; margin-bottom: 7px; }
+.model-paper-caption p { font-size: 18px; color: #969d8a; }
+.model-reveal { position: absolute; inset: 22px; border-radius: 10px; border: 1px solid #e1e6d8; background: #f9faf5f7; backdrop-filter: blur(8px); padding: 39px 29px; box-shadow: 0 4px 14px #292f2110; transform-origin: bottom; animation: scene-model-reveal 10s var(--scene-delay) infinite; }
+.model-reveal>div { display: flex; align-items: center; gap: 15px; padding-bottom: 37px; }
+.model-reveal>div strong { font-size: 23px; }
+.model-reveal p { display: flex; justify-content: space-between; font-size: 18px; color: #969d8b; border-top: 1px solid #e7ebde; padding: 17px 0; }
+.model-reveal p span { color: #5c6751; }
+.model-reveal small { display: block; font-size: 14px; color: #9da790; margin-top: 15px; }
+@keyframes scene-model-reveal { 0%,28%,94%,100% { opacity: 0; transform: translateY(35px) scale(.94); } 42%,79% { opacity: 1; transform: translateY(0) scale(1); } }
+@keyframes scene-model-orbits { 0%,20%,100% { transform: rotate(0); } 60%,80% { transform: rotate(90deg); } }
+
+/* 03 / A link-size input expands into a model request preview. */
+.endpoint-card { position: absolute; left: 70px; top: 145px; width: 500px; border: 1px solid #e1e2dc; border-radius: 13px; background: white; overflow: hidden; box-shadow: 0 4px 13px #272a2105; animation: scene-endpoint-position 10s var(--scene-delay) infinite; }
+.endpoint-address { height: 79px; padding: 20px 22px; display: flex; align-items: center; gap: 12px; }
+.endpoint-icon { width: 38px; height: 38px; flex: 0 0 auto; background: #f1f2ed; border-radius: 7px; display: grid; place-items: center; color: #8a8e81; }
+.endpoint-icon svg { width: 23px; height: 23px; }
+.endpoint-address-text { font-size: 20px; white-space: nowrap; overflow: hidden; animation: scene-endpoint-type 10s var(--scene-delay) infinite; }
+.endpoint-address .scene-demo { margin-left: auto; }
+.endpoint-caret { display: inline-block; height: 21px; margin-bottom: -4px; width: 1px; background: #989e8b; animation: scene-caret 1s steps(1) infinite; }
+.endpoint-unfold { height: 328px; overflow: hidden; animation: scene-endpoint-unfold 10s var(--scene-delay) infinite; }
+.endpoint-preview { height: 148px; background: #f3f5ed; border-top: 1px solid #ecefe4; border-bottom: 1px solid #e9eddf; padding: 32px 38px; }
+.endpoint-connection { display: flex; align-items: center; }
+.endpoint-connection>span { width: 48px; height: 48px; flex: 0 0 auto; display: grid; place-items: center; border: 1px solid #e0e5d6; background: #fafbf7; border-radius: 9px; }
+.endpoint-connection>span svg { width: 25px; height: 25px; stroke: #969e86; }
+.endpoint-connection .endpoint-model { border-color: #d6e1bc; background: #ebf1dc; }
+.endpoint-connection i { flex: 1; height: 1px; background: #d8dfcd; position: relative; }
+.endpoint-connection i:after { content: ""; position: absolute; top: -2px; left: 0; width: 5px; height: 5px; border-radius: 50%; background: #afbd8e; animation: scene-flow-dot 3s var(--scene-delay) infinite; }
+.endpoint-connection i:nth-of-type(2):after { animation-delay: calc(var(--scene-delay) + 1.4s); }
+.endpoint-flow-labels { display: flex; justify-content: space-between; font-size: 13px; color: #a0a88e; margin-top: 9px; }
+.endpoint-flow-labels span:nth-child(2) { margin-left: 15px; }
+.endpoint-description { padding: 23px 25px; }
+.endpoint-description h3 { font-size: 25px; margin-bottom: 9px; }
+.endpoint-description p { font-size: 17px; color: #919887; }
+.endpoint-code { font: 13px/1.5 ui-monospace,monospace; margin-top: 18px; color: #8a947b; display: flex; align-items: center; gap: 10px; }
+.endpoint-code>span { color: #81975c; font-size: 11px; }
+.endpoint-code small { margin-left: auto; font: 11px "Manrope",sans-serif; color: #a1aa92; }
+.endpoint-cursor { left: 449px; top: 371px; animation: scene-endpoint-cursor 10s var(--scene-delay) infinite; }
+@keyframes scene-endpoint-position { 0%,19%,95%,100% { transform: translateY(110px); } 37%,78% { transform: translateY(-10px); } }
+@keyframes scene-endpoint-unfold { 0%,19%,95%,100% { height: 0; opacity: 0; } 37%,78% { height: 328px; opacity: 1; } }
+@keyframes scene-endpoint-type { 0%,3%,98%,100% { clip-path: inset(0 100% 0 0); } 15%,90% { clip-path: inset(0 0 0 0); } }
+@keyframes scene-endpoint-cursor { 0%,10%,75%,100% { opacity: 0; transform: translate(20px,35px); } 17%,25% { opacity: 1; transform: translate(0,-67px); } 39%,63% { opacity: 1; transform: translate(0,-166px); } }
+@keyframes scene-flow-dot { 0% { left: 0; opacity: 0; } 20%,80% { opacity: 1; } 100% { left: 95%; opacity: 0; } }
+@keyframes scene-caret { 0%,45% { opacity: .7; } 46%,100% { opacity: 0; } }
+
+/* 04 / The original solitary color swatch becomes one restrained state tile. */
+.availability-tile { position: absolute; left: 150px; top: 150px; width: 340px; height: 340px; border-radius: 15px; border: 1px solid #dfe4d1; background: #eaf0da; padding: 22px 25px; box-shadow: 0 3px 9px #24272004; animation: scene-availability-tone 11s var(--scene-delay) infinite; }
+.availability-header { display: flex; justify-content: space-between; font-size: 15px; color: #7c8669; }
+.availability-header .scene-demo { border-color: #d1d9c1; color: #91a079; font-size: 9px; }
+.availability-glyph { width: 83px; height: 83px; display: grid; grid-template-columns: repeat(3,1fr); gap: 7px; margin: 37px auto 21px; }
+.availability-glyph i { background: #a5b489; border: 1px solid #99a779; border-radius: 4px; opacity: .65; animation: scene-slot 11s var(--scene-delay) infinite; }
+.availability-glyph i:nth-child(n+4) { animation-delay: calc(var(--scene-delay) + .15s); }
+.availability-glyph i:nth-child(n+7) { animation-delay: calc(var(--scene-delay) + .3s); }
+.availability-label { position: relative; height: 35px; }
+.capacity-state { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 27px; letter-spacing: -.5px; color: #607044; }
+.capacity-state-available { animation: scene-available-label 11s var(--scene-delay) infinite; }
+.capacity-state-limited { animation: scene-limited-label 11s var(--scene-delay) infinite; color: #7f8479; }
+.capacity-state-limited .scene-dot { background: #999f91; }
+.availability-tile>p { font-size: 14px; color: #90997f; margin-top: 8px; text-align: center; }
+.availability-foot { display: flex; justify-content: center; align-items: center; gap: 6px; color: #a1a992; font-size: 10px; margin-top: 32px; }
+.availability-pulse { width: 4px; height: 4px; background: #97a577; border-radius: 50%; animation: scene-soft-pulse 3s infinite; }
+@keyframes scene-availability-tone { 0%,38%,100% { background: #eaf0da; border-color: #dfe4d1; } 51%,84% { background: #eaede5; border-color: #e0e3d9; } }
+@keyframes scene-slot { 0%,35%,100% { opacity: .65; transform: scale(1); } 50%,83% { opacity: .18; transform: scale(.87); } }
+@keyframes scene-available-label { 0%,35%,97%,100% { opacity: 1; transform: translateY(0); } 45%,87% { opacity: 0; transform: translateY(-10px); } }
+@keyframes scene-limited-label { 0%,37%,95%,100% { opacity: 0; transform: translateY(10px); } 50%,84% { opacity: 1; transform: translateY(0); } }
+@keyframes scene-soft-pulse { 0%,100% { opacity: .4; } 50% { opacity: 1; } }
+
+/* 05 / Audio-like wave becomes token metering, retaining its quiet controls. */
+.meter-card { position: absolute; left: 70px; top: 125px; width: 500px; min-height: 390px; border: 1px solid #e1e4da; border-radius: 13px; padding: 32px; background: #fff; box-shadow: 0 4px 12px #1e231a05; }
+.meter-heading { display: flex; align-items: center; gap: 10px; }
+.meter-heading h3 { font-size: 24px; }
+.meter-heading>.scene-demo { margin-left: auto; }
+.meter-wave { display: flex; align-items: center; height: 76px; gap: 4px; position: relative; margin: 26px 0 18px; overflow: hidden; }
+.meter-wave>.wave-bar { flex: 1; border-radius: 3px; background: #dadfd0; height: var(--bar-height); opacity: .75; animation: scene-meter-wave 4s calc(var(--bar-delay) + var(--scene-delay)) ease-in-out infinite; }
+.meter-wave>.wave-bar:nth-child(3n) { background: #bfcda6; }
+.meter-playhead { position: absolute; left: 0; top: 3px; width: 1px; height: 70px; background: #9aae74; z-index: 1; animation: scene-meter-head 9s var(--scene-delay) infinite linear; }
+.meter-controls { display: flex; justify-content: space-between; align-items: center; }
+.meter-status,.meter-token-pill { display: inline-flex; align-items: center; position: relative; height: 35px; border-radius: 8px; background: #f2f4ec; font-size: 15px; padding: 6px 12px; color: #8b947b; }
+.meter-status { width: 131px; gap: 10px; }
+.meter-play { font-size: 10px; font-style: normal; }
+.meter-status-running,.meter-status-done { position: absolute; left: 32px; }
+.meter-status-running { animation: scene-meter-running 9s var(--scene-delay) infinite; }
+.meter-status-done { animation: scene-meter-done 9s var(--scene-delay) infinite; }
+.meter-token-pill { gap: 5px; font-variant-numeric: tabular-nums; }
+.meter-token-pill strong { min-width: 28px; }
+.meter-divider { height: 1px; background: #edf0e5; margin: 25px 0 20px; }
+.meter-settlement { display: flex; justify-content: space-between; gap: 20px; animation: scene-meter-settled 9s var(--scene-delay) infinite; }
+.meter-settlement>div>span { display: block; font-size: 15px; color: #a2aa96; margin-bottom: 5px; }
+.meter-settlement strong { font-size: 24px; letter-spacing: -.5px; color: #727f5f; font-variant-numeric: tabular-nums; }
+.meter-settlement small { font-size: 11px; letter-spacing: 0; color: #a3ad95; }
+.meter-note { font-size: 17px; color: #9aa48b; margin-top: 21px !important; line-height: 1.5; }
+@keyframes scene-meter-wave { 0%,100% { transform: scaleY(.75); } 50% { transform: scaleY(1); } }
+@keyframes scene-meter-head { 0%,7% { left: 0; opacity: 0; } 12% { opacity: 1; } 64% { left: 99%; opacity: 1; } 70%,100% { left: 99%; opacity: 0; } }
+@keyframes scene-meter-running { 0%,60%,100% { opacity: 1; } 67%,92% { opacity: 0; } }
+@keyframes scene-meter-done { 0%,60%,100% { opacity: 0; } 67%,92% { opacity: 1; } }
+@keyframes scene-meter-settled { 0%,57%,100% { opacity: .35; transform: translateY(5px); } 68%,91% { opacity: 1; transform: translateY(0); } }
