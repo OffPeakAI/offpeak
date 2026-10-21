@@ -94,3 +94,80 @@ function model(time,{x=250,y=269,scale=1.69}={}){
  flush();return neutralise(assembled);
 }
   /* ORIGINAL_MODEL_END */
+
+  const NS='http://www.w3.org/2000/svg';
+  const reduced=matchMedia('(prefers-reduced-motion: reduce)');
+  const entries=new Map();
+  const owners=new WeakSet();
+  const gradientIds=['whitefront','whiteside','roofwhite','glass','soft'];
+  let serial=0,raf=0,last=0,lastPaint=0,clock=0;
+  function namespace(markup,prefix){
+    for(const id of gradientIds){
+      markup=markup.replaceAll(`id="${id}"`,`id="${prefix}-${id}"`).replaceAll(`url(#${id})`,`url(#${prefix}-${id})`);
+    }
+    return markup;
+  }
+  function allowed(entry){
+    if(!entry.visible||entry.paused||!entry.host.isConnected)return false;
+    if(entry.host.closest('[hidden],[data-logo-paused="true"],.arcade-motion-paused,[data-tech-paused="true"]'))return false;
+    // The navigation icon is deliberately cross-faded out while the wordmark is showing.
+    if(entry.navLayer&&entry.header&&!entry.header.classList.contains('is-scrolled'))return false;
+    return true;
+  }
+  function motionLabel(entry,value){if(entry.host.dataset.logoMotion!==value)entry.host.dataset.logoMotion=value;}
+  function paint(entry,body){entry.layer.innerHTML=namespace(body,entry.prefix);}
+  function paintAll(t){const body=model(t,{x:246,y:260,scale:1.59});for(const entry of entries.values())paint(entry,body);}
+  function frame(now){
+    raf=0;
+    if(document.hidden||reduced.matches)return;
+    const active=[...entries.values()].filter(allowed);
+    if(!active.length){last=0;return;}
+    clock=(clock+Math.max(0,Math.min((now-(last||now))/1000,.1)))%DURATION;
+    last=now;
+    if(!lastPaint||now-lastPaint>=1000/FPS){
+      const body=model(clock,{x:246,y:260,scale:1.59});
+      for(const entry of active)paint(entry,body);
+      lastPaint=now-((now-lastPaint)%(1000/FPS));
+    }
+    raf=requestAnimationFrame(frame);
+  }
+  function sync(){
+    let active=false;
+    for(const entry of entries.values()){
+      const running=!document.hidden&&!reduced.matches&&allowed(entry);
+      motionLabel(entry,running?'running':reduced.matches?'static':'paused');
+      active=active||running;
+    }
+    if(!active&&raf){cancelAnimationFrame(raf);raf=0;last=0;}
+    if(active&&!raf){last=performance.now();lastPaint=0;raf=requestAnimationFrame(frame);}
+  }
+  const visibility=new IntersectionObserver(changes=>{
+    for(const change of changes){const entry=entries.get(change.target);if(entry)entry.visible=change.isIntersecting&&change.intersectionRatio>0;}
+    sync();
+  },{threshold:0});
+  const stateObserver=new MutationObserver(sync);
+  function observeState(node){if(node&&!owners.has(node)){owners.add(node);stateObserver.observe(node,{attributes:true,attributeFilter:['class','hidden','data-tech-paused','data-logo-paused']});}}
+  function mount(host){
+    if(!host)return null;if(entries.has(host))return entries.get(host).controller;
+    const prefix=`offpeak-approved-${++serial}`;
+    const svg=document.createElementNS(NS,'svg');
+    svg.classList.add('approved-logo-art');svg.setAttribute('viewBox','0 0 500 500');svg.setAttribute('preserveAspectRatio','xMidYMid meet');svg.setAttribute('aria-hidden','true');svg.setAttribute('focusable','false');
+    svg.innerHTML=namespace(defs,prefix);
+    const layer=document.createElementNS(NS,'g');layer.setAttribute('data-approved-logo-body','');svg.append(layer);
+    const entry={host,layer,prefix,visible:false,paused:false,navLayer:host.closest('.nav-icon-layer'),header:host.closest('.faithful-header')};
+    entry.controller={
+      setPaused(value){entry.paused=Boolean(value);sync();},
+      destroy(){visibility.unobserve(host);entries.delete(host);host.removeAttribute('data-logo-ready');sync();}
+    };
+    paint(entry,model(0,{x:246,y:260,scale:1.59}));
+    host.replaceChildren(svg);host.dataset.logoReady='true';host.dataset.logoSource='approved-white-mechanical';
+    entries.set(host,entry);visibility.observe(host);
+    observeState(host);observeState(entry.header);observeState(host.closest('.arcade-console'));observeState(host.closest('#about'));
+    sync();return entry.controller;
+  }
+  function mountAll(root=document){root.querySelectorAll('.approved-logo').forEach(mount);}
+  document.addEventListener('visibilitychange',sync);
+  reduced.addEventListener('change',()=>{if(reduced.matches)paintAll(0);sync();});
+  window.OffpeakApprovedLogo={mount,mountAll};
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',()=>mountAll(),{once:true});else mountAll();
+})();
