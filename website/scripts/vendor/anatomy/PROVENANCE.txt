@@ -1,0 +1,9 @@
+Anatomy by Ryan — MIT license (see LICENSE).
+Source: https://github.com/wheresryan22/anatomy
+Source revision: e6600ffc4e8e6620eeb45bf49bcdbd5e4b84163f
+Vendored on 2026-10-13. iso-kit.mjs is unchanged from source.
+SHA-256: 6d3ecc725d30c3b0346da309cf61dfa5a65017c23620bbd4093009d4fb104018
+
+Used by ../build-nav-anatomy.mjs for actual world-space projection,
+beveled solids, camera-aware four-tone shading, face matrices,
+mechanical detail and projected motion axes. OFFPEAK geometry is original.
