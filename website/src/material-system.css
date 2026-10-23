@@ -388,3 +388,197 @@
 .material-panel .usecase-avatar { background:linear-gradient(150deg,#666966,#373b37)!important;box-shadow:inset 0 1px 0 #d6d9d63d,inset 0 -1px 0 #12141299,0 2px 3px #0f110f33; }
 .material-panel .usecase-avatar>.line-icon { color:#ccff00; }
 .material-panel[data-closing="panel"] .closing-dots { filter:invert(1);opacity:.48; }
+
+/* The native workflow illustrations use the same physical paper/glass materials. */
+.offpeak-page .page-scene { color:#d4d6d4;background:transparent; }
+.offpeak-page .page-scene.material-panel { background:var(--material-panel-skin); }
+.offpeak-page .page-scene::after { background:linear-gradient(140deg,#e6e7e60a,transparent 65%); }
+.offpeak-page :is(.preview-sheet,.preview-classification,.preview-table,.preview-summary,.preview-source,.preview-routes span,.preview-compare>div,.preview-network>span,.preview-network>b,.preview-meter,.preview-chat>div,.preview-stack>div:first-child,.preview-stack>div:nth-child(2)) {
+  background-color:#404340;
+  background-image:repeating-linear-gradient(105deg,#ffffff03 0 1px,transparent 1px 3px),linear-gradient(150deg,#656966,#404340 43%,#2d2f2d);
+  border-color:#7e847e73;
+  color:#d9dcd9;
+  box-shadow:inset 0 1px 0 #edeeed38,inset 0 -1px 0 #16171670,0 1px 0 #1c1d1c,0 1.2cqw 2.4cqw #16171633;
+}
+.offpeak-page .page-scene :is(p,b,strong,.preview-sheet-title) { color:#dbdddb; }
+.offpeak-page .page-scene :is(span,small) { color:#abaeab; }
+.offpeak-page .preview-row i { background:#ccff00;box-shadow:0 0 4px #ccff0033; }
+.offpeak-page :is(.preview-tags b,.preview-tagcloud b) { background:linear-gradient(#464b46,#2e312e);border:1px solid #70787066;box-shadow:inset 0 1px 0 #bcc0bc2b;color:#d1d4d1; }
+.offpeak-page .preview-table>div { border-color:#7c827c40; }
+.offpeak-page .preview-table>div:nth-child(3) { background:#ccff000a; }
+.offpeak-page .preview-summary i { background:#7e857e52; }
+.offpeak-page .preview-routes .selected { border-color:#ccff0070;box-shadow:inset 0 0 0 1px #ccff0014,0 1.2cqw 2.4cqw #16171633; }
+.offpeak-page .preview-wires path { stroke:#ccff0070; }
+.offpeak-page .preview-network { background:linear-gradient(28deg,transparent 49.8%,#ccff0040 50%,transparent 50.4%),linear-gradient(-28deg,transparent 49.8%,#ccff0040 50%,transparent 50.4%); }
+.offpeak-page .preview-meter i { background:linear-gradient(to right,#ccff00 var(--value),#282b28 var(--value));box-shadow:inset 0 1px 3px #13151352; }
+.offpeak-page .preview-compare p { border-color:#8b928b40; }
+.offpeak-page .pages-price-card li::before { color:#ccff00; }
+.offpeak-page .pages-code-block pre { color:#ccd0cc; }
+.offpeak-page .pages-workflow-detail textarea { background:#292b29;border-color:#737b734d;color:#d1d5d2;box-shadow:inset 0 2px 5px #1416144d; }
+
+/* Reference FAQs remain rows; only their small disclosure control receives a casing. */
+[data-faq]>span:last-child { border-radius:50%;background:linear-gradient(145deg,#515351,#2e302e);color:#d4d7d4;box-shadow:inset 0 1px 0 #c7cac747,0 1px 0 #161716; }
+[data-faq][aria-expanded="true"]>span:last-child { color:#ccff00;box-shadow:inset 0 1px 0 #cacdca66,0 0 0 1px #ccff0033; }
+
+/* Documentation keeps its reading column open; only existing bounded examples are plates. */
+.docs-page .material-panel { --docs-line:#666b664d;--docs-muted:#a2a6a2;--docs-ink:#e1e3e1; }
+.docs-page .material-panel :is(h3,dd,tbody th,strong) { color:#dbdedb; }
+.docs-page .material-panel :is(caption,.docs-case-flow span) { background:#2a2e2b;color:#bec3be; }
+.docs-page .material-panel :is(th,td) { border-color:#737b7340;color:#b3b8b3; }
+.docs-page .material-panel :is(thead th,.docs-amounts dt) { color:#a0a5a0; }
+.docs-page .material-panel code { color:#dcdfdc; }
+.docs-page .material-panel .code-comment { color:#9ca29d; }
+.docs-page .docs-note { border-left-color:#ccff00; }
+
+/* Functional console cards: retain all field/table dimensions and the existing disabled states. */
+.console-page .material-panel { --line:#6f746f47;--muted:#a8aba8;--white:#373a37;--ink:#e0e3e1; }
+.console-page .material-panel :is(h2,strong,.balance-number,.stat-value,.max-charge strong,.price-lines dd) { color:#dde0dd; }
+.console-page .material-panel :is(.card-label,.balance-details,.stat-description,.capacity-footer,.field-label,.field-help,.quote-explainer,.quote-disclaimer,.model-facts span,.receipt-row p,.receipt-summary,.result-footer,.step-tag) { color:#a4a9a4; }
+.console-page .material-panel :is(textarea,select,pre,.model-selection,.quote-status) { background:#292d2a;border-color:#6e776f4d;color:#c7cac7;box-shadow:inset 0 2px 5px #15171545; }
+.console-page .material-panel :is(textarea,select)::placeholder { color:#989e99; }
+.console-page .material-panel :is(td,td small,.receipt-details,.receipt-row h2) { color:#b9bdb9;border-color:#676f6840; }
+.console-page .material-panel th { background:#2c302d;color:#c0c5c1; }
+.console-page .material-panel :is(.balance-details,.max-charge,.receipt-row) { border-color:#77807847; }
+.console-page .material-panel .status-pill,.console-page .material-panel .neutral-status:is(.ready,.completed) { color:#ccff00; }
+.console-page .material-panel .capacity-visual span { background:linear-gradient(#abb0ab,#666d66);border-color:#99a099; }
+.console-page .material-panel .capacity-visual span:nth-child(n+6) { background:#4c514c40;border-color:#717a7240; }
+.console-page .button:disabled { color:#8b8d8b;filter:saturate(.25);opacity:.48;box-shadow:inset 0 1px 3px #14151433;transform:none; }
+.console-page .material-panel .table-action { color:#bfc3bf; }
+.console-page .material-panel :is(p,.panel-title p:not(.eyebrow),.card-header p,.panel-header p,.field-label.prompt-label span,.model-selection span:not(.tiny-tag),.price-lines dt,.price-lines dd small,.max-charge>span,.max-charge small,.quote-timer,.balance-number>span:last-child,.capacity-footer>span,.request-progress span) { color:#b8c5ac; }
+#hero .hero-example-panel.material-panel { background:var(--material-panel-skin);border-color:#70776380;color:#dce1d6;box-shadow:inset 0 1px 0 #dce1d560,inset 0 -2px 0 #1c201980,0 8px 20px #22252226; }
+#hero .hero-example-panel.material-panel :is(h2,.hero-example-value,.hero-example-row strong,.hero-example-slider-label output) { color:#e1e7dc; }
+#hero .hero-example-panel.material-panel :is(p,small,.hero-example-row,.hero-example-timer,.hero-example-slider-label,.hero-example-status,.hero-example-badge) { color:#b8c5ac; }
+#hero .hero-example-panel.material-panel .hero-example-rule { background:#828a7840; }
+#hero .hero-example-panel.material-panel .hero-example-receipt { background:#2a3027;border-color:#6c785c4d;color:#c4cdbb;box-shadow:inset 0 1px 4px #171d1433; }
+#hero .hero-example-panel.material-panel .hero-example-receipt b { color:#dce4d5; }
+.opcity-info.is-selected { background:linear-gradient(150deg,#53584f,#30352d);border-color:#838a7660;box-shadow:inset 0 1px 0 #dce2d138,inset 0 -2px 0 #19201666,0 5px 10px #1c221a19;backdrop-filter:none; }
+.opcity-info.is-selected :is(h3,.opcity-kicker) { color:#e2e7dd; }
+.opcity-info.is-selected :is(p,.opcity-hint) { color:#b8c5ac; }
+@media(hover:none) { .material-explore { min-height:34px; } }
+@media(prefers-reduced-motion:reduce) {
+  .material-stage,.material-portal,.material-volume,.material-explore,.material-card::after,.material-panel::after { transition:none!important; }
+  .material-volume { mask-image:none; }
+  .material-stage.is-open .material-volume { transform:none; }
+  :is(.faithful-button,#hero .hero-example-button,.opcity-hotspot,.opcity-district-tab,.opcity-pause,.film-control,.hero-example-close,.material-controls button,.pages-pill,.pages-filter button,.pages-rate-switch button,.pages-flow-tabs button,.pages-code-block button,.docs-button,.console-page .button,.widget-copy) { transition:none;transform:var(--surface-placement,none); }
+  :is(.faithful-button,#hero .hero-example-button,.opcity-hotspot,.opcity-district-tab,.opcity-pause,.film-control,.hero-example-close,.material-controls button,.pages-pill,.pages-filter button,.pages-rate-switch button,.pages-flow-tabs button,.pages-code-block button,.docs-button,.console-page .button,.widget-copy):is(:hover,:focus-visible,.is-surface-hover,:active,.is-surface-pressed) { transform:var(--surface-placement,none); }
+  .opcity-hotspot { transform:translate(-50%,-50%); }
+}
+
+/* Six capability previews: one crisp, front-facing housing per illustration. */
+#features .material-card {
+  box-shadow:inset 0 1px 0 #efefef9c,inset 1px 0 0 #bbbbbb73,
+    inset -1px 0 0 #181818a6,inset 0 -5px 0 #181818a1,
+    0 9px 15px -12px #13131375;
+}
+#features .material-card::before {
+  border-color:#181818;
+  background:
+    repeating-linear-gradient(0deg,#ccff0003 0 1px,transparent 1px 32px),
+    repeating-linear-gradient(90deg,#ccff0003 0 1px,transparent 1px 32px),
+    radial-gradient(ellipse at 26% -10%,#acacac1c,transparent 58%),
+    linear-gradient(160deg,#3a3a3a,#2c2c2c 80%,#323232);
+  box-shadow:inset 0 2px 4px #12121273,inset 0 0 0 1px #bcbcbc12,0 1px 0 #d5d5d53d;
+}
+#features .material-card.material-card-interactive::after {
+  border-color:#bdbdbd76;
+  box-shadow:inset 0 1px 0 #f2f2f27a,inset 0 0 0 3px #adadad2b,
+    inset 0 0 0 4px #12121280,inset 0 -1px 0 #0909098c;
+}
+#features .material-card.material-card-interactive:is(:hover,:focus-within)::after {
+  border-color:#c4c4c498;
+  box-shadow:inset 0 1px 0 #f2f2f28f,inset 0 0 0 3px #b2b2b234,
+    inset 0 0 0 4px #12121280,inset 0 0 26px #ccff0007;
+}
+/* Hover is light only. The scripted text, scans and state changes retain their clocks. */
+#features .offpeak-scene .scene-hover-plane { transform:none!important;transition:none; }
+#features .material-card :is(.model-sheet-back,.model-sheet-middle) { display:none!important; }
+#features .material-card :is(.model-sheet-front,.endpoint-card,.availability-tile,.meter-card,.signature-sheet) {
+  border-color:#a6a6a699;
+  border-radius:12px;
+  background-color:#383838;
+  background-image:
+    linear-gradient(135deg,#efefef13,transparent 31%),
+    repeating-linear-gradient(0deg,#ccff0003 0 1px,transparent 1px 32px),
+    repeating-linear-gradient(90deg,#ccff0003 0 1px,transparent 1px 32px),
+    linear-gradient(155deg,#5a5a5a,#393939 56%,#2c2c2c);
+  box-shadow:inset 0 1px 0 #f3f3f3b8,inset 1px 0 0 #c2c2c285,
+    inset -1px 0 0 #121212cc,inset 0 -1px 0 #101010cc,
+    inset 0 0 0 3px #c3c3c35e,inset 0 0 0 4px #1717179c,
+    inset 0 0 0 5px #d6d6d614,0 8px 12px -9px #12121285;
+}
+#features .material-card .quote-document::before {
+  border-color:#a6a6a699;border-radius:12px;
+  background:
+    linear-gradient(135deg,#efefef13,transparent 31%),
+    repeating-linear-gradient(0deg,#ccff0003 0 1px,transparent 1px 32px),
+    repeating-linear-gradient(90deg,#ccff0003 0 1px,transparent 1px 32px),
+    linear-gradient(155deg,#5a5a5a,#393939 56%,#2c2c2c);
+  box-shadow:inset 0 1px 0 #f3f3f3b8,inset 1px 0 0 #c2c2c285,
+    inset -1px 0 0 #121212cc,inset 0 -1px 0 #101010cc,
+    inset 0 0 0 3px #c3c3c35e,inset 0 0 0 4px #1717179c,
+    inset 0 0 0 5px #d6d6d614,0 8px 12px -9px #12121285;
+}
+#features .material-card .model-paper-art {
+  border:1px solid #a7a7a73b;border-radius:12px;
+  background:linear-gradient(145deg,#b4b4b405,#1313131f);
+  box-shadow:inset 0 1px 2px #11111126,inset 0 -1px 0 #bfbfbf12;
+}
+#features .material-card .model-reveal {
+  border-color:#8282828a;background:#2d2d2dfa;backdrop-filter:none;
+  box-shadow:inset 0 2px 5px #11111166,inset 0 0 0 1px #d9d9d91f,0 1px 0 #d1d1d129;
+}
+#features .material-card .quote-context {
+  border-color:#a0a0a075;background:#3f3f3f;backdrop-filter:none;
+  box-shadow:inset 0 1px 0 #dddddd42,inset 0 -2px 0 #18181873,0 3px 6px #14141426;
+}
+#features .material-card .signature-sheet { transform:none!important; }
+#features .material-card :is(.model-paper-caption p,.signature-foot,.signature-sheet>small) { color:#b8b8b8; }
+#features .material-card .signature-field>span:last-child { color:#d8d8d8; }
+
+/* Feature-only invitation: a frosted hint and glare confined to the narrow bevel. */
+#features .material-card>.material-explore {
+  color:#ededed;border-color:#ffffff36;
+  background:linear-gradient(145deg,#ffffff0e,#ffffff03),#303030a6;
+  backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);
+  box-shadow:inset 0 1px 0 #ffffff26,0 2px 6px #1111112b;
+  opacity:1;
+  transition:opacity .32s var(--material-ease),color .32s var(--material-ease),border-color .32s var(--material-ease),box-shadow .32s var(--material-ease);
+}
+#features .material-hover-glass {
+  position:absolute;inset:3px;z-index:11;pointer-events:none;
+  padding:4px;border:1px solid #ffffff24;border-radius:inherit;
+  opacity:0;background:none;backdrop-filter:none;
+  box-shadow:inset 0 1px 0 #ffffff1a;
+  transition:opacity .32s var(--material-ease);
+}
+@supports (mask-composite:exclude) or (-webkit-mask-composite:xor) {
+  #features .material-hover-glass {
+    background:linear-gradient(135deg,#ffffff1a,transparent 36% 65%,#ffffff0d);
+    backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px);
+    -webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);
+    -webkit-mask-composite:xor;
+    mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);
+    mask-composite:exclude;
+  }
+}
+#features .material-card:is(:hover,:focus-within)>.material-hover-glass { opacity:1; }
+@media(hover:hover) and (pointer:fine) {
+  #features .material-card>.material-explore { opacity:0;pointer-events:none; }
+  #features .material-card:is(:hover,:focus-within)>.material-explore { opacity:1;pointer-events:auto; }
+}
+#features .material-card[data-material-active="true"]>.material-hover-glass,
+#features .material-card[data-material-active="true"]>.material-explore { opacity:0;pointer-events:none; }
+@media(prefers-reduced-motion:reduce) {
+  #features .material-hover-glass,#features .material-card>.material-explore { transition:none!important; }
+}
+
+/* Use-case cards share one height; copy length must not create a taller masonry item. */
+#reviews .columns-1{display:grid;columns:auto;grid-template-columns:minmax(0,1fr);grid-auto-rows:1fr;gap:var(--gallery-gap);align-items:stretch}
+#reviews .columns-1>figure{min-width:0;margin:0;align-self:stretch;break-inside:auto}
+@media(min-width:40rem){#reviews .columns-1{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(min-width:64rem){#reviews .columns-1{grid-template-columns:repeat(3,minmax(0,1fr))}}
+
+/* Phone explainers inherit the exact source bounds, so wide work cards need the same room as their square siblings. */
+@media(max-width:639px){
+  #productivity .material-card:has(>.scene-frame:is([data-scene="scene-productivity-3"],[data-scene="scene-productivity-4"])) { aspect-ratio:1; }
+}

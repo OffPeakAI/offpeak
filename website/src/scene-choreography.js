@@ -143,3 +143,183 @@
       show(code, extras);
     };
   }
+
+  function availabilityRenderer(root) {
+    const tile = q(root, '.availability-tile');
+    const first = q(root, '.capacity-state-available');
+    const second = q(root, '.capacity-state-limited');
+    const slots = [...root.querySelectorAll('.availability-glyph i')];
+    const states = ['Available', 'Limited', 'Unavailable', 'Available'];
+    const fills = [1, .55, .12, 1];
+    function label(element, value) {
+      if (!element || element.dataset.sourceLabel === value) return;
+      element.dataset.sourceLabel = value;
+      const dot = element.querySelector('.scene-dot');
+      element.replaceChildren();
+      if (dot) element.appendChild(dot);
+      element.appendChild(document.createTextNode(value));
+    }
+    return t => {
+      const step = Math.floor(t / 1500) % 4;
+      const local = t % 1500;
+      const blend = phase(local, 850, 1450, ease.fluid);
+      const leave = phase(local, 1050, 1150, ease.release);
+      const enter = phase(local, 1150, 1350, ease.arrive);
+      label(first, states[step]);
+      label(second, states[(step + 1) % 4]);
+      show(first, 1 - leave);
+      show(second, enter, 4 * (1 - enter));
+      set(tile, 'transform', `scale(${round(1 - .025 * Math.sin(Math.PI * blend))})`);
+      const available = mix(fills[step], fills[(step + 1) % 4], blend);
+      slots.forEach((slot, i) => {
+        set(slot, 'opacity', round(.14 + .65 * clamp(available * 9 - i)));
+        set(slot, 'transform', 'none');
+      });
+    };
+  }
+
+  // Original tt() waveform envelope; original nt() scroll speed et=.04 px/ms.
+  function waveformAmplitude(index) {
+    const envelope = .35 + .65 * Math.abs(Math.sin(index * .21 + .6)) ** .8 * (.55 + .45 * Math.abs(Math.sin(index * .057 + 1.3)));
+    let noise = Math.sin(index * 12.9898) * 43758.5453;
+    noise -= Math.floor(noise);
+    return Math.min(1, envelope * (.55 + .45 * noise));
+  }
+  function meterRenderer(root) {
+    const wave = q(root, '.meter-wave');
+    const settlement = q(root, '.meter-settlement');
+    const note = q(root, '.meter-note');
+    const count = q(root, '[data-token-count]');
+    if (count) count.removeAttribute('data-token-count'); // The legacy 120ms interval yields ownership.
+    let path;
+    if (wave) {
+      [...wave.children].forEach(child => set(child, 'display', 'none'));
+      const svg = document.createElementNS(svgNS, 'svg');
+      svg.setAttribute('viewBox', '0 0 300 40');
+      svg.setAttribute('preserveAspectRatio', 'none');
+      svg.setAttribute('aria-hidden', 'true');
+      svg.style.cssText = 'display:block;width:100%;height:60px;fill:currentColor;stroke:none;color:inherit;';
+      path = document.createElementNS(svgNS, 'path');
+      path.setAttribute('fill', 'currentColor');
+      path.setAttribute('stroke', 'none');
+      svg.appendChild(path);
+      wave.appendChild(svg);
+    }
+    return (t, clock) => {
+      const offset = clock * .04;
+      const start = Math.floor(offset / 3);
+      let d = '';
+      for (let index = start; index <= start + 100; index++) {
+        const x = index * 3 - offset;
+        if (x < -1 || x > 298) continue;
+        const height = Math.max(2, 36 * waveformAmplitude(index));
+        d += `M${x.toFixed(2)} ${(20 - height / 2).toFixed(2)}h1v${height.toFixed(2)}h-1z`;
+      }
+      if (path) path.setAttribute('d', d);
+      const transcript = phase(t, 1650, 2250, ease.arrive) - phase(t, 5200, 5600, ease.release);
+      show(settlement, transcript, 6 * (1 - transcript));
+      show(note, transcript, 6 * (1 - transcript));
+      show(q(root, '.meter-status-running'), 1 - transcript);
+      show(q(root, '.meter-status-done'), transcript);
+      if (count) count.textContent = String(Math.round(200 * phase(t, 0, 2250)));
+    };
+  }
+
+  function signatureRenderer(root) {
+    const line = q(root, '.signature-line');
+    const underline = q(root, '.signature-understroke');
+    const tick = q(root, '.signature-tick');
+    const pen = q(root, '.signature-pen');
+    let length = 760; let underlineLength = 260;
+    try { length = line.getTotalLength(); underlineLength = underline.getTotalLength(); } catch (_) { /* SVG may be disconnected during insertion. */ }
+    set(line, 'stroke-dasharray', `${length} ${length}`);
+    set(underline, 'stroke-dasharray', `${underlineLength} ${underlineLength}`);
+    return t => {
+      const secondHalf = t >= 3000;
+      const local = t % 3000;
+      const brush = phase(local, 200, 1900, ease.stroke);
+      const highlighter = phase(local, 1300, 2700);
+      const erase = phase(local, 100, 2700, ease.stroke);
+      set(line, 'stroke-dashoffset', round(length * (secondHalf ? 0 : 1 - brush)));
+      set(line, 'opacity', 1);
+      set(line, 'clip-path', secondHalf ? `inset(0 0 0 ${round(erase * 100)}%)` : 'none');
+      set(underline, 'stroke-dashoffset', round(underlineLength * (secondHalf ? 0 : 1 - highlighter)));
+      set(underline, 'opacity', .65);
+      set(underline, 'clip-path', secondHalf ? `inset(0 0 0 ${round(erase * 100)}%)` : 'none');
+      show(tick, secondHalf ? 1 - erase : phase(local, 1900, 2200, ease.arrive));
+      set(tick, 'stroke-dashoffset', 0);
+      if (line && pen && !secondHalf) {
+        const point = line.getPointAtLength(length * brush);
+        // Source gesture timings; coordinates follow this receipt's actual path, not a guessed diagonal.
+        set(pen, 'left', `${round(84 + 30 + point.x - 22)}px`);
+        set(pen, 'top', `${round(79 + 279 + point.y - 112)}px`);
+        set(pen, 'transform', `rotate(${round(3 * Math.sin((t / 2600 + .1) * Math.PI * 4))}deg)`);
+        set(pen, 'opacity', 1 - phase(local, 2200, 2700, ease.release));
+      } else hide(pen);
+    };
+  }
+
+  function radarRenderer(root) {
+    const chart = q(root, '.radar-visual');
+    const table = q(root, '.radar-table');
+    const chartLabel = q(root, '.radar-mode-chart');
+    const tableLabel = q(root, '.radar-mode-table');
+    set(q(root, '.radar-area'), 'transform', 'none');
+    return t => {
+      const step = Math.floor(t / 3000) % 3;
+      const local = t % 3000;
+      const blend = phase(local, 1500, 3000, ease.fluid);
+      // Only two visual actors exist here. The original third (priorities) is a documented gap.
+      const currentChart = step === 1 ? 1 : 0;
+      const nextChart = (step + 1) % 3 === 1 ? 1 : 0;
+      const amount = mix(currentChart, nextChart, blend);
+      show(chart, amount, (1 - amount) * -8);
+      show(chartLabel, amount);
+      show(table, 1 - amount, amount * 8);
+      show(tableLabel, 1 - amount);
+    };
+  }
+
+  function assistantRenderer(root) {
+    const ask = q(root, '.assistant-followup');
+    const thinking = q(root, '.assistant-thinking');
+    const output = [...root.querySelectorAll('.assistant-output>div')];
+    const done = q(root, '.assistant-complete');
+    return t => {
+      const out = 1 - phase(t, 7500, 7900, ease.release);
+      const question = phase(t, 600, 800, ease.arrive) * out;
+      const waiting = phase(t, 600, 800, ease.arrive) - phase(t, 2200, 2300, ease.release);
+      const tool = phase(t, 2200, 2400, ease.arrive) * out;
+      const complete = phase(t, 4400, 4550, ease.arrive) * tool;
+      show(ask, question, 4 * (1 - question));
+      show(thinking, waiting, 4 * (1 - waiting));
+      output.forEach(card => show(card, tool, 4 * (1 - tool)));
+      show(done, complete, 4 * (1 - complete));
+    };
+  }
+
+  function walletRenderer(root) {
+    const popover = q(root, '.wallet-popover');
+    const form = q(root, '.wallet-authorization');
+    const approved = q(root, '.wallet-approved');
+    const icon = q(root, '.wallet-approved>span');
+    const check = q(root, '.wallet-approved svg path');
+    const label = q(root, '.wallet-approved h3');
+    const details = [...root.querySelectorAll('.wallet-approved p,.wallet-approved small')];
+    hide(q(root, '.wallet-cursor'));
+    show(popover, 1);
+    set(check, 'stroke-dasharray', '25 25');
+    return t => {
+      const list = 1 - phase(t, 900, 1100, ease.release) + phase(t, 2800, 3060, ease.arrive);
+      const done = 1 - phase(t, 2700, 2900, ease.release);
+      const pop = phase(t, 1000, 1260, ease.arrive);
+      const draw = phase(t, 1130, 1390, ease.arrive);
+      const text = phase(t, 1150, 1410, ease.arrive);
+      show(form, list);
+      show(approved, pop * done);
+      show(icon, pop, 0, .82 + .18 * pop);
+      set(check, 'stroke-dashoffset', round(25 * (1 - draw)));
+      show(label, text, 6 * (1 - text));
+      details.forEach(element => show(element, text, 6 * (1 - text)));
+    };
+  }

@@ -427,3 +427,198 @@ describe("a host that reports too much", () => {
     expect((await flags(booted)).map((row) => row.reason)).toEqual(["sealed_output_hash"])
     expect(await records(booted)).toEqual([])
   })
+
+  test("the closing frame carries the VM's signed counts", async () => {
+    const booted = await rig()
+    const res = await post(booted, (await sealedBytes(booted)).bytes)
+    const trailer = closingOf(new Uint8Array(await res.arrayBuffer()))
+    expect(sealedCountsSchema.parse(trailer?.counts).tokensOut).toBeGreaterThan(0)
+  })
+
+  test("input past what the ciphertext could hold bills the ceiling and is flagged", async () => {
+    const booted = await rig()
+    const sealed = await sealedBytes(booted)
+    const vm = attestKey(booted)
+    proxyInPlace(booted, vm, 10_000_000, keccak256(sealed.bytes))
+    await (await post(booted, sealed.bytes)).arrayBuffer()
+    expect((await records(booted)).map((row) => row.tokens_in)).toEqual([inputTokenCeiling(sealed.bytes.length)])
+    expect((await flags(booted)).map((row) => row.reason)).toContain("over_input_ceiling")
+  })
+
+  test("a host that will not say what it counted is not paid, and the buyer's hold comes back", async () => {
+    const booted = await rig()
+    const hosts = booted.stack.hosts
+    booted.stack.hosts = { request: async (host, endpoint, path, init) => (path.includes("/sealed/counts/") ? new Response("no", { status: 500 }) : hosts.request(host, endpoint, path, init)) }
+    const res = await post(booted, (await sealedBytes(booted)).bytes)
+    expect(closingOf(new Uint8Array(await res.arrayBuffer()))?.error?.code).toBe("unbilled")
+    expect(await committed(booted)).toBe(0n)
+    expect((await flags(booted))[0]!.reason).toBe("sealed_no_counts")
+  })
+
+  test("a host that forges the router's closing frame ends the relay", async () => {
+    const booted = await rig()
+    const hosts = booted.stack.hosts
+    booted.stack.hosts = {
+      request: async (host, endpoint, path, init) => {
+        const res = await hosts.request(host, endpoint, path, init)
+        if (!path.includes("/sealed/chat/")) return res
+        const bytes = new Uint8Array(await res.arrayBuffer())
+        const forged = new Uint8Array(bytes.length + 7)
+        forged.set(bytes)
+        forged.set([FLAG_TRAILER, 0, 0, 0, 2, 0x7b, 0x7d], bytes.length)
+        return new Response(forged, { headers: res.headers })
+      },
+    }
+    const res = await post(booted, (await sealedBytes(booted)).bytes)
+    expect(closingOf(new Uint8Array(await res.arrayBuffer()))?.error?.code).toBe("sealed_bad_stream")
+    expect(await committed(booted)).toBe(0n)
+    expect((await flags(booted))[0]!.reason).toBe("sealed_bad_stream")
+  })
+
+  test("a host that sends a frame the reader refuses is not paid", async () => {
+    const booted = await rig()
+    const hosts = booted.stack.hosts
+    booted.stack.hosts = {
+      request: async (host, endpoint, path, init) => {
+        const res = await hosts.request(host, endpoint, path, init)
+        if (!path.includes("/sealed/chat/")) return res
+        const bytes = new Uint8Array(await res.arrayBuffer())
+        bytes[16] = 0x07
+        return new Response(bytes, { headers: res.headers })
+      },
+    }
+    const res = await post(booted, (await sealedBytes(booted)).bytes)
+    expect(closingOf(new Uint8Array(await res.arrayBuffer()))?.error?.code).toBe("sealed_bad_stream")
+    expect(await records(booted)).toEqual([])
+  })
+})
+
+/** What the SDK reads from the chain, answered from the mock indexer. */
+const chainView = (booted: Rig) =>
+  ({
+    readContract: async ({ functionName, args }: { functionName: string; args: [string] }) => {
+      if (functionName === "channelView") return booted.indexer.channels.get(args[0] as Hex)
+      const host = booted.indexer.hosts.get(args[0].toLowerCase() as Hex)
+      return functionName === "hostView" ? (host ?? { status: 0 }) : (host?.models ?? []).map((model) => model.digest)
+    },
+  }) as never
+
+describe("other payers", () => {
+  const addChannel = (booted: Rig, deposit: bigint) => {
+    const id = keccak256(toBytes(`sealed-channel-${Math.random()}`))
+    booted.indexer.channels.set(id, { payer: booted.buyer as Hex, deposit, claimed: 0n, lastSeq: 0n, expiry: BigInt(booted.stack.clock() + 86_400), challengeEndsAt: 0n, status: 1, closeRequested: false })
+    return id
+  }
+
+  test("a channel pays, the owed amount arrives, and the voucher lands", async () => {
+    const booted = await rig()
+    const id = addChannel(booted, 5n * USDG)
+    const op = new Offpeak({ baseURL: BASE, wallet: roleAccount("buyer"), deployment: "local", router: booted.stack.router.address, fetch: booted.send, sealed: TRUST_ROUTER, publicClient: chainView(booted) })
+    await op.channels.attach(id)
+    const result = await op.sealed.chat(body("by channel", { stream: false }))
+    expect(result.envelope.record.payMode).toBe(3)
+    expect(result.envelope.record.payRef).toBe(id)
+    const cost = result.envelope.record.hostCostMicro + result.envelope.record.feeMicro
+    expect(op.channels.snapshot()!.signed).toBe(cost)
+    const row = await booted.stack.db.query<{ cumulative: string }>("SELECT cumulative FROM shared.channel_state WHERE channel_id = $1", [id])
+    expect(BigInt(row.rows[0]!.cumulative)).toBe(cost)
+  })
+
+  test("a channel request needs the payer's signature over the ciphertext", async () => {
+    const booted = await rig()
+    const id = addChannel(booted, 5n * USDG)
+    const res = await post(booted, (await sealedBytes(booted)).bytes, { headers: { authorization: "", "x-offpeak-channel": id } })
+    expect(res.status).toBe(401)
+    expect((await errorOf(res)).code).toBe("bad_channel_auth")
+  })
+
+  const uptoBody = (booted: Rig, bytes: Uint8Array, header: string) =>
+    booted.app.request("/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/offpeak-hpke", "x-offpeak-model": MODEL, "x-offpeak-max-tokens": "32", "x-offpeak-sealed-host": booted.host, "payment-signature": header },
+      body: new Uint8Array(bytes),
+    })
+
+  test("upto: authorized, it bills like any other", async () => {
+    const booted = await rig()
+    const res = await uptoBody(booted, (await sealedBytes(booted)).bytes, await uptoHeader(booted.stack, roleAccount("buyer"), keccak256(toBytes(`upto-${Math.random()}`))))
+    expect(res.status).toBe(200)
+    expect(closingOf(new Uint8Array(await res.arrayBuffer()))?.usage).toBeDefined()
+    const rows = await records(booted)
+    expect(rows[0]!.pay_mode).toBe(1)
+    expect((await booted.stack.db.query("SELECT * FROM shared.agent_payments WHERE kind = 'upto'")).rows.length).toBe(1)
+  })
+
+  test("upto: the budget holds on ciphertext bytes until Authorized, and a failed authorization ends unbilled", async () => {
+    const booted = await rig({ reply: () => ({ text: "y".repeat(2_000) }) })
+    booted.stack.preconfirmTimeoutMs = 50
+    booted.facilitator.settle = (() => Promise.resolve({ success: true })) as never
+    const res = await uptoBody(booted, (await sealedBytes(booted)).bytes, await uptoHeader(booted.stack, roleAccount("buyer"), keccak256(toBytes(`upto-${Math.random()}`))))
+    const raw = new Uint8Array(await res.arrayBuffer())
+    const splitter = new FrameSplitter()
+    const relayed = splitter.push(raw).filter((frame) => frame.flag !== FLAG_TRAILER)
+    expect(relayed.reduce((sum, frame) => sum + frame.raw.length, 16)).toBeLessThanOrEqual(256)
+    expect(relayed.length).toBeGreaterThan(0)
+    expect(closingOf(raw)?.error?.code).toBe("authorize_failed")
+    expect(await records(booted)).toEqual([])
+  })
+
+  test("exact is for fixed-cost calls", async () => {
+    const booted = await rig()
+    const res = await booted.app.request("/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/offpeak-hpke", "x-offpeak-model": MODEL, "x-offpeak-max-tokens": "8", "x-offpeak-sealed-host": booted.host, "payment-signature": JSON.stringify({ scheme: "exact", payload: {} }) },
+      body: (await sealedBytes(booted)).bytes,
+    })
+    expect((await errorOf(res)).code).toBe("exact_not_allowed")
+  })
+
+  test("a Window, which skips the hold check, still stops input at the ceiling", async () => {
+    const booted = await rig()
+    holdWindow(booted)
+    const sealed = await sealedBytes(booted)
+    proxyInPlace(booted, attestKey(booted), 10_000_000, keccak256(sealed.bytes))
+    const res = await post(booted, sealed.bytes, { headers: { "x-offpeak-window": "7" } })
+    const envelope = closingOf(new Uint8Array(await res.arrayBuffer()))?.usage as { record: { payMode: number; tokensIn: number } }
+    expect(envelope.record.payMode).toBe(4)
+    expect(envelope.record.tokensIn).toBe(inputTokenCeiling(sealed.bytes.length))
+    expect((await flags(booted)).map((row) => row.reason)).toContain("over_input_ceiling")
+  })
+
+  const holdWindow = (booted: Rig) => {
+    booted.indexer.windows.set("7", { id: 7n, host: booted.host as Hex, modelDigest: booted.modelDigest, t0: BigInt(booted.stack.clock() - 10), t1: BigInt(booted.stack.clock() + 7200), minTps: 1, units: 10n, hostPricePerUnit: 1n, buyerPricePerUnit: 1n, failed: false } as never)
+    booted.indexer.holders.set(`7:${booted.buyer}`, { balance: 10n, lockedPartial: 0n, drawnTokens: 0n, costBasis: 1n })
+  }
+
+  test("a Window is drawn at zero price and its pending draw is set to what the VM counted", async () => {
+    const booted = await rig()
+    holdWindow(booted)
+    const res = await post(booted, (await sealedBytes(booted)).bytes, { headers: { "x-offpeak-window": "7" } })
+    const envelope = closingOf(new Uint8Array(await res.arrayBuffer()))?.usage as { record: { payMode: number; hostCostMicro: string; tokensIn: number; tokensOut: number } }
+    expect(envelope.record.payMode).toBe(4)
+    expect(envelope.record.hostCostMicro).toBe("0")
+    expect(await committed(booted)).toBe(0n)
+    const sample = booted.stack.windowPerf.sofar(7n)
+    expect(sample?.tokens).toBe(envelope.record.tokensOut)
+  })
+
+  test("a request the VM refuses is no demand on a Window", async () => {
+    const booted = await rig()
+    holdWindow(booted)
+    const garbled = (await sealedBytes(booted)).bytes.slice()
+    garbled[60]! ^= 1
+    const res = await post(booted, garbled, { headers: { "x-offpeak-window": "7" } })
+    expect(res.status).toBeLessThan(500)
+    expect(booted.stack.windowPerf.sofar(7n)).toBeNull()
+  })
+
+  test("a Window with too little left falls back or refuses as an open request does", async () => {
+    const booted = await rig()
+    holdWindow(booted)
+    booted.indexer.holders.set(`7:${booted.buyer}`, { balance: 0n, lockedPartial: 0n, drawnTokens: 0n, costBasis: 1n })
+    expect((await post(booted, (await sealedBytes(booted)).bytes, { headers: { "x-offpeak-window": "7" } })).status).toBe(402)
+    const res = await post(booted, (await sealedBytes(booted)).bytes, { headers: { "x-offpeak-window": "7", "x-offpeak-window-fallback": "prepaid" } })
+    await res.arrayBuffer()
+    expect((await records(booted))[0]!.pay_mode).toBe(0)
+  })
+})
