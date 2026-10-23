@@ -1,0 +1,134 @@
+/* The desktop links remain centered while their labels fold into quiet icons. */
+.faithful-header[data-nav-collapse="ready"] .nav-collapse-icon {
+  display:none;
+}
+.faithful-header[data-nav-collapse="ready"] .nav-collapse-label {
+  white-space:nowrap;
+}
+.faithful-header .nav-disclosure { display:none; }
+.faithful-header .nav-section-pair { display:grid;grid-template-columns:1fr 1fr;gap:4px; }
+.faithful-header .nav-section-pair small { font-size:11px; }
+
+@media (min-width:641px) {
+  .faithful-header[data-nav-collapse="ready"] .faithful-nav {
+    position:relative;
+    justify-content:space-between;
+  }
+  .faithful-header[data-nav-collapse="ready"] .faithful-links,
+  .faithful-header[data-nav-collapse="ready"] .faithful-links.is-open {
+    display:flex;
+    position:absolute;
+    left:50%;
+    right:auto;
+    top:50%;
+    translate:-50% -50%;
+    width:max-content;
+    height:46px;
+    max-height:none;
+    flex-direction:row;
+    align-items:center;
+    gap:4px;
+    padding:0 5px;
+    overflow:visible;
+    font-size:14px;
+    border-radius:999px;
+    background:transparent;
+    backdrop-filter:none;
+    -webkit-backdrop-filter:none;
+    box-shadow:none;
+  }
+  .faithful-header[data-nav-collapse="ready"].is-scrolled .faithful-links {
+    background:#fafafad9;
+    backdrop-filter:blur(18px);
+    -webkit-backdrop-filter:blur(18px);
+    box-shadow:inset 0 1px 0 #fff,0 0 0 1px #20202008,0 5px 16px #2020200b,0 16px 34px #20202005;
+  }
+  .faithful-header[data-nav-collapse="ready"] .mobile-menu { display:none; }
+  .faithful-header[data-nav-collapse="ready"] .nav-collapse-control {
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    width:auto;
+    min-height:44px;
+    padding:7px 10px;
+    gap:0;
+  }
+  .faithful-header[data-nav-collapse="ready"] .nav-collapse-label {
+    display:block;
+    max-width:110px;
+    overflow:hidden;
+    opacity:1;
+    transition:max-width .5s cubic-bezier(.22,1,.36,1),opacity .24s ease;
+  }
+  .faithful-header[data-nav-collapse="ready"] .nav-collapse-icon {
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    flex:none;
+    width:0;
+    height:24px;
+    overflow:hidden;
+    opacity:0;
+    transition:width .5s cubic-bezier(.22,1,.36,1),opacity .36s ease;
+  }
+  .faithful-header[data-nav-collapse="ready"] .nav-collapse-icon svg {
+    display:block;
+    flex:none;
+    width:22px;
+    height:22px;
+    fill:none;
+    stroke:none;
+    stroke-width:0;
+    stroke-linecap:round;
+    stroke-linejoin:round;
+    rotate:none;
+    color:#666a62;
+    filter:none;
+    transition:color .3s ease;
+  }
+  .faithful-header[data-nav-collapse="ready"] .nav-collapse-control:is(:hover,:focus-visible,[aria-expanded="true"]) .nav-collapse-icon svg {
+    color:#34382f;
+  }
+  .faithful-header[data-nav-collapse="ready"] .nav-collapse-chevron {
+    flex:none;
+    width:12px;
+    height:12px;
+    margin-left:5px;
+    opacity:1;
+    transition:width .5s cubic-bezier(.22,1,.36,1),margin-left .5s cubic-bezier(.22,1,.36,1),opacity .24s ease,rotate .25s;
+  }
+  .faithful-header[data-nav-collapse="ready"].is-scrolled .nav-collapse-label {
+    max-width:0;
+    opacity:0;
+  }
+  .faithful-header[data-nav-collapse="ready"].is-scrolled .nav-collapse-icon {
+    width:24px;
+    opacity:1;
+  }
+  .faithful-header[data-nav-collapse="ready"].is-scrolled .nav-collapse-chevron {
+    width:0;
+    margin-left:0;
+    opacity:0;
+  }
+  /* Keep the inherited opening animation while clamping its resting position. */
+  .faithful-header[data-nav-collapse="ready"] .nav-dropdown,
+  .faithful-header[data-nav-collapse="ready"] .nav-dropdown.has-preview {
+    position:absolute;
+    top:calc(100% + 16px);
+    left:50%;
+    translate:-50% 0;
+    margin-left:var(--nav-menu-offset,0px);
+    max-width:calc(100vw - 24px);
+    max-height:calc(100dvh - 96px);
+    overflow-y:auto;
+    overscroll-behavior:contain;
+    scrollbar-width:thin;
+    box-sizing:border-box;
+    border-radius:16px;
+    box-shadow:0 0 0 1px #00000008,0 8px 16px #0000000a,0 16px 48px #00000005;
+    background:#f9f9f9f2;
+  }
+  .faithful-header[data-nav-collapse="ready"] .nav-dropdown { width:290px;padding:12px; }
+  .faithful-header[data-nav-collapse="ready"] .nav-dropdown.has-preview { width:516px;padding-right:224px;min-height:226px; }
+  .faithful-header[data-nav-collapse="ready"] .nav-dropdown a { padding:12px; }
+}
