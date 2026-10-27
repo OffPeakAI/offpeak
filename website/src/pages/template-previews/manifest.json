@@ -1,0 +1,200 @@
+[
+  {
+    "id": "classification",
+    "slug": "classification",
+    "file": "classification.svg",
+    "title": "Product classification",
+    "category": "Structure",
+    "preview": "/template-previews/classification.svg",
+    "href": "/templates/?workflow=classification#workflow-detail",
+    "width": 1600,
+    "height": 1000
+  },
+  {
+    "id": "extraction",
+    "slug": "extraction",
+    "file": "extraction.svg",
+    "title": "Field extraction",
+    "category": "Structure",
+    "preview": "/template-previews/extraction.svg",
+    "href": "/templates/?workflow=extraction#workflow-detail",
+    "width": 1600,
+    "height": 1000
+  },
+  {
+    "id": "summarization",
+    "slug": "summarization",
+    "file": "summarization.svg",
+    "title": "Document summary",
+    "category": "Writing",
+    "preview": "/template-previews/summarization.svg",
+    "href": "/templates/?workflow=summarization#workflow-detail",
+    "width": 1600,
+    "height": 1000
+  },
+  {
+    "id": "routing",
+    "slug": "routing",
+    "file": "routing.svg",
+    "title": "Support routing",
+    "category": "Operations",
+    "preview": "/template-previews/routing.svg",
+    "href": "/templates/?workflow=routing#workflow-detail",
+    "width": 1600,
+    "height": 1000
+  },
+  {
+    "id": "tagging",
+    "slug": "tagging",
+    "file": "tagging.svg",
+    "title": "Content tagging",
+    "category": "Structure",
+    "preview": "/template-previews/tagging.svg",
+    "href": "/templates/?workflow=tagging#workflow-detail",
+    "width": 1600,
+    "height": 1000
+  },
+  {
+    "id": "normalization",
+    "slug": "normalization",
+    "file": "normalization.svg",
+    "title": "Record normalization",
+    "category": "Structure",
+    "preview": "/template-previews/normalization.svg",
+    "href": "/templates/?workflow=normalization#workflow-detail",
+    "width": 1600,
+    "height": 1000
+  },
+  {
+    "id": "entities",
+    "slug": "entities",
+    "file": "entities.svg",
+    "title": "Entity collection",
+    "category": "Structure",
+    "preview": "/template-previews/entities.svg",
+    "href": "/templates/?workflow=entities#workflow-detail",
+    "width": 1600,
+    "height": 1000
+  },
+  {
+    "id": "tone",
+    "slug": "tone",
+    "file": "tone.svg",
+    "title": "Tone review",
+    "category": "Writing",
+    "preview": "/template-previews/tone.svg",
+    "href": "/templates/?workflow=tone#workflow-detail",
+    "width": 1600,
+    "height": 1000
+  },
+  {
+    "id": "faq",
+    "slug": "faq",
+    "file": "faq.svg",
+    "title": "FAQ drafting",
+    "category": "Writing",
+    "preview": "/template-previews/faq.svg",
+    "href": "/templates/?workflow=faq#workflow-detail",
+    "width": 1600,
+    "height": 1000
+  },
+  {
+    "id": "headlines",
+    "slug": "headlines",
+    "file": "headlines.svg",
+    "title": "Headline options",
+    "category": "Writing",
+    "preview": "/template-previews/headlines.svg",
+    "href": "/templates/?workflow=headlines#workflow-detail",
+    "width": 1600,
+    "height": 1000
+  },
+  {
+    "id": "duplicate",
+    "slug": "duplicate",
+    "file": "duplicate.svg",
+    "title": "Duplicate review",
+    "category": "Operations",
+    "preview": "/template-previews/duplicate.svg",
+    "href": "/templates/?workflow=duplicate#workflow-detail",
+    "width": 1600,
+    "height": 1000
+  },
+  {
+    "id": "comparison",
+    "slug": "comparison",
+    "file": "comparison.svg",
+    "title": "Attribute comparison",
+    "category": "Structure",
+    "preview": "/template-previews/comparison.svg",
+    "href": "/templates/?workflow=comparison#workflow-detail",
+    "width": 1600,
+    "height": 1000
+  },
+  {
+    "id": "bullets",
+    "slug": "bullets",
+    "file": "bullets.svg",
+    "title": "Bullet-point conversion",
+    "category": "Writing",
+    "preview": "/template-previews/bullets.svg",
+    "href": "/templates/?workflow=bullets#workflow-detail",
+    "width": 1600,
+    "height": 1000
+  },
+  {
+    "id": "feedback",
+    "slug": "feedback",
+    "file": "feedback.svg",
+    "title": "Feedback themes",
+    "category": "Operations",
+    "preview": "/template-previews/feedback.svg",
+    "href": "/templates/?workflow=feedback#workflow-detail",
+    "width": 1600,
+    "height": 1000
+  },
+  {
+    "id": "keywords",
+    "slug": "keywords",
+    "file": "keywords.svg",
+    "title": "Keyword suggestions",
+    "category": "Structure",
+    "preview": "/template-previews/keywords.svg",
+    "href": "/templates/?workflow=keywords#workflow-detail",
+    "width": 1600,
+    "height": 1000
+  },
+  {
+    "id": "validation",
+    "slug": "validation",
+    "file": "validation.svg",
+    "title": "Schema review",
+    "category": "Operations",
+    "preview": "/template-previews/validation.svg",
+    "href": "/templates/?workflow=validation#workflow-detail",
+    "width": 1600,
+    "height": 1000
+  },
+  {
+    "id": "rewrite",
+    "slug": "rewrite",
+    "file": "rewrite.svg",
+    "title": "Plain-language edit",
+    "category": "Writing",
+    "preview": "/template-previews/rewrite.svg",
+    "href": "/templates/?workflow=rewrite#workflow-detail",
+    "width": 1600,
+    "height": 1000
+  },
+  {
+    "id": "queue",
+    "slug": "queue",
+    "file": "queue.svg",
+    "title": "Queue digest",
+    "category": "Operations",
+    "preview": "/template-previews/queue.svg",
+    "href": "/templates/?workflow=queue#workflow-detail",
+    "width": 1600,
+    "height": 1000
+  }
+]
