@@ -207,3 +207,118 @@ function streetFurniture(){
  s+=pipe([[249,-84,25],[249,-49,25],[235,-49,25],[235,40,25]],2.3);
  return s;
 }
+
+const mod=(a,b)=>((a%b)+b)%b;
+function onPath(points,v){const lengths=points.slice(1).map((q,i)=>Math.hypot(q[0]-points[i][0],q[1]-points[i][1]));let distance=mod(v,1)*lengths.reduce((a,b)=>a+b,0);for(let i=0;i<lengths.length;i++){if(distance<=lengths[i]){const q=points[i],r=points[i+1],t=distance/lengths[i];return{x:q[0]+(r[0]-q[0])*t,y:q[1]+(r[1]-q[1])*t,dx:Math.sign(r[0]-q[0]),dy:Math.sign(r[1]-q[1])}}distance-=lengths[i]}return{x:points[0][0],y:points[0][1],dx:1,dy:0};}
+const ring=[[-329,-253],[317,-253],[317,223],[-329,223],[-329,-253]],innerRing=[[-105,-224],[109,-224],[109,193],[-105,193],[-105,-224]];
+function vehicle(v,kind=0){const length=kind===2?23:15,w=v.dx?length:7,d=v.dx?7:length;let s=box(v.x-w/2,v.y-d/2,3,w,d,5,{top:kind?'#E8F0D8':'#FBFCF4',front:'#A6BB9B',side:'#7C9878'});s+=top(v.x-w*.28,v.y-d*.28,8.2,w*.56,d*.56,'#5D7862');if(kind===2){for(let i=0;i<3;i++)s+=top(v.x-w*.25+(v.dx?i*5:0),v.y-d*.25+(v.dy?i*5:0),8.35,v.dx?3.5:4,v.dy?3.5:4,'#BBCCAF');}const [cx,cy]=p(v.x,v.y,8.4);return s+ellipse(cx,cy,1.3,.8,kind?C.active:'#E1EFBB');}
+function traffic(t){let s='',u=mod(t,DURATION)/DURATION;
+ // Small electric shuttles circulate in both directions; a linked light rail uses the outer circuit.
+ for(let i=0;i<14;i++)s+=vehicle(onPath(i%3?ring:innerRing,(i%2?1:-1)*u*(i%3===0?2:1)+i*.071),i%4===0);
+ for(let i=0;i<5;i++){const v=onPath(ring,u+.16-i*.0115);s+=vehicle(v,2);}
+ // Ground data routes pulse independently underneath architecture and bridges.
+ const routes=[[[-281,-45],[257,-45],[257,23]],[[-136,-209],[-136,199]],[[85,-209],[85,199]],[[-277,205],[283,205]]];
+ for(let j=0;j<routes.length;j++){s+=line(routes[j].map(q=>p(...q,2.8)),'#A6BF8F',1);for(let i=0;i<4;i++){const v=onPath(routes[j],u*4+i*.25+j*.18),[x,y]=p(v.x,v.y,3);s+=ellipse(x,y,2.5,1.2,'#DBF2B6')+ellipse(x,y,5,2.5,'#CDEDA1','opacity=".20"');}}
+ // Visitors and hand trucks move on open sidewalks, never across building footprints.
+ for(let i=0;i<18;i++){const v=onPath([[-300,19],[286,19],[286,25],[-300,25],[-300,19]],u+(i/18)),[x,y]=p(v.x,v.y,2);s+=ellipse(x,y+1,2,1,'#586F50','opacity=".15"')+line([[x,y-1],[x,y-5]],i%3?'#A0B39A':'#6A8868',1.2)+circle(x,y-6,1.2,'#D9DDCA');}
+ return s;
+}
+function arm(x,y,z,phase,t){const a=Math.sin(t*TAU/5+phase),b=Math.cos(t*TAU/5+phase),shoulder=[x,y,z],elbow=[x+13+13*a,y-9,z+23+5*b],hand=[x+29+13*a,y+7+10*b,z+9+7*a];let s=pipe([shoulder,elbow,hand],2.8,'#D1DEC5');for(const q of [shoulder,elbow,hand]){const[xp,yp]=p(...q);s+=circle(xp,yp,3.6,'#8AA376')+circle(xp,yp,1.8,'#DFEACD');}const[xp,yp]=p(...hand);s+=pathsvg(`M${xp-3} ${yp+2}v5h3m6-5v5h-3`,'#526D4D',1.4);return s;}
+function effects(t){const u=mod(t,DURATION)/DURATION;let s='';
+ for(const f of fans){const angle=(u*360*20+f.phase*180)%360;let fanblades='';for(let k=0;k<5;k++)fanblades+=`<path d="M0 0C${f.r*.15} ${-f.r*.7} ${f.r*.9} ${-f.r*.9} ${f.r*.78} ${-f.r*.28}Q${f.r*.36} ${f.r*.2} 0 0" fill="#829879" transform="rotate(${angle+k*72})"/>`;s+=roof(f.x,f.y,f.z,fanblades+circle(0,0,2.3,'#C1D1B6'));}
+ for(const l of leds){const light=.35+.65*Math.pow(Math.sin(u*TAU*3+l.phase),2);s+=plane(l.x,l.y,l.z,rect(0,0,l.w,2.3,'#D5F2A0',.4,'none',0,`opacity="${light.toFixed(3)}"`));}
+ // Rate needle moves, then gently locks; accepted state is visible in the separate ticket lights.
+ const ang=-50+60*(.5+.5*Math.sin(u*TAU*2));
+ s+=plane(-57,-110,68,`<g transform="translate(39 35) rotate(${ang})">${pathsvg('M0 0V-24','#D5F0AA',1.9)}${circle(0,0,2.7,'#EDF5DF')}</g>`);
+ for(let i=0;i<5;i++){const q=mod(u*4+i*.2,1);s+=top(-54+q*86,-85,15,6,6,'#EDF5DF')+line([p(-53+q*86,-84,15.2),p(-49+q*86,-84,15.2)],'#ABC783',.7);}
+ // Authorization scanner descends through the portal; a gate arm raises and lowers.
+ const scan=12+54*(.5+.5*Math.sin(u*TAU*4));
+ s+=poly([p(195,-141,scan),p(233,-141,scan),p(233,-176,scan),p(195,-176,scan)],'#CFEAA5','none',0,'opacity=".23"')+line([p(195,-141,scan),p(233,-141,scan)],'#CDE9A0',1.8);
+ const gate=.5+.5*Math.sin(u*TAU*2),ga=gate*1.2;
+ s+=pipe([[188,-124,28],[188+46*Math.cos(ga),-124,28+46*Math.sin(ga)]],1.7,'#CCDDAE');
+ // Workshop arms sort glowing packages across a live roller conveyor.
+ s+=arm(-278,131,45,0,t)+arm(-177,131,45,Math.PI,t);
+ for(let i=0;i<8;i++){const q=mod(u*4+i/8,1),x=-293+q*124;s+=crate(x,145,22,7)+top(x+1,146,28,5,4,i%3?'#D4E6B8':'#C7E692');}
+ // Meter bars, a physical diverter and two return paths run at separate periods.
+ let bars='';for(let i=0;i<13;i++){const h=5+14*(.5+.5*Math.sin(u*TAU*2+i*.35));bars+=rect(5+i*6.3,23-h,3.5,h,i<8?'#C5DFA3':'#88AA7B',.5);}s+=plane(-59,136,50,bars);
+ for(let i=0;i<7;i++){let q=mod(u*4+i/7,1);let x=-71+q*124,y=155+(i%2?8:0);s+=crate(x,y,26,5);}
+ const [gx,gy]=p(-19,162,35);s+=`<g transform="translate(${gx} ${gy}) rotate(${Math.sin(u*TAU*4)*18})">${pathsvg('M-8 0L10 3','#D6EAB6',2.1)}</g>`;
+ for(let i=0;i<4;i++){const q=mod(-u*2+i*.25,1);s+=crate(-72+q*128,189,5,5);}
+ // Printer paper unrolls; a signature line is progressively revealed on the slip.
+ const ph=.5+.5*Math.sin(u*TAU*2),len=20+24*ph;
+ s+=plane(220,178,43,`<path d="M0 0H38V${len-7}Q38 ${len+1} 32 ${len+2}H-6Q0 ${len-1} 0 ${len-7}Z" fill="#FAFBF1" stroke="#B9CBB0" stroke-width=".55"/>${pathsvg(`M6 7H30M6 12H27M6 17H${14+14*ph}`,'#A7BD95',.65)}`);
+ // Archive-root beacon with orbiting checks and soft concentric pulses.
+ const [bx,by]=p(267,72,121),pulse=.5+.5*Math.sin(u*TAU*5);
+ s+=ellipse(bx,by,24+8*pulse,12+4*pulse,'none',`stroke="#C3DDA4" stroke-width="1" opacity="${.45-.25*pulse}"`);
+ for(let i=0;i<3;i++){const a=u*TAU*2+i*TAU/3;s+=ellipse(bx+26*Math.cos(a),by+13*Math.sin(a),2.1,1.4,'#E2F6BA');}
+ // A service lift travels its fixed tower shaft, stopping smoothly at both levels.
+ const lift=16+86*(.5-.5*Math.cos(u*TAU*2));s+=box(191,92,lift,10,19,13,{front:'#DCE8CD',side:'#9BB790',top:'#F0F5E5'})+windows(192,111,lift+11,7,7,1,1);
+ // Four small courier drones on closed ellipses, with spinning rotors and moving soft shadows.
+ for(let i=0;i<4;i++){const a=u*TAU+(i*.25*TAU),x=110*Math.cos(a)+(i%2?110:-150),y=77*Math.sin(a)+(i<2?-120:112),z=155+13*Math.sin(a*2+i),[dx,dy]=p(x,y,z),[sx,sy]=p(x,y,2);
+  s+=ellipse(sx,sy,12,5,'#5C795B','opacity=".055"');
+  s+=box(x-4,y-4,z,8,8,4,{top:'#F5F8EA',front:'#AFBE9D',side:'#8EA87F'});
+  for(const[ox,oy]of[[-8,-7],[8,-7],[-8,7],[8,7]]){const[cx,cy]=p(x+ox,y+oy,z+2);s+=line([[dx,dy],[cx,cy]],'#8DA581',1)+ellipse(cx,cy,5,2.5,'none','stroke="#91AC83" stroke-width=".7"')+line([[cx-4*Math.cos(u*TAU*40),cy-1.8*Math.sin(u*TAU*40)],[cx+4*Math.cos(u*TAU*40),cy+1.8*Math.sin(u*TAU*40)]],'#DCEBCC',1);}
+ }
+ return s;
+}
+
+async function main(){
+ await fs.mkdir(WORK,{recursive:true});await fs.mkdir(OUT,{recursive:true});
+ if(process.argv.includes('--live')){
+  const darken=s=>s.replaceAll('#526A56','#202722').replaceAll('#4F6D55','#202722').replaceAll('#4E6854','#202722').replaceAll('#687E70','#3B4740').replaceAll('#33483B','#202722').replaceAll('#4D6253','#37423A').replaceAll('#849387','#56625A');
+  const districts=[['capacity',capacityDistrict()],['quote',quoteDistrict()],['inference',inferenceDistrict()],['authorization',authorizationDistrict()],['meter',meterDistrict()],['receipt',receiptDistrict()]];
+  const city=districts.map(([id,body])=>`<g data-city-district="${id}"><g filter="url(#neutral-architecture)">${darken(body)}</g><g data-district-motion="${id}"></g></g>`).join('');
+  const eyes=(id,x,y,z,w,h)=>`<g data-city-eyes="${id}">${plane(x,y,z,rect(0,0,w,h,'#202522',h*.15,'#737D73',.5)+rect(w*.14,h*.30,w*.28,h*.21,'#CCFF00',h*.10)+rect(w*.58,h*.30,w*.28,h*.21,'#CCFF00',h*.10)+rect(w*.45,h*.64,w*.10,h*.08,'#BEE900',h*.04))}</g>`;
+  const robotEyes=eyes('capacity',-248,-139,134,37,21)+eyes('inference',-236,123,61,37,23)+eyes('quote',46,-118,41,14,10)+eyes('receipt',148,115,124,36,20);
+  const newDefs=`<defs><radialGradient id="city-neon-field"><stop stop-color="#CCFF00" stop-opacity=".16"/><stop offset="1" stop-color="#CCFF00" stop-opacity="0"/></radialGradient></defs>`;
+  const instruments=[['GPU utilization','67.4','%'],['Available capacity','32.6','%'],['Model throughput','812','tok/s']].map(([name,value,unit],i)=>{
+   const x=105+i*500,y=630,w=350,h=57;
+   const trace=Array.from({length:27},(_,k)=>[145+k*7.1,34-9*Math.sin(k*.36+i)-3*Math.sin(k*.9)]);
+   return `<g data-city-instrument="${i}" transform="translate(${x} ${y})">${poly([[-5,-6],[w+3,-6],[w,0],[0,0]],'#5A5D59','#95998F',.7)}${poly([[w,0],[w+7,-6],[w+7,h-4],[w,h]],'#292C29','#73786C',.7)}${rect(0,0,w,h,'#353834',5,'#808679',.9)}${rect(4,4,w-8,h-8,'#171C18',3,'#3B4437',.5)}${rect(12,h,7,7,'#686D63',1)}${rect(w-19,h,7,7,'#686D63',1)}${rect(9,8,w-18,1,'#D9DFCF',0,'none',0,'opacity=".16"')}<text data-metric-label="" x="15" y="17" font-family="Arial,sans-serif" font-size="9.5" fill="#AEB7A2">${name}</text><text data-metric-value="" x="15" y="44" font-family="Arial,sans-serif" font-size="24" letter-spacing="-1.2" fill="#EDF3E4">${value}</text><text data-metric-unit="" x="98" y="42" font-family="Arial,sans-serif" font-size="9" fill="#AFBBA2">${unit}</text>${line([[145,44],[330,44]],'#46513E',.5)}${line([[145,30],[330,30]],'#35402F',.4)}<path data-metric-fill="" d="M${trace.map(v=>v.join(' ')).join('L')}L330 44H145Z" fill="#CCFF00" opacity=".07"/><polyline data-metric-line="" points="${P(trace)}" fill="none" stroke="#CCFF00" stroke-width="1.4" stroke-linejoin="round"/><circle data-metric-dot="" cx="330" cy="${trace.at(-1)[1]}" r="2.2" fill="#CCFF00"/><text x="329" y="15" text-anchor="end" font-family="Arial,sans-serif" font-size="6.7" letter-spacing=".65" fill="#88977C">ILLUSTRATIVE</text></g>`;
+  }).join('');
+  const live=svg(`${newDefs}<g data-city-ground="" filter="url(#neutral-ground)">${ground(true)}</g><g data-city-traffic=""></g><g data-city-architecture="">${city}<g filter="url(#neutral-architecture)">${darken(streetFurniture())}</g></g><g data-city-details="">${robotEyes}</g><g data-city-air=""></g><g data-city-fields=""></g><g data-city-analytics="">${instruments}</g>`);
+  await fs.writeFile(path.join(OUT,'offpeak-city-live.svg'),live);
+  const districtFor=(x,y)=>y<0?(x<-125?'capacity':x<110?'quote':'authorization'):(x<-125?'inference':x<110?'meter':'receipt');
+  const state={width:W,height:H,camera,projection:'front-facing orthographic, horizontal facades',analytics:'illustrative',period_seconds:20,fans:fans.map(f=>({...f,district:districtFor(f.x,f.y)})),leds:leds.map(l=>({...l,district:districtFor(l.x,l.y)})),districts:[{id:'capacity',x:-229,y:-69,z:10},{id:'quote',x:-6,y:-69,z:10},{id:'authorization',x:217,y:-69,z:10},{id:'inference',x:-229,y:195,z:12},{id:'meter',x:-4,y:195,z:12},{id:'receipt',x:216,y:195,z:12}]};
+  await fs.writeFile(path.join(OUT,'offpeak-city-live-state.json'),JSON.stringify(state));
+  const neon=s=>s.replaceAll('#D5F2A0','#CCFF00').replaceAll('#D5F0AA','#CCFF00').replaceAll('#CDE9A0','#CCFF00').replaceAll('#CFEAA5','#CCFF00').replaceAll('#C5DFA3','#CCFF00').replaceAll('#C3DDA4','#CCFF00').replaceAll('#E2F6BA','#CCFF00').replaceAll('#DBF2B6','#CCFF00');
+  const previewAt=t=>live.replace('<g data-city-traffic=""></g>',`<g>${neon(traffic(t))}</g>`).replace('<g data-city-air=""></g>',`<g>${neon(effects(t))}</g>`);
+  const preview=previewAt(0);
+  await sharp(Buffer.from(preview)).png().toFile(path.join(OUT,'offpeak-city-live-poster.png'));
+  await sharp(Buffer.from(preview)).flatten({background:'#f8f8f8'}).png().toFile(path.join(ROOT,'city-live-proof.png'));
+  const initial=await sharp(Buffer.from(preview)).ensureAlpha().raw().toBuffer(),end=await sharp(Buffer.from(previewAt(20))).ensureAlpha().raw().toBuffer();let delta=0,transparent=0,min=255,max=0;
+  for(let i=0;i<initial.length;i++){delta+=Math.abs(initial[i]-end[i]);if(i%4===3){min=Math.min(min,initial[i]);max=Math.max(max,initial[i]);if(initial[i]===0)transparent++;}}
+  if(delta)throw new Error(`Front city source loop differs: ${delta}`);
+  const corners=[3,(W-1)*4+3,(W*(H-1))*4+3,(W*H-1)*4+3].map(i=>initial[i]);
+  await fs.writeFile(path.join(ROOT,'live-validation.json'),JSON.stringify({dimensions:[W,H],mode:'RGBA',projection:state.projection,camera,alpha_extrema:[min,max],fully_transparent_pixels:transparent,transparent_fraction:Number((transparent/(W*H)).toFixed(4)),corner_alpha:corners,background_rectangle:false,overall_floor_slab:false,districts:6,fan_anchors:fans.length,led_anchors:leds.length,analytics_instruments:3,analytics_mode:'illustrative; district-selected; 1Hz; deterministic 20s period',source_0s_20s_raw_pixel_difference:delta,svg_bytes:Buffer.byteLength(live),runtime:'../city-interactive.js'},null,2));
+  console.log(`Live transparent SVG exported: ${Buffer.byteLength(live)} bytes; no overall background or slab. ${fans.length} fan anchors, ${leds.length} LED anchors.`);return;
+ }
+ const groundSvg=svg(`<g filter="url(#neutral-ground)">${ground()}</g>`);
+ const citySvg=svg(`<g filter="url(#neutral-architecture)">${capacityDistrict()+quoteDistrict()+inferenceDistrict()+authorizationDistrict()+meterDistrict()+receiptDistrict()+streetFurniture()}</g>`);
+ await fs.writeFile(path.join(ROOT,'city-ground.svg'),groundSvg);await fs.writeFile(path.join(ROOT,'city-architecture.svg'),citySvg);
+ const [groundPng,cityPng]=await Promise.all([sharp(Buffer.from(groundSvg)).png().toBuffer(),sharp(Buffer.from(citySvg)).png().toBuffer()]);
+ await fs.writeFile(path.join(WORK,'ground.png'),groundPng);await fs.writeFile(path.join(WORK,'architecture.png'),cityPng);
+ async function frame(t,raw=false){const [trafficPng,effectsPng]=await Promise.all([sharp(Buffer.from(svg(traffic(t)))).png().toBuffer(),sharp(Buffer.from(svg(effects(t)))).png().toBuffer()]);let render=sharp(groundPng).composite([{input:trafficPng},{input:cityPng},{input:effectsPng}]);return raw?render.removeAlpha().raw().toBuffer():render.png().toBuffer();}
+ const times=[0,5.5,11,16.5],proofs=[];
+ for(const t of times){const b=await frame(t);await fs.writeFile(path.join(WORK,`proof-${t}.png`),b);proofs.push(b);if(t===0)await fs.writeFile(path.join(OUT,'offpeak-city-poster.png'),b);}
+ await sharp({create:{width:1600,height:900,channels:4,background:C.paper}}).composite(await Promise.all(proofs.map(async(b,i)=>({input:await sharp(b).resize(800,450).png().toBuffer(),left:(i%2)*800,top:Math.floor(i/2)*450})))).png().toFile(path.join(ROOT,'city-contact-sheet.png'));
+ console.log(`PROOF READY: ${fans.length} rotating fans, ${leds.length} status lights, six districts. ${W}x${H}.`);
+ if(!process.argv.includes('--render'))return;
+ const a=await frame(0,true),b=await frame(20,true);let diff=0;for(let i=0;i<a.length;i++)diff+=Math.abs(a[i]-b[i]);
+ if(diff!==0)throw new Error(`Loop is not periodic: ${diff}`);
+ const meanDifference=(one,two)=>{let d=0;for(let i=0;i<one.length;i++)d+=Math.abs(one[i]-two[i]);return d/one.length;};
+ const finalFrame=await frame(DURATION-1/FPS,true),seamDelta=meanDifference(finalFrame,a),adjacent=[];
+ for(const time of [0,2.5,5,8.75,12.5,15,17.5]){const pair=await Promise.all([frame(time,true),frame(time+1/FPS,true)]);adjacent.push(meanDifference(...pair));}
+ console.log(`Loop boundary mean delta ${seamDelta.toFixed(4)}; sampled ordinary steps ${Math.min(...adjacent).toFixed(4)}–${Math.max(...adjacent).toFixed(4)}.`);
+ console.log('Exact 0s/20s raw-pixel periodicity verified. Encoding 480 frames.');
+ const video=path.join(OUT,'offpeak-city.mp4');
+ const ff=spawn(FFMPEG,['-hide_banner','-loglevel','warning','-y','-f','rawvideo','-pix_fmt','rgb24','-s',`${W}x${H}`,'-r',String(FPS),'-i','pipe:0','-an','-c:v','libx264','-preset','medium','-crf','19','-pix_fmt','yuv420p','-movflags','+faststart','-frames:v',String(FPS*DURATION),video],{stdio:['pipe','ignore','pipe'],windowsHide:true});
+ let stderr='';ff.stderr.on('data',d=>stderr+=d.toString());ff.stdin.on('error',()=>{});const finished=once(ff,'close');
+ const started=Date.now();
+ for(let i=0;i<FPS*DURATION;i+=4){const frames=await Promise.all(Array.from({length:Math.min(4,FPS*DURATION-i)},(_,j)=>frame((i+j)/FPS,true)));for(const f of frames){if(!ff.stdin.write(f))await once(ff.stdin,'drain');}if(i%48===0)console.log(`Rendered ${i+frames.length}/480 frames, ${Math.round((Date.now()-started)/1000)}s elapsed`);}
+ ff.stdin.end();const[code]=await finished;if(code!==0)throw new Error(stderr);
+ const bytes=(await fs.stat(video)).size;
+ const report={file:'offpeak-city.mp4',width:W,height:H,fps:FPS,duration_seconds:DURATION,frames:FPS*DURATION,audio:false,codec:'H.264 / yuv420p',loop:'Deterministic 20-second periodic animation; exact raw pixels at t=0 and t=20 are equal.',periodic_pixel_difference:diff,loop_boundary_mean_delta:seamDelta,sampled_adjacent_mean_deltas:adjacent,loop_boundary_within_sampled_motion:seamDelta<=Math.max(...adjacent)+.02,rotating_fans:fans.length,status_lights:leds.length,districts:6,moving_systems:['electric shuttles','five-car light rail','courier drones and rotors','cooling fans','status LEDs','accepted quote dial','ticket conveyor','authorization scanning plane','gate arm','two industrial sorting arms','inference token parcels','meter bars','sorting diverter','return parcels','paper feed and signature','archive root beacon','service lift','walking visitors','data-route pulses'],bytes,sha256:crypto.createHash('sha256').update(await fs.readFile(video)).digest('hex'),render_elapsed_seconds:Math.round((Date.now()-started)/1000)};
+ await fs.writeFile(path.join(ROOT,'validation.json'),JSON.stringify(report,null,2)+'\n');console.log(JSON.stringify(report));
+}
+main().catch(e=>{console.error(e);process.exit(1)});
