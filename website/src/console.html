@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <meta name="theme-color" content="#f6f7f3">
+  <title>OFFPEAK — Console preview</title>
+  <link rel="icon" type="image/svg+xml" href="/assets/offpeak-white-mark.svg">
+  <link rel="stylesheet" href="/assets/reference.css">
+  <link rel="stylesheet" href="/assets/console.css">
+  <link rel="stylesheet" href="/assets/material-system.css">
+  <script defer src="/assets/ui-icons.js"></script>
+  <script defer src="/assets/console.js"></script>
+  <script defer src="/assets/material-system.js"></script>
+  <script defer src="/assets/surface-interaction.js"></script>
+<link rel="stylesheet" href="/assets/console-arcade.css"><script defer src="/assets/console-arcade.js"></script><link rel="stylesheet" href="/assets/approved-logo.css"><link rel="stylesheet" href="/assets/ui-icons.css"></head>
+<body class="console-page">
+<a class="skip-link" href="#main-content">Skip to content</a>
+<div class="console-shell">
+  <aside class="sidebar">
+    <a class="brand" href="/" aria-label="OFFPEAK home"><img src="/assets/offpeak-wordmark.svg" alt="OFFPEAK" width="140" height="32"></a>
+    <div class="workspace-label"><span class="workspace-icon">O</span><div>Demo workspace<small>Product preview</small></div><span class="workspace-arrow" data-ui-icon="chevronDown" aria-hidden="true"></span></div>
+    <p class="sidebar-eyebrow">WORKSPACE</p>
+    <nav class="console-nav" aria-label="Console">
+      <button class="nav-item active" data-view="overview" aria-current="page"><span data-ui-icon="overview" aria-hidden="true"></span>Overview</button>
+      <button class="nav-item" data-view="models"><span data-ui-icon="models" aria-hidden="true"></span>Models</button>
+      <button class="nav-item" data-view="requests"><span data-ui-icon="requests" aria-hidden="true"></span>Requests<span class="nav-count" id="request-count">0</span></button>
+      <button class="nav-item" data-view="receipts"><span data-ui-icon="receipts" aria-hidden="true"></span>Receipts</button>
+    </nav>
+    <div class="sidebar-bottom"><div class="preview-note"><span class="dot"></span><strong>A look at what’s next.</strong><p>Explore the planned inference flow with a local simulation.</p></div><a class="return-link" href="/"><span data-ui-icon="arrowLeft" aria-hidden="true"></span> Back to OFFPEAK</a><button class="reset-link" id="reset-demo">Reset demo <span data-ui-icon="reset" aria-hidden="true"></span></button></div>
+  </aside>
+  <div class="main-shell">
+    <header class="topbar"><div class="breadcrumb">Workspace <span>/</span> <strong id="view-name">Overview</strong></div><div class="topbar-right"><span class="demo-badge"><span></span>Illustrative demo</span><button class="mobile-reset" id="reset-demo-mobile" aria-label="Reset demo" title="Reset demo"><span data-ui-icon="reset" aria-hidden="true"></span></button><span class="avatar" aria-label="Demo account">D</span></div></header>
+    <main id="main-content" tabindex="-1">
+      <section class="view" id="view-overview" aria-labelledby="overview-heading">
+        <div class="page-heading"><div><p class="eyebrow">YOUR COMPUTE, AT A GLANCE</p><h1 id="overview-heading">Good work starts here.</h1><p>Find capacity. Set your limit. Keep the receipt.</p></div><span class="environment-pill"><span class="dot"></span>Local simulation</span></div>
+        <div class="demo-banner"><span data-ui-icon="info" aria-hidden="true"></span><p><strong>A product preview, with nothing to pay.</strong> All balances, rates, model responses, and receipts below are illustrative. No wallet or live service is connected.</p></div>
+        <div class="summary-grid">
+          <article class="summary-card balance-card"><div class="card-label">DEMO BALANCE <span class="tiny-tag">MOCK</span></div><div class="balance-number"><span id="balance-available">1.000000</span><span>MOCK</span></div><div class="balance-details"><span>Reserved <strong id="balance-reserved">0.000000</strong></span><span>Pending <strong>0.000000</strong></span></div></article>
+          <article class="summary-card"><div class="card-label">COMPLETED REQUESTS <span data-ui-icon="check" aria-hidden="true"></span></div><div class="stat-value" id="completed-count">0</div><p class="stat-description">Every completed demo call gets a receipt.</p></article>
+          <article class="summary-card capacity-card"><div class="card-label">EXAMPLE CAPACITY <span class="status-pill"><span></span>Available</span></div><div class="capacity-visual" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div><div class="capacity-footer"><strong>Room for your next idea.</strong><span>Simulated availability</span></div></article>
+        </div>
+        <div class="workspace-grid">
+          <article class="panel composer"><div class="panel-title"><div><h2>Run a sample request</h2><p>A small job. A clear spending limit.</p></div><span class="step-tag">01 / COMPOSE</span></div>
+            <div class="model-selection"><div class="model-symbol" aria-hidden="true">◈</div><div><strong>Example open model</strong><span>Text inference · Demo revision</span></div><span class="tiny-tag">PREVIEW</span></div>
+            <label class="field-label" for="sample-task">Start with a sample</label><select id="sample-task"><option value="classify">Classify product descriptions</option><option value="summarize">Summarize a support conversation</option><option value="extract">Extract structured information</option></select>
+            <label class="field-label prompt-label" for="prompt-input">Your prompt <span>Stays in this browser</span></label><textarea id="prompt-input" rows="6" spellcheck="false">Classify these products by category:
+1. A stainless steel pour-over kettle.
+2. A lightweight trail running shoe.
+3. A compact mechanical keyboard.
+
+Return a category for each product.</textarea>
+            <div class="composer-bottom"><div><label class="field-label" for="output-limit">Maximum output tokens</label><select id="output-limit"><option value="256">256 tokens</option><option value="500" selected>500 tokens</option><option value="1000">1,000 tokens</option></select></div><button class="button button-dark" id="create-quote">Get a demo quote <span data-ui-icon="arrowUpRight" aria-hidden="true"></span></button></div>
+            <p class="field-help">Fixed demo metering: 1,000 input tokens. Your text is not sent to a model or tokenized.</p>
+          </article>
+          <article class="panel quote-panel"><div class="panel-title"><div><h2>Your quote</h2><p>Know the maximum before you run.</p></div><span class="step-tag">02 / AUTHORIZE</span></div>
+            <div class="quote-status"><span id="quote-state" class="neutral-status">Awaiting a quote</span><span class="quote-timer" id="quote-timer">—</span></div>
+            <dl class="price-lines"><div><dt>Input / 1M tokens</dt><dd>0.20 <small>MOCK</small></dd></div><div><dt>Output / 1M tokens</dt><dd>0.60 <small>MOCK</small></dd></div><div><dt>Platform fee</dt><dd>0.00 <small>MOCK</small></dd></div></dl>
+            <div class="max-charge"><span>MAXIMUM DEMO CHARGE</span><strong id="quote-cap">—</strong><small>MOCK units</small></div>
+            <div class="quote-explainer"><span data-ui-icon="shield" aria-hidden="true"></span><p>The maximum is reserved first. A successful request pays for measured usage; the remainder is released.</p></div>
+            <button class="button button-lime" id="run-request" disabled>Simulate request <span data-ui-icon="arrowRight" aria-hidden="true"></span></button>
+            <p class="quote-disclaimer" id="quote-disclaimer">Create a quote to try the flow. No real funds or signatures.</p>
+          </article>
+        </div>
+        <article class="panel result-panel" id="result-panel" hidden><div class="panel-title"><div><p class="eyebrow">03 / RESULT</p><h2 id="result-heading">Request in progress</h2></div><span class="neutral-status" id="result-status">Reserved</span></div><div class="request-progress" aria-label="Demo request progress"><span id="stage-reserved">Reserved</span><i></i><span id="stage-running">Running</span><i></i><span id="stage-completed">Completed</span></div><pre id="result-output">Your maximum charge has been reserved.</pre><div class="result-footer" id="result-footer" hidden><div><span>Charged <strong id="result-charged"></strong></span><span>Released <strong id="result-released"></strong></span></div><button class="button button-outline" id="download-latest">Download demo receipt <span data-ui-icon="arrowDown" aria-hidden="true"></span></button></div></article>
+        <footer class="console-footer"><span>OFFPEAK / PRODUCT PREVIEW</span><p>Open models. Capacity-based prices.</p><a href="/roadmap/">See the roadmap <span data-ui-icon="arrowUpRight" aria-hidden="true"></span></a></footer>
+      </section>
+      <section class="view" id="view-models" aria-labelledby="models-heading" hidden><div class="page-heading"><div><p class="eyebrow">THE MODEL CATALOG</p><h1 id="models-heading">Start with the right model.</h1><p>Clear capabilities, revisions, and pricing before every request.</p></div></div><div class="demo-banner"><span data-ui-icon="info" aria-hidden="true"></span><p><strong>Catalog not connected.</strong> The initial model is pending validation. This example shows the information a supported model would provide.</p></div><article class="panel model-detail"><div class="model-detail-top"><div class="model-symbol large" aria-hidden="true">◈</div><div><span class="eyebrow">ILLUSTRATIVE MODEL PROFILE</span><h2>Example open model</h2><p>Repeatable text work, with explicit limits.</p></div><span class="tiny-tag">DEMO REVISION</span></div><div class="model-facts"><div><span>Capability</span><strong>Non-streaming text</strong></div><div><span>Designed for</span><strong>Extraction & classification</strong></div><div><span>Region</span><strong>Pending validation</strong></div><div><span>Serving hardware</span><strong>Pending validation</strong></div><div><span>Input / 1M tokens</span><strong>0.20 MOCK · example</strong></div><div><span>Output / 1M tokens</span><strong>0.60 MOCK · example</strong></div></div><div class="model-detail-bottom"><p>Model quality, license, hardware, and real rates must be verified before paid access.</p><button class="button button-dark" id="try-example">Try the example <span data-ui-icon="arrowUpRight" aria-hidden="true"></span></button></div></article><div class="quiet-note"><strong>One complete loop comes first.</strong><p>The planned pilot starts with one approved model revision and vetted capacity. Streaming, tools, and broader model support are later steps.</p></div></section>
+      <section class="view" id="view-requests" aria-labelledby="requests-heading" hidden><div class="page-heading"><div><p class="eyebrow">YOUR REQUEST HISTORY</p><h1 id="requests-heading">Every request, accounted for.</h1><p>Follow the status, inspect usage, and keep the record.</p></div><button class="button button-dark" id="new-request">New demo request <span data-ui-icon="plus" aria-hidden="true"></span></button></div><article class="panel table-panel"><div class="table-scroll"><table><thead><tr><th>Request</th><th>Task</th><th>Status</th><th>Usage</th><th>Charge</th><th>Receipt</th></tr></thead><tbody id="requests-table"></tbody></table></div><div class="empty-state" id="requests-empty"><span class="empty-symbol" aria-hidden="true"><span data-ui-icon="requests" aria-hidden="true"></span></span><h2>A clean slate.</h2><p>Run your first sample request to see its status and usage here.</p><button class="button button-outline" data-start-request>Try a sample request</button></div></article><p class="section-note">This history lives in memory for the current browser page. Refreshing or resetting clears the demo.</p></section>
+      <section class="view" id="view-receipts" aria-labelledby="receipts-heading" hidden><div class="page-heading"><div><p class="eyebrow">BILLING YOU CAN INSPECT</p><h1 id="receipts-heading">Keep the record.</h1><p>A receipt for the request, the usage, and the charge.</p></div></div><div class="demo-banner"><span data-ui-icon="info" aria-hidden="true"></span><p><strong>Example receipts only.</strong> These records are not signed or published on-chain. A production proof would verify signature and inclusion, not correct model execution.</p></div><article class="panel" id="receipts-content"><div class="empty-state" id="receipts-empty"><span class="empty-symbol" aria-hidden="true"><span data-ui-icon="receipts" aria-hidden="true"></span></span><h2>Your records start here.</h2><p>Complete a sample request to inspect and download its illustrative receipt.</p><button class="button button-outline" data-start-request>Run a sample request</button></div><div id="receipts-list"></div></article><div class="quiet-note"><strong>A receipt is a record, not proof of computation.</strong><p>The planned verifier checks that OFFPEAK signed a billing record and included it in a committed batch. It does not establish truthful metering or a correct model answer.</p></div></section>
+    </main>
+  </div>
+</div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<div class="sr-only" id="announcer" role="status" aria-live="polite"></div>
+<script defer src="/assets/approved-logo.js"></script></body>
+</html>
