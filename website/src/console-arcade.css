@@ -98,3 +98,83 @@ body.arcade-console.console-page{--paper:#f5f5f5;--ink:#2a2a2a;--muted:#747474;-
 .arcade-console.console-page .table-panel{padding:0!important;overflow:hidden}.arcade-console.console-page .material-panel th{background:linear-gradient(#efefef,#e3e3e3);color:#6b6b6b;border-color:#c8c8c8;font-size:11px;padding-block:19px}.arcade-console.console-page .material-panel td{color:#656565;border-color:#e5e5e5;font-size:12px}.arcade-console.console-page .material-panel td small{color:#6b6b6b;font-size:11px}.arcade-console.console-page .material-panel .table-action{color:#646464;font-size:12px}.arcade-console.console-page .material-panel .neutral-status:is(.ready,.completed){color:#6b6b6b}
 .arcade-console.console-page .empty-symbol{background:linear-gradient(#fafafa,#ededed);border-color:#d7d7d7;color:#6b6b6b;box-shadow:inset 0 1px 0 white,0 2px 0 #d7d7d7}.arcade-console.console-page .empty-state h2{color:#696969}.arcade-console.console-page .receipt-row{border-color:#e0e0e0}.arcade-console.console-page .receipt-row h2{font-size:13px;color:#6f6f6f}.arcade-console.console-page .receipt-summary{font-size:12px;color:#6b6b6b}.arcade-console.console-page .receipt-summary strong{font-size:13px;color:#6a6a6a}.arcade-console.console-page .receipt-details{font-size:12px;color:#6b6b6b}.arcade-console.console-page .receipt-details pre{overflow:auto;color:#e8e8e8}
 .arcade-console.console-page .console-footer{color:#6b6b6b;font-size:10px;border-color:#e4e4e4}.arcade-console.console-page .console-footer>span{font-size:9px}.arcade-console.console-page .console-footer a{color:#6b6b6b}.arcade-console.console-page .toast{background:#444444;color:#eeeeee;border:1px solid #787878}
+
+@media(max-width:1100px){.arcade-console.console-page .capacity-card.material-panel{min-height:160px;padding:24px}.arcade-console.console-page .capacity-footer{bottom:26px}.arcade-console.console-page .quote-panel .price-lines{grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.arcade-console.console-page .quote-panel .price-lines dd{margin-top:6px}}
+@media(max-width:640px){
+ .arcade-console.console-page .sidebar{border-radius:0 0 14px 14px;padding:18px 16px 10px;border-bottom:1px solid #cbcbcb;box-shadow:inset 0 -3px 0 #e6e6e6,0 2px 0 #bbbbbb}
+ .arcade-console.console-page .console-nav{gap:5px;padding-bottom:3px}.arcade-console.console-page .nav-item{padding:9px 4px;gap:5px;font-size:10px;min-height:44px}.arcade-console.console-page .topbar{padding:0 18px;gap:8px}.arcade-console.console-page .topbar-right{gap:7px}.arcade-console.console-page .breadcrumb{font-size:11px;white-space:nowrap}.arcade-console.console-page .demo-badge{font-size:9px;white-space:nowrap;padding:4px 7px}.arcade-console.console-page .arcade-motion-toggle{min-width:24px;min-height:40px;font-size:13px;padding:3px}
+ .arcade-console.console-page .summary-card.material-panel{padding:20px 18px;min-height:232px}.arcade-console.console-page .balance-card.material-panel{padding:22px;min-height:0}.arcade-console.console-page .balance-number #balance-available{font-size:clamp(32px,8vw,44px)}.arcade-console.console-page .balance-number{padding:12px;margin-top:17px;gap:7px}.arcade-console.console-page .balance-details{gap:14px;font-size:10px}.arcade-console.console-page .balance-details strong{font-size:10px}.arcade-console.console-page .summary-card .card-label{font-size:9px;letter-spacing:.025em}.arcade-console.console-page .summary-card .stat-description{font-size:11px!important;line-height:1.5}.arcade-console.console-page .summary-card .stat-value{font-size:43px}
+ .arcade-console.console-page .capacity-card.material-panel{min-height:232px;padding:20px 16px}.arcade-console.console-page .arcade-capacity-world{height:139px}.arcade-console.console-page .arcade-machine{scale:.69;top:45%}.arcade-console.console-page .capacity-footer{bottom:20px}.arcade-console.console-page .capacity-card.material-panel .capacity-footer strong{font-size:11px}.arcade-console.console-page .capacity-card.material-panel .capacity-footer>span{font-size:10px}.arcade-console.console-page .arcade-printer{right:16px;bottom:21px;scale:.82;transform-origin:bottom right}
+ .arcade-console.console-page .panel.material-panel{padding:24px 18px;border-radius:14px}.arcade-console.console-page .panel-title{gap:10px;align-items:flex-start}.arcade-console.console-page .panel-title h2{font-size:19px}.arcade-console.console-page .step-tag{display:none}.arcade-console.console-page .model-selection{gap:9px;flex-wrap:wrap}.arcade-console.console-page .model-selection strong{font-size:12px}.arcade-console.console-page .model-selection span:not(.tiny-tag){font-size:10px}.arcade-console.console-page .model-selection .tiny-tag{margin-left:49px;font-size:9px}.arcade-console.console-page .field-label.prompt-label{gap:8px;flex-wrap:wrap}.arcade-console.console-page .composer :is(select,textarea){font-size:12px}.arcade-console.console-page .composer textarea{min-height:245px;padding:13px}
+ .arcade-console.console-page .composer-bottom{flex-wrap:wrap;gap:14px}.arcade-console.console-page .composer-bottom>div{min-width:0;max-width:none;flex:1 1 100%}.arcade-console.console-page .composer-bottom .field-label{font-size:11px}.arcade-console.console-page .composer-bottom .button{width:100%;font-size:12px;min-height:45px}.arcade-console.console-page .quote-panel .price-lines{grid-template-columns:1fr;gap:13px}.arcade-console.console-page .quote-panel .price-lines dd{margin:0}.arcade-console.console-page .max-charge{min-height:145px;padding:19px 16px}.arcade-console.console-page .max-charge #quote-cap{font-size:34px}
+ .arcade-console.console-page .result-panel pre,.arcade-console.console-page .receipt-details pre{font-size:12px;padding:14px}.arcade-console.console-page .model-facts{gap:22px 16px}.arcade-console.console-page .model-facts strong{font-size:12px;overflow-wrap:anywhere}.arcade-console.console-page .model-detail-top .eyebrow{font-size:9px}.arcade-console.console-page .table-panel.material-panel{padding:0}.arcade-console.console-page .receipt-row h2{overflow-wrap:anywhere}.arcade-console.console-page .console-footer{gap:12px;align-items:flex-start;font-size:10px}.arcade-console.console-page .console-footer>span{font-size:9px;max-width:130px}.arcade-system-strip{font-size:9px;gap:10px;flex-wrap:wrap}
+}
+@media(max-width:400px){.arcade-console.console-page .breadcrumb{font-size:10px}.arcade-console.console-page .topbar{padding-inline:16px}.arcade-console.console-page .topbar-right{gap:4px}.arcade-console.console-page .demo-badge{font-size:9px;padding-inline:5px}.arcade-console.console-page .arcade-dial{display:none}.arcade-console.console-page .balance-card.material-panel{padding-inline:18px}.arcade-console.console-page .balance-details{gap:8px;justify-content:space-between}.arcade-console.console-page .balance-details strong{display:block;margin:2px 0 0;float:none}.arcade-console.console-page .arcade-deck-label>span:last-child{display:none}.arcade-console.console-page .capacity-card.material-panel .capacity-footer strong{font-size:10px}.arcade-console.console-page .capacity-card.material-panel .capacity-footer>span{font-size:9px}.arcade-console.console-page .summary-card .card-label{font-size:9px;gap:3px}.arcade-console.console-page .summary-card .card-label svg{width:15px;height:15px}}
+
+/* Display labels remain light inside graphite wells. */
+.arcade-console.console-page .balance-number{background:linear-gradient(#303030,#242424)}
+.arcade-console.console-page .composer :is(select,textarea){background:linear-gradient(150deg,#303030,#252525)!important;color:#e8e8e8!important}
+.arcade-console.console-page .max-charge{background:linear-gradient(#303030,#232323)}
+.arcade-console.console-page :is(.result-panel,.receipt-details) pre{background:linear-gradient(#303030,#252525);color:#e8e8e8}
+.arcade-console.console-page .max-charge>span,.arcade-console.console-page .max-charge small,.arcade-console.console-page .arcade-dial>span{color:#bfbfbf}
+.arcade-console.console-page .arcade-dial svg{stroke:#9d9d9d}
+.arcade-console.console-page .arcade-dial .arcade-dial-track,.arcade-console.console-page .arcade-dial .arcade-dial-needle{stroke:#ccff00}
+.arcade-console.console-page :is(button,a,select,textarea):focus-visible{outline-color:#777}
+
+/* Narrow paired instruments need room below their readable descriptions. */
+@media(max-width:480px){
+ .arcade-console.console-page .summary-card.material-panel:not(.balance-card){min-height:272px}
+}
+@media(max-width:360px){
+ .arcade-console.console-page .summary-card.material-panel:not(.balance-card){min-height:296px}
+}
+/* Tablet chassis reserves a separate lower bay for the receipt mechanism. */
+@media(min-width:641px) and (max-width:1100px){
+  .arcade-console.console-page .summary-card.material-panel:not(.capacity-card){min-height:288px}
+  .arcade-console.console-page .capacity-card.material-panel{min-height:188px}
+  .arcade-console.console-page .arcade-capacity-world{top:22px}
+}
+
+
+/* Small, front-facing vector controls share one quiet material language. */
+.console-page [data-ui-icon] {
+ display:inline-flex;
+ align-items:center;
+ justify-content:center;
+ flex:none;
+ line-height:0;
+ vertical-align:middle;
+}
+.console-page svg.ui-icon {
+ width:16px;
+ height:16px;
+ flex:none;
+ margin:0;
+ padding:0;
+ border:0;
+ border-radius:0;
+ background:none;
+ pointer-events:none;
+}
+.arcade-console.console-page .nav-item svg.ui-icon { width:20px;height:20px; }
+.arcade-console.console-page .nav-item.active svg.ui-icon { color:#62675e; }
+.arcade-console.console-page .summary-card .card-label svg.ui-icon {
+ width:16px;height:16px;padding:0;border-radius:0;background:none;
+}
+.arcade-console.console-page .empty-symbol svg.ui-icon { width:28px;height:28px; }
+.console-page :is(.return-link,.console-footer>a,.table-action) {
+ display:inline-flex;
+ align-items:center;
+ gap:7px;
+}
+.console-page .table-action { white-space:nowrap; }
+.console-page .arcade-motion-toggle svg.ui-icon { width:16px;height:16px; }
+.console-page .workspace-arrow svg.ui-icon { width:14px;height:14px; }
+@media(max-width:640px){
+ .arcade-console.console-page .console-nav { display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px; }
+ .arcade-console.console-page .console-nav .nav-item {
+  position:relative;flex-direction:column;justify-content:center;gap:5px;
+  min-width:0;min-height:62px;padding:8px 2px;font-size:10px;
+ }
+ .arcade-console.console-page .console-nav .nav-count { position:absolute;top:4px;right:3px;margin:0;min-width:12px;font-size:7px; }
+}

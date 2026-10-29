@@ -171,3 +171,25 @@ function receipt(){
   solid('feed-key',{x:-43,y:-16,w:10,d:10,r:2},49.5,2.5,'an-white');
   return f.finish();
 }
+
+export function buildNavFigures(){
+  const figures=Object.fromEntries([capacity(),sorter(),scanner(),receipt()].map(f=>[f.key,f]));
+  return{version:1,source:'https://github.com/wheresryan22/anatomy',license:'MIT',illustrative:true,css:NAV_ANATOMY_CSS,figures};
+}
+export function writeNavFigures(outDir=path.join(HERE,'../src/nav-anatomy')){
+  const result=buildNavFigures();fs.mkdirSync(outDir,{recursive:true});
+  for(const figure of Object.values(result.figures)){
+    if(figure.partCount<40||figure.partCount>80)throw new Error(`${figure.key}: ${figure.partCount} parts outside Figure tier`);
+    if(/NaN|undefined|Infinity/.test(figure.svg))throw new Error(`Invalid geometry: ${figure.key}`);
+    fs.writeFileSync(path.join(outDir,`${figure.key}.svg`),figure.standalone);
+  }
+  const payload={...result,figures:Object.fromEntries(Object.entries(result.figures).map(([key,{body,standalone,projection,...figure}])=>[key,figure]))};
+  fs.mkdirSync(path.join(HERE,'../src/assets'),{recursive:true});
+  fs.writeFileSync(path.join(HERE,'../src/assets/nav-anatomy.json'),JSON.stringify(payload));
+  fs.writeFileSync(path.join(outDir,'LICENSE.txt'),fs.readFileSync(path.join(HERE,'vendor/anatomy/LICENSE'),'utf8'));
+  return result;
+}
+if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url)){
+  const result=writeNavFigures();
+  console.log(Object.values(result.figures).map(f=>`${f.key}: ${f.partCount} purposeful parts / ${(f.svg.match(/<path/g)||[]).length} paths`).join('\n'));
+}
