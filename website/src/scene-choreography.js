@@ -323,3 +323,154 @@
       details.forEach(element => show(element, text, 6 * (1 - text)));
     };
   }
+
+  function requestRenderer(root) {
+    const card = q(root, '.request-moving-card');
+    const origin = q(root, '.request-origin-card');
+    const target = q(root, '.request-drop-target');
+    const inserted = q(root, '.request-inserted');
+    const line = q(root, '.request-drop-line');
+    const detail = q(root, '.request-log-lines');
+    const note = q(root, '.request-log-note');
+    const oldCursor = q(card || root, '.scene-cursor');
+    let cursor;
+    if (oldCursor) {
+      cursor = oldCursor.cloneNode(true);
+      cursor.classList.add('choreography-cursor');
+      cursor.setAttribute('aria-hidden', 'true');
+      cursor.style.setProperty('animation', 'none', 'important');
+      root.appendChild(cursor);
+      hide(oldCursor);
+    }
+    let destination = {x: 524, y: 240};
+    function measure() {
+      if (!target) return;
+      const rootRect = root.getBoundingClientRect();
+      const targetRect = target.getBoundingClientRect();
+      const scale = rootRect.width / 960;
+      if (scale) destination = {x: (targetRect.left - rootRect.left) / scale, y: (targetRect.top - rootRect.top) / scale};
+    }
+    measure();
+    if ('ResizeObserver' in window) new ResizeObserver(measure).observe(root);
+    return t => {
+      const approach = phase(t, 450, 1050, ease.arrive);
+      const pick = phase(t, 1250, 1420, ease.arrive);
+      const drag = phase(t, 1300, 2450, ease.sweep);
+      const drop = phase(t, 2560, 2860, ease.arrive);
+      const land = phase(t, 2560, 2900, ease.arrive);
+      const previewOut = phase(t, 2560, 2820, ease.release);
+      const lineOut = phase(t, 2560, 2760, ease.release);
+      const pointer = phase(t, 350, 600, ease.arrive) - phase(t, 2900, 3250, ease.release);
+      const open = phase(t, 2560, 2960, ease.arrive) - phase(t, 5000, 5500, ease.release);
+      const text = phase(t, 2640, 2960, ease.arrive) - phase(t, 4850, 5100, ease.release);
+      const x = mix(96, destination.x, drag);
+      const y = mix(240, destination.y, drag) - 36 * Math.sin(Math.PI * drag);
+      set(card, 'transform', `translate(${round(x)}px,${round(y - 2 * (pick - land))}px)`);
+      set(card, 'opacity', round(pick * (1 - drop)));
+      set(origin, 'opacity', round(1 - .6 * pick));
+      show(inserted, open, 6 * (1 - open));
+      show(detail, text, 6 * (1 - text));
+      show(note, text, 6 * (1 - text));
+      set(line, 'opacity', round(pick * (1 - lineOut)));
+      set(line, 'transform', `scaleX(${round(drag)})`);
+      if (cursor) {
+        const pointerX = pick === 0 ? mix(330, 236, approach) : x + 140;
+        const pointerY = pick === 0 ? mix(470, 270, approach) : y + 30;
+        set(cursor, 'left', `${round(pointerX - 3)}px`);
+        set(cursor, 'top', `${round(pointerY - 3)}px`);
+        set(cursor, 'opacity', pointer * (1 - .15 * previewOut));
+        set(cursor, 'transform', 'none');
+      }
+    };
+  }
+
+  function exportRenderer(root) {
+    const download = q(root, '.export-download-icon');
+    const check = q(root, '.export-check-icon');
+    const tooltip = q(root, '.export-tooltip');
+    const button = q(root, '.export-button');
+    hide(q(root, '.export-menu'));
+    hide(q(root, '.export-cursor'));
+    return t => {
+      const copied = phase(t, 1200, 1350, ease.ease) - phase(t, 3500, 3650, ease.ease);
+      const pop = phase(t, 1200, 1450, ease.arrive);
+      const tip = phase(t, 1300, 1500, ease.arrive) - phase(t, 3200, 3400, ease.release);
+      show(download, 1 - copied, 0, 1 - .15 * copied);
+      show(check, copied, 0, .82 + .18 * pop);
+      // Tooltip positioning uses right/bottom in the retained OFFPEAK scene, not an extra flyout.
+      show(tooltip, tip, 4 * (1 - tip));
+      set(button, 'filter', `brightness(${round(1 - .025 * copied)})`);
+    };
+  }
+
+  const factories = {
+    quote: quoteRenderer, models: modelsRenderer, endpoint: endpointRenderer,
+    availability: availabilityRenderer, meter: meterRenderer, signature: signatureRenderer,
+    radar: radarRenderer, assistant: assistantRenderer, wallet: walletRenderer,
+    'request-log': requestRenderer, export: exportRenderer
+  };
+
+  function tick(time) {
+    raf = 0;
+    const delta = Math.min(100, Math.max(0, time - (lastTime || time)));
+    lastTime = time;
+    let anyVisible = false;
+    for (const state of scenes) {
+      if (!state.root.isConnected) { scenes.delete(state); continue; }
+      if (!state.visible) continue;
+      anyVisible = true;
+      state.elapsed += delta;
+      state.render(state.elapsed % state.loopMs, state.elapsed);
+    }
+    if (anyVisible && !reduce.matches && !document.hidden) raf = requestAnimationFrame(tick);
+  }
+  function resume() {
+    if (raf || reduce.matches || document.hidden) return;
+    lastTime = 0;
+    raf = requestAnimationFrame(tick);
+  }
+  const observer = 'IntersectionObserver' in window ? new IntersectionObserver(entries => {
+    for (const entry of entries) {
+      for (const state of scenes) if (state.root === entry.target) state.visible = entry.isIntersecting;
+    }
+    resume();
+  }) : null;
+
+  function mount(root = document) {
+    const targets = root.matches?.('.offpeak-scene') ? [root] : [...root.querySelectorAll('.offpeak-scene')];
+    for (const element of targets) {
+      if (mounted.has(element)) continue;
+      const kind = element.dataset.scene;
+      if (!factories[kind]) continue;
+      mounted.add(element);
+      // Replace the earlier approximate looping layer, without replacing material/style files.
+      for (const child of element.querySelectorAll('*')) child.style.setProperty('animation', 'none', 'important');
+      const config = audit[kind];
+      const state = {root: element, visible: !observer, elapsed: config.stillMs, loopMs: config.loopMs, render: factories[kind](element)};
+      element.dataset.choreographySource = config.source;
+      state.render(config.stillMs, config.stillMs);
+      scenes.add(state);
+      if (observer) observer.observe(element);
+    }
+    resume();
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden && raf) { cancelAnimationFrame(raf); raf = 0; }
+    resume();
+  });
+  reduce.addEventListener('change', () => {
+    if (reduce.matches) {
+      if (raf) cancelAnimationFrame(raf);
+      raf = 0;
+      for (const state of scenes) {
+        const config = audit[state.root.dataset.scene];
+        state.render(config.stillMs, config.stillMs);
+      }
+    } else resume();
+  });
+
+  window.OffpeakChoreography = {mount, audit};
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => mount(), {once: true});
+  else mount();
+})();
