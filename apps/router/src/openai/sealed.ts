@@ -441,7 +441,7 @@ export async function serveSealed(stack: Stack, req: Request): Promise<Response>
   if (!opening?.value) return failed(oai(503, "Host failed before the first token", "engine", "no_capacity"), false)
   clearTimeout(timer)
   const ttftMs = Math.round(performance.now() - startedAt)
-  stack.load.noteTtft(host.host, ttftMs)
+  stack.load.noteTtft(host.host, ttftMs, tokensIn)
   stack.load.noteResult(host.host, true)
   stack.hostWaitMs?.push(ttftMs)
   const ctx: Ctx = { stack, reqId, started, model, payer, pay, feeBps, maxTokens, host, countsSigner, priced, promptHash, requestBytes: bytes.length, ttftMs, flow }

@@ -1,24 +1,22 @@
 export type LoadSample = { t: number; servedTps: number }
 
-/** EWMA with a 60s time constant. `u = ewma / maxTps`. */
+/** Long enough that a steady rate reads as itself, however long ago it began. */
+const LOAD_WINDOW_S = 300
+const TAU_S = 60
+
+/**
+ * EWMA with a 60s time constant over per-second buckets, where a second with no bucket served nothing. `u = ewma / maxTps`.
+ * Weights are scaled to sum to 1 over the window, so a host held at `maxTps` reads exactly 1.
+ */
 export function ewmaUtil(samples: LoadSample[], now: number, maxTps: number): number {
   if (maxTps <= 0) return 1
-  const tau = 60
+  const alpha = 1 - Math.exp(-1 / TAU_S)
   let value = 0
-  let last = now - 60
-  const ordered = [...samples].filter((s) => s.t >= now - 120 && s.t <= now).sort((a, b) => a.t - b.t)
-  for (const sample of ordered) {
-    const dt = Math.max(0, sample.t - last)
-    const alpha = 1 - Math.exp(-dt / tau)
-    value = value + alpha * (sample.servedTps - value)
-    last = sample.t
+  for (const sample of samples) {
+    const age = now - sample.t
+    if (age >= 0 && age < LOAD_WINDOW_S) value += alpha * sample.servedTps * Math.exp(-age / TAU_S)
   }
-  const tail = Math.max(0, now - last)
-  if (tail > 0 && ordered.length > 0) {
-    const alpha = 1 - Math.exp(-tail / tau)
-    value = value + alpha * (0 - value)
-  }
-  return value / maxTps
+  return value / (1 - Math.exp(-LOAD_WINDOW_S / TAU_S)) / maxTps
 }
 
 export type LoadRow = {
@@ -33,6 +31,8 @@ export type LoadRow = {
 
 const ERROR_WINDOW_MS = 5 * 60_000
 const TTFT_WINDOW_MS = 15 * 60_000
+/** First tokens wait on prefill, so a longer prompt than this is scaled down to it. Otherwise a buyer's long prompts read as a slow host. */
+const TTFT_PROMPT_TOKENS = 1024
 
 /** Old samples age out, so one bad minute cannot exclude a quiet host for good. */
 function recent<T extends { at: number }>(list: T[] | undefined, windowMs: number): T[] {
@@ -69,14 +69,17 @@ export class LoadMeter {
   note(host: string, model: string, kind: "prefill" | "output", tokens: number, t: number) {
     const served = kind === "output" ? tokens : tokens / 4
     const k = this.key(host, model)
-    const list = this.buckets.get(k) ?? []
-    list.push({ t, servedTps: served })
-    this.buckets.set(k, list.filter((s) => s.t >= t - 180))
+    const second = Math.floor(t)
+    const list = (this.buckets.get(k) ?? []).filter((s) => s.t > second - LOAD_WINDOW_S)
+    const bucket = list.find((s) => s.t === second)
+    if (bucket) bucket.servedTps += served
+    else list.push({ t: second, servedTps: served })
+    this.buckets.set(k, list)
   }
 
-  noteTtft(host: string, ms: number) {
+  noteTtft(host: string, ms: number, promptTokens = 0) {
     const list = recent(this.ttft.get(host), TTFT_WINDOW_MS)
-    list.push({ at: Date.now(), ms })
+    list.push({ at: Date.now(), ms: (ms * TTFT_PROMPT_TOKENS) / Math.max(promptTokens, TTFT_PROMPT_TOKENS) })
     if (list.length > 200) list.shift()
     this.ttft.set(host, list)
   }

@@ -104,7 +104,7 @@ export type Opened = {
  * Opens a stream on the best host, failing over once before any token has reached the client. Only a 5xx, a
  * timeout or a broken stream counts against a host: a 4xx answers this request, and a buyer can ask for those.
  */
-export async function openHost(stack: Stack, ranked: HostCandidate[], payload: string, signedHeader: string): Promise<Opened | { ok: false; error: string }> {
+export async function openHost(stack: Stack, ranked: HostCandidate[], payload: string, signedHeader: string, promptTokens: number): Promise<Opened | { ok: false; error: string }> {
   let last = "down"
   for (const host of ranked.slice(0, 2)) {
     const control = new AbortController()
@@ -129,7 +129,7 @@ export async function openHost(stack: Stack, ranked: HostCandidate[], payload: s
       clearTimeout(timer)
       if (first.done) throw new Error("host sent an empty stream")
       const ttftMs = Math.round(performance.now() - started)
-      stack.load.noteTtft(host.host, ttftMs)
+      stack.load.noteTtft(host.host, ttftMs, promptTokens)
       stack.load.noteResult(host.host, true)
       return { ok: true, host: host.host, endpoint: host.endpoint, ttftMs, first: first.value, events, abort: () => control.abort() }
     } catch (err) {

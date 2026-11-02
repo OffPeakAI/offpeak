@@ -92,7 +92,7 @@ describe("the 402 quote", () => {
     }
     const quoted = BigInt((await offers(await chat(booted, body, unpaid)))[1]!.maxAmountRequired!)
     // Load lifts the live price a few percent off its floor, as it can between the 402 and the retry.
-    booted.stack.load.note(booted.host, booted.modelDigest, "output", 22, booted.stack.clock())
+    booted.stack.load.note(booted.host, booted.modelDigest, "output", 840, booted.stack.clock())
     booted.stack.candidateCache.clear()
     await chat(booted, body, { ...unpaid, "payment-signature": await uptoHeader(booted.stack, roleAccount("buyer"), keccak256(toBytes("retry"))) })
     expect(BigInt(required[0]!)).toBeLessThanOrEqual(quoted)

@@ -4,7 +4,10 @@ import { keccak256, toBytes, type Hex } from "viem"
 import { roleAccount } from "../../../packages/shared/src/test-keys.ts"
 import { bootStack } from "./support/stack.ts"
 import { uptoHeader } from "./support/upto.ts"
+import { loadFactorBps } from "../src/pricing/live.ts"
+import { LoadMeter } from "../src/pricing/load.ts"
 import { absorb, boundedText, emptyAssembly, hostEvents } from "../src/routing/dispatch.ts"
+import { selectHost, type HostCandidate } from "../src/routing/select.ts"
 
 type Booted = Awaited<ReturnType<typeof bootStack>>
 
@@ -287,5 +290,91 @@ describe("host replies", () => {
     booted.stack.hosts = { request: async (host, endpoint, path, init) => (path === "/offpeak/v1/sign" ? new Response(JSON.stringify({ hostSig: "x".repeat(1 << 20) })) : inner(host, endpoint, path, init)) }
     expect((await chat(booted)).status).toBe(502)
     expect((await records(booted)).rows.length).toBe(0)
+  })
+})
+
+describe("the load meter", () => {
+  const setMaxTps = (booted: Booted, maxTps: number) => {
+    for (const host of booted.indexer.hosts.values()) for (const model of host.models) model.maxTps = maxTps
+  }
+  const start = 1_762_000_000
+  const large = chatBody("x ".repeat(4000), { max_tokens: 1 })
+
+  test("a host twenty times over capacity reads above one, and priced at the top", () => {
+    const meter = new LoadMeter()
+    for (let t = start; t < start + 120; t++) {
+      for (let r = 0; r < 100; r++) {
+        meter.note("h", "m", "prefill", 40, t)
+        meter.note("h", "m", "output", 200, t)
+      }
+    }
+    const u = meter.util("h", "m", 1000, start + 119)
+    expect(u).toBeGreaterThanOrEqual(1)
+    expect(loadFactorBps(u)).toBe(12_000)
+  })
+
+  test("a host held at capacity reads one, however the tokens split across requests", () => {
+    const meter = new LoadMeter()
+    for (let t = start; t < start + 900; t++) for (let r = 0; r < 10; r++) meter.note("h", "m", "output", 100, t)
+    expect(meter.util("h", "m", 1000, start + 899)).toBeCloseTo(1, 6)
+  })
+
+  test("half of capacity reads a half, and the reading fades once traffic stops", () => {
+    const meter = new LoadMeter()
+    for (let t = start; t < start + 900; t++) meter.note("h", "m", "output", 500, t)
+    const end = start + 899
+    expect(meter.util("h", "m", 1000, end)).toBeCloseTo(0.5, 6)
+    expect(meter.util("h", "m", 1000, end + 60)).toBeLessThan(0.2)
+    expect(meter.util("h", "m", 1000, end + 400)).toBe(0)
+  })
+
+  test("two requests in the same second both count", () => {
+    const meter = new LoadMeter()
+    meter.note("h", "m", "output", 600, start)
+    meter.note("h", "m", "output", 600, start)
+    const one = new LoadMeter()
+    one.note("h", "m", "output", 1200, start)
+    expect(meter.util("h", "m", 1000, start)).toBe(one.util("h", "m", 1000, start))
+  })
+
+  test("one large request leaves an idle host routed, for the next buyer and in the same second", async () => {
+    const booted = await bootStack()
+    setMaxTps(booted, 1000)
+    expect((await chat(booted, large)).status).toBe(200)
+    expect(booted.stack.load.util(booted.host, booted.modelDigest, 1000, booted.stack.clock())).toBeLessThan(0.05)
+    booted.stack.candidateCache.clear()
+    expect((await chat(booted)).status).toBe(200)
+  })
+
+  test("two large requests leave a two-host model in service", async () => {
+    const booted = await bootStack({ secondHost: true })
+    setMaxTps(booted, 1000)
+    for (let i = 0; i < 2; i++) {
+      expect((await chat(booted, large)).status).toBe(200)
+      booted.stack.candidateCache.clear()
+    }
+    expect((await chat(booted)).status).toBe(200)
+  })
+
+  test("a run of large requests is real load, and stops the host being routed", () => {
+    const meter = new LoadMeter()
+    for (let t = start; t < start + 300; t++) meter.note("h", "m", "prefill", 8000, t)
+    expect(meter.util("h", "m", 1000, start + 299)).toBeGreaterThanOrEqual(0.95)
+  })
+
+  const candidate = (meter: LoadMeter): HostCandidate => ({ host: "h", endpoint: "", priceIn: 1n, priceOut: 1n, sheetHash: "", bondUsdg: 1n, routingBonusBps: 0, strikes: 0, auditedSamples: 0, util: 0, healthy: true, ttftP95Ms: meter.ttftP95("h"), errorRate: 0, status: "Active", sealedOk: false, modelDigest: "m", maxTps: 1 })
+
+  test("slow first tokens on long prompts do not take a host out", () => {
+    const meter = new LoadMeter()
+    for (let i = 0; i < 188; i++) meter.noteTtft("h", 200, 40)
+    for (let i = 0; i < 12; i++) meter.noteTtft("h", 2000, 8000)
+    expect(selectHost([candidate(meter)], { sealed: false, interactive: true })).toHaveLength(1)
+  })
+
+  test("slow first tokens on ordinary prompts still do", () => {
+    const meter = new LoadMeter()
+    for (let i = 0; i < 188; i++) meter.noteTtft("h", 200, 40)
+    for (let i = 0; i < 12; i++) meter.noteTtft("h", 2000, 400)
+    expect(selectHost([candidate(meter)], { sealed: false, interactive: true })).toHaveLength(0)
   })
 })

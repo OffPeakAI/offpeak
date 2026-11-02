@@ -496,7 +496,7 @@ export async function serveChat(stack: Stack, req: Request, night?: NightLine): 
     flow?.drop()
     return pay
   }
-  const opened = await openHost(stack, route.ranked, payload, await headerP)
+  const opened = await openHost(stack, route.ranked, payload, await headerP, inputTokens)
   if (opened.ok) stack.hostWaitMs?.push(opened.ttftMs)
   if (!opened.ok) {
     const refused = opened.error === "refused"
