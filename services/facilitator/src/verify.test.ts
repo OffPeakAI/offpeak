@@ -187,30 +187,46 @@ describe("verify", () => {
     await refused(body, "malformed")
   })
 
-  test("exact needs no minimum and signs its own witness", async () => {
-    const { deps, cache } = await setup()
-    const witness = { reqId: keccak256(toBytes("exact")), payee: VAULT, amount: 40_000n, validBefore: BigInt(NOW + 600), resourceHash: keccak256(toBytes("r")) }
+  async function exactBody(amount: bigint, quote: bigint, name: string): Promise<VerifyBody> {
+    const witness = { reqId: keccak256(toBytes(name)), payee: VAULT, amount, validBefore: BigInt(NOW + 600), resourceHash: keccak256(toBytes("r")) }
     const typed = {
       domain: { name: "Permit2", chainId: 4663, verifyingContract: PERMIT2 as Address },
       types: permitWitnessTypes("ExactWitness"),
       primaryType: "PermitWitnessTransferFrom",
-      message: { permitted: { token: USDG, amount: 40_000n }, spender: ESCROW, nonce: 9n, deadline: BigInt(NOW + 600), witness },
+      message: { permitted: { token: USDG, amount }, spender: ESCROW, nonce: 9n, deadline: BigInt(NOW + 600), witness },
     } as never
-    const body: VerifyBody = {
+    return {
       paymentPayload: {
         scheme: "exact",
         payload: {
           signature: await agent.signTypedData(typed),
-          witness: { ...witness, amount: "40000", validBefore: witness.validBefore.toString() },
-          permitted: { token: USDG, amount: "40000" },
+          witness: { ...witness, amount: amount.toString(), validBefore: witness.validBefore.toString() },
+          permitted: { token: USDG, amount: amount.toString() },
           spender: ESCROW,
           nonce: "9",
           deadline: String(NOW + 600),
         },
       },
-      paymentRequirements: { payTo: VAULT, asset: USDG, maxAmountRequired: "40000" },
+      paymentRequirements: { payTo: VAULT, asset: USDG, maxAmountRequired: quote.toString() },
     }
-    expect(await verifyPayment(deps, cache, body)).toEqual({ isValid: true, payer: OWNER })
+  }
+
+  test("exact needs no minimum and signs its own witness", async () => {
+    const { deps, cache } = await setup()
+    expect(await verifyPayment(deps, cache, await exactBody(40_000n, 40_000n, "exact"))).toEqual({ isValid: true, payer: OWNER })
+  })
+
+  test("exact may pass the quote by the margin and no further", async () => {
+    const { deps, cache } = await setup()
+    expect(await verifyPayment(deps, cache, await exactBody(48_000n, 40_000n, "exact-margin"))).toEqual({ isValid: true, payer: OWNER })
+    await refused(await exactBody(48_001n, 40_000n, "exact-over"), "amount_too_high")
+  })
+
+  test("a 100 USDG exact on a 0.001 USDG quote is refused and leaves no claim", async () => {
+    const { deps, cache } = await setup()
+    const body = await exactBody(100_000_000n, 1_000n, "exact-huge")
+    expect((await verifyPayment(deps, cache, body)).invalidReason).toBe("amount_too_high")
+    expect((await deps.db.query("SELECT 1 FROM chain.x402_claims")).rows.length).toBe(0)
   })
 })
 

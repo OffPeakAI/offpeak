@@ -45,8 +45,8 @@ export async function panelPacket(deps: PanelDeps, challengeId: number, choice: 
     reviewEndsAt: row.review_ends_at === null ? null : Number(row.review_ends_at),
     evidence: {
       samples: samples.length,
-      statistic: Number(BigInt(row.statistic)) / 1e6,
-      threshold: Number(BigInt(row.threshold)) / 1e6,
+      statistic: Number(BigInt(row.statistic!)) / 1e6,
+      threshold: Number(BigInt(row.threshold!)) / 1e6,
       canaryFailures: samples.filter((s) => s.canaryFail).length,
       replicatedByReference: samples.filter((s) => s.refAgrees).length,
       proofsVerify: await leavesProven(deps, bundle),

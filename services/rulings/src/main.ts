@@ -20,6 +20,7 @@ const deps = {
   account,
   contracts: readDeployment(env.OFFPEAK_DEPLOYMENT_FILE).contracts,
   rulers: env.OFFPEAK_RULER_ADDRESSES as Address[],
+  auditor: env.OFFPEAK_AUDITOR_ADDRESS as Address,
   chainId: env.OFFPEAK_CHAIN_ID,
 }
 log("rulings", "started", { index: env.OFFPEAK_RULING_INDEX, signer: account.address })

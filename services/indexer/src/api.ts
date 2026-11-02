@@ -1,5 +1,5 @@
 import { OfpkHooksAbi, WindowMarketAbi } from "@offpeak/abis"
-import type { Db, Metrics } from "@offpeak/common"
+import { bearerMatches, type Db, type Metrics } from "@offpeak/common"
 import { merkleProof, merkleRoot } from "@offpeak/shared"
 import { Hono, type Context } from "hono"
 import { zeroAddress, type Address, type Hex, type PublicClient } from "viem"
@@ -14,6 +14,30 @@ export type ApiDeps = {
 }
 
 type Head = { block: number; blockTs: number; finalizedBlock: number }
+
+const PUBLIC_RATE_PER_MINUTE = 120
+const MINUTE_MS = 60_000
+
+/** One window per minute per caller. Clearing each window keeps the map to a minute's worth of callers. */
+function perMinuteLimit(limit: number) {
+  const counts = new Map<string, number>()
+  let windowStart = 0
+  return (caller: string, now: number) => {
+    if (now - windowStart >= MINUTE_MS) {
+      counts.clear()
+      windowStart = now
+    }
+    const used = (counts.get(caller) ?? 0) + 1
+    counts.set(caller, used)
+    return used <= limit
+  }
+}
+
+/** Under `Bun.serve` the second fetch argument is the server, which knows the peer. */
+function callerOf(c: Context) {
+  const server = c.env as { requestIP?: (req: Request) => { address: string } | null } | undefined
+  return server?.requestIP?.(c.req.raw)?.address ?? "unknown"
+}
 
 function send(c: Context, status: number, body: unknown) {
   const json = JSON.stringify(body, (_key, value) => (typeof value === "bigint" ? value.toString() : value))
@@ -63,9 +87,15 @@ export function createApi(deps: ApiDeps) {
   const app = new Hono()
   const leavesByHour = new Map<string, Hex[]>()
   const { db } = deps
+  const publicLimit = perMinuteLimit(PUBLIC_RATE_PER_MINUTE)
 
   app.use("/idx/*", async (c, next) => {
-    if (c.req.header("authorization") !== `Bearer ${deps.internalToken}`) return c.json({ error: "unauthorized" }, 401)
+    if (!bearerMatches(c.req.header("authorization"), deps.internalToken)) return c.json({ error: "unauthorized" }, 401)
+    await next()
+  })
+
+  app.use("/public/*", async (c, next) => {
+    if (!publicLimit(callerOf(c), Date.now())) return c.json({ error: "rate_limited" }, 429, { "retry-after": "60" })
     await next()
   })
 

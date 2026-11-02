@@ -15,11 +15,11 @@ export class LiveFacilitator implements PaymentClient {
   }
 
   verify(body: Parameters<PaymentClient["verify"]>[0]) {
-    return this.post<Awaited<ReturnType<PaymentClient["verify"]>>>("/x402/verify", body)
+    return this.post<Awaited<ReturnType<PaymentClient["verify"]>>>("/x402/verify", body, true)
   }
 
   settle(body: Parameters<PaymentClient["settle"]>[0]) {
-    return this.post<{ success: boolean; status: string; errorReason?: string }>("/x402/settle", body)
+    return this.post<{ success: boolean; status: string; errorReason?: string }>("/x402/settle", body, true)
   }
 
   capture(reqId: string, actual: bigint) {

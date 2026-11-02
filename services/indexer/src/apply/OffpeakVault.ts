@@ -1,5 +1,6 @@
-import type { Db } from "@offpeak/common"
+import { agreedSignatures, log, type Db, type SigRow } from "@offpeak/common"
 import { hourIndex } from "@offpeak/shared"
+import { recoverAddress, type Address, type Hex } from "viem"
 import type { ChainEvent } from "./index.ts"
 
 const addr = (v: unknown) => String(v).toLowerCase()
@@ -19,6 +20,27 @@ async function touchBuyer(tx: Db, buyer: string) {
   await tx.query("INSERT INTO chain.buyers (address) VALUES ($1) ON CONFLICT DO NOTHING", [buyer])
 }
 
+/**
+ * What landed, from the rows for the landed hash whose signatures hold. Both signers normally agree. One
+ * may have re-signed since, which replaces its row, so the other's row alone still stands for the batch.
+ */
+async function landedOutcome(tx: Db, e: ChainEvent) {
+  const { hour, batchHash, signers } = e.args as { hour: unknown; batchHash?: Hex; signers?: Address[] }
+  const rows = batchHash
+    ? await tx.query<SigRow>("SELECT signer, batch_hash, sig, batch FROM chain.settlement_sigs WHERE kind = 'settle' AND hour = $1 AND batch_hash = $2", [hour, batchHash])
+    : { rows: [] }
+  const accepted = signers ?? []
+  const agreed = await agreedSignatures(rows.rows, accepted)
+  if (agreed) return agreed.batch as StoredOutcome
+  for (const row of rows.rows) {
+    if (!accepted.some((signer) => addr(signer) === row.signer)) continue
+    const recovered = await recoverAddress({ hash: row.batch_hash, signature: row.sig }).catch(() => null)
+    if (recovered?.toLowerCase() === row.signer) return row.batch as StoredOutcome
+  }
+  log("indexer", "settlement_outcome_missing", { hour: String(hour), txHash: e.txHash })
+  return undefined
+}
+
 async function applySettled(tx: Db, e: ChainEvent) {
   const { hour, root, totalsHash, debited, credited, fees } = e.args
   await tx.query(
@@ -29,12 +51,7 @@ async function applySettled(tx: Db, e: ChainEvent) {
     [hour, root, totalsHash, debited, credited, fees, e.txHash, e.blockNumber, e.blockTs],
   )
   await tx.query("UPDATE chain.vault_state SET last_settled_hour = $1", [hour])
-  const signed = await tx.query<{ batch: StoredOutcome }>(
-    `SELECT batch FROM chain.settlement_sigs
-     WHERE kind = 'settle' AND hour = $1 AND batch->'b'->>'root' = $2 AND batch->'b'->>'totalsHash' = $3 LIMIT 1`,
-    [hour, root, totalsHash],
-  )
-  const outcome = signed.rows[0]?.batch
+  const outcome = await landedOutcome(tx, e)
   for (const reject of outcome?.rejects ?? []) {
     await tx.query(
       "INSERT INTO chain.settlement_rejects (hour, req_id, reason) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",

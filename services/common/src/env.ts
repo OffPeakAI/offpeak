@@ -47,6 +47,7 @@ export const rulingEnv = baseEnv.extend({
   OFFPEAK_RULING_INDEX: z.coerce.number().int().min(1).max(3),
   OFFPEAK_RULING_KEY: privateKey,
   OFFPEAK_RULER_ADDRESSES: z.string().transform((v) => v.split(",")).pipe(z.array(address).length(3)),
+  OFFPEAK_AUDITOR_ADDRESS: address,
 })
 
 export const keeperEnv = baseEnv.extend({

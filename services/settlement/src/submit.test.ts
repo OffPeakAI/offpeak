@@ -47,6 +47,26 @@ describe("agreedSignatures", () => {
     expect(await agreedSignatures([await sigRow(0), forged], settlers)).toBeNull()
   })
 
+  test("a junk signature is skipped and the honest pair still agrees", async () => {
+    const junk = { signer: "0x0000000000000000000000000000000000000001", batch_hash: HASH, sig: "0x1234" as Hex, batch: { b: "junk" } }
+    const agreed = await agreedSignatures([junk, await sigRow(0), await sigRow(1)], settlers)
+    expect(agreed!.batch).toEqual({ hash: HASH })
+  })
+
+  test("a member's false copy of the batch is not what comes back, whatever its order", async () => {
+    const poison = { ...(await sigRow(0)), batch: { b: "poison" } }
+    const rows = [poison, await sigRow(1), await sigRow(2)]
+    for (const ordered of [rows, [...rows].reverse()]) {
+      const agreed = await agreedSignatures(ordered, settlers)
+      expect(agreed!.batch).toEqual({ hash: HASH })
+      expect(agreed!.thresholdSig).not.toContain(poison.sig.slice(2))
+    }
+  })
+
+  test("two members holding different batches under one hash do not agree", async () => {
+    expect(await agreedSignatures([{ ...(await sigRow(0)), batch: { b: "poison" } }, await sigRow(1)], settlers)).toBeNull()
+  })
+
   test("a row claiming someone else's signature does not count", async () => {
     const stolen = { ...(await sigRow(1)), signer: accounts[2]!.address.toLowerCase() }
     expect(await agreedSignatures([await sigRow(0), stolen], settlers)).toBeNull()

@@ -2,7 +2,7 @@ import { AuditCourtAbi, HostRegistryAbi, UsageLedgerAbi } from "@offpeak/abis"
 import { agreedSignatures, log, readSignatures, storeSignature, type Db } from "@offpeak/common"
 import { domain, rulingTypes, type EvidenceBundle } from "@offpeak/shared"
 import { hashTypedData, keccak256, toBytes, type Address, type Hex, type LocalAccount, type PublicClient, type WalletClient } from "viem"
-import { OUTCOME_BREACH, OUTCOME_SWAP, decideRuling, type ChallengeFacts } from "./decide.ts"
+import { OUTCOME_BREACH, OUTCOME_SWAP, decideRuling, dismiss, type ChallengeFacts } from "./decide.ts"
 import { buildRefundTree, spendWithHost, storeRefundTree } from "./refund-tree.ts"
 
 const HOST_RESPONSE_S = 86_400
@@ -14,24 +14,26 @@ export type RulingDeps = {
   account: LocalAccount
   contracts: Record<string, Address>
   rulers: Address[]
+  auditor: Address
   chainId: number
 }
 
 export type ChallengeRow = {
   id: string
   host: string
+  challenger: string
   kind: number
-  samples_root: string
-  sample_count: number
-  test_id: string
-  statistic: string
-  threshold: string
+  samples_root: string | null
+  sample_count: number | null
+  test_id: string | null
+  statistic: string | null
+  threshold: string | null
   filed_at: string
   filed_block: string
   response_hash: string | null
 }
 
-export async function loadBundle(db: Db, samplesRoot: string): Promise<EvidenceBundle | null> {
+export async function loadBundle(db: Db, samplesRoot: string | null): Promise<EvidenceBundle | null> {
   const rows = await db.query<{ body: EvidenceBundle }>("SELECT body FROM shared.evidence_bundles WHERE samples_root = $1", [samplesRoot])
   return rows.rows[0]?.body ?? null
 }
@@ -52,15 +54,16 @@ export async function leavesProven(deps: Pick<RulingDeps, "db" | "reader" | "con
   return true
 }
 
+/** An evidence event that never applied leaves these NULL. With no root there is no bundle, so the ruling dismisses. */
 export function factsOf(row: ChallengeRow): ChallengeFacts {
   return {
     host: row.host,
     kind: Number(row.kind),
-    samplesRoot: row.samples_root,
-    sampleCount: Number(row.sample_count),
-    testId: row.test_id,
-    statistic: BigInt(row.statistic),
-    threshold: BigInt(row.threshold),
+    samplesRoot: row.samples_root ?? "",
+    sampleCount: Number(row.sample_count ?? 0),
+    testId: row.test_id ?? "",
+    statistic: BigInt(row.statistic ?? 0),
+    threshold: BigInt(row.threshold ?? 0),
   }
 }
 
@@ -77,10 +80,22 @@ export async function refundTreeFor(deps: Pick<RulingDeps, "db" | "reader" | "co
   return buildRefundTree(spend, (view.bondUsdg * BigInt(slashBps)) / 10_000n)
 }
 
+/**
+ * A root counts once: for the auditor's first filing of it, which also fixes its kind. Roots are public,
+ * so a copy proves nothing, and a stranger's filing cannot use up the auditor's.
+ */
+async function evidenceMisuse(deps: RulingDeps, row: ChallengeRow) {
+  const auditor = deps.auditor.toLowerCase()
+  if (row.challenger !== auditor) return "evidence_wrong_filer"
+  const first = await deps.db.query<{ id: string }>("SELECT min(id) AS id FROM chain.challenges WHERE samples_root = $1 AND challenger = $2", [row.samples_root, auditor])
+  return Number(first.rows[0]!.id) === Number(row.id) ? null : "evidence_reused"
+}
+
 async function signRuling(deps: RulingDeps, row: ChallengeRow) {
   const bundle = await loadBundle(deps.db, row.samples_root)
-  const proven = bundle ? await leavesProven(deps, bundle) : false
-  const decision = decideRuling(bundle, factsOf(row), proven)
+  const misuse = bundle ? await evidenceMisuse(deps, row) : null
+  const proven = bundle && !misuse ? await leavesProven(deps, bundle) : false
+  const decision = misuse ? dismiss(misuse) : decideRuling(bundle, factsOf(row), proven)
 
   let refundRoot = `0x${"00".repeat(32)}` as Hex
   if (bundle && decision.outcome === OUTCOME_BREACH) {
@@ -134,12 +149,18 @@ export async function rulingTick(deps: RulingDeps) {
   )
   const results: { id: number; reason: string; submitted: unknown }[] = []
   for (const row of ready.rows) {
-    const decision = await signRuling(deps, row)
-    const submitted = await trySubmit(deps, Number(row.id)).catch((err) => {
-      log("rulings", "submit_retry", { id: row.id, error: String(err).slice(0, 200) })
-      return "retry"
-    })
-    results.push({ id: Number(row.id), reason: decision.reason, submitted })
+    try {
+      const decision = await signRuling(deps, row)
+      const submitted = await trySubmit(deps, Number(row.id)).catch((err) => {
+        log("rulings", "submit_retry", { id: row.id, error: String(err).slice(0, 200) })
+        return "retry"
+      })
+      results.push({ id: Number(row.id), reason: decision.reason, submitted })
+    } catch (err) {
+      // One challenge that cannot be ruled must not hold back the ones after it.
+      log("rulings", "ruling_failed", { id: row.id, error: String(err).slice(0, 200) })
+      results.push({ id: Number(row.id), reason: "ruling_failed", submitted: "retry" })
+    }
   }
   return results
 }

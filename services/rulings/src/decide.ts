@@ -25,7 +25,7 @@ export type ChallengeFacts = {
 
 export type RulingDecision = { outcome: number; slashBps: number; reason: string }
 
-const dismiss = (reason: string): RulingDecision => ({ outcome: OUTCOME_DISMISS, slashBps: 0, reason })
+export const dismiss = (reason: string): RulingDecision => ({ outcome: OUTCOME_DISMISS, slashBps: 0, reason })
 const breach = (reason: string): RulingDecision => ({ outcome: OUTCOME_BREACH, slashBps: 2_000, reason })
 
 const shareReached = (count: number, total: number) => count >= Math.ceil(total * SIGNAL_SHARE)

@@ -87,6 +87,7 @@ export async function refundPass(deps: WorkerDeps) {
       writer: deps.writer,
       account: deps.account,
       vault: deps.contracts.OffpeakVault!,
+      escrow: deps.contracts.X402Escrow,
       settlers: deps.settlers,
       chainId: deps.chainId,
     },

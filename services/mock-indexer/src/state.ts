@@ -159,7 +159,10 @@ export class MockIndexer implements ChainReader {
       const row = this.escrows.get(String(msg.reqId)) ?? { status: "none" as const, maxAmount: 0n, captured: 0n }
       if (msg.type === "Authorized") row.status = "authorized"
       if (msg.type === "Captured") row.status = "captured"
-      if (msg.type === "ExactSettled") row.status = "captured"
+      if (msg.type === "ExactSettled") {
+        row.status = "captured"
+        row.captured = BigInt(String(msg.amount ?? 0))
+      }
       this.escrows.set(String(msg.reqId), row)
     }
     this.head.block += 1

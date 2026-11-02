@@ -1,6 +1,7 @@
 import { OffpeakVaultAbi, abis } from "@offpeak/abis"
 import { log, type Db, type Metrics } from "@offpeak/common"
-import { decodeEventLog, type Abi, type Address, type Log, type PublicClient } from "viem"
+import { domain, settleTypes } from "@offpeak/shared"
+import { BlockNotFoundError, decodeEventLog, decodeFunctionData, hashTypedData, isAddressEqual, recoverAddress, slice, type Abi, type Address, type Hex, type Log, type PublicClient } from "viem"
 import { applyEvent, type ChainEvent } from "./apply/index.ts"
 
 const CURSOR = "main"
@@ -78,6 +79,18 @@ async function blockTimes(reader: PublicClient, logs: Log[]) {
   return times
 }
 
+/** The batch a `settle` call landed and the two signers the vault accepted for it, read from its calldata. */
+async function landedBatch(deps: IngestDeps, txHash: Hex) {
+  const sent = await deps.reader.getTransaction({ hash: txHash })
+  if (!sent.to || !isAddressEqual(sent.to, deps.contracts.OffpeakVault!)) return null
+  const call = decodeFunctionData({ abi: OffpeakVaultAbi, data: sent.input })
+  if (call.functionName !== "settle") return null
+  const [batch, , thresholdSig] = call.args
+  const hash = hashTypedData({ domain: domain("OffpeakSettlement", batch.vault, Number(batch.chainId)), types: settleTypes, primaryType: "SettleBatch", message: batch })
+  const signers = await Promise.all([slice(thresholdSig, 0, 65), slice(thresholdSig, 65, 130)].map((signature) => recoverAddress({ hash, signature })))
+  return { batchHash: hash, signers }
+}
+
 /** Moves unmatched collections onto their payment rows, which may be written after the claim lands. */
 async function reconcileCollections(tx: Db) {
   await tx.query(
@@ -120,11 +133,17 @@ async function applyRange(deps: IngestDeps, from: bigint, to: bigint) {
   const logs = await deps.reader.getLogs({ address: Object.values(deps.contracts), fromBlock: from, toBlock: to })
   const times = await blockTimes(deps.reader, logs)
   const tip = await deps.reader.getBlock({ blockNumber: to })
+  // Kept in the event's args, so replay needs no RPC and rebuilds the same outcome.
+  const decodedLogs: [Log, Omit<ChainEvent, "blockTs">][] = []
+  for (const log of logs) {
+    const decoded = decode(log, names)
+    if (!decoded) continue
+    const landed = decoded.contract === "OffpeakVault" && decoded.event === "Settled" ? await landedBatch(deps, log.transactionHash!) : null
+    decodedLogs.push([log, landed ? { ...decoded, args: { ...decoded.args, ...landed } } : decoded])
+  }
   const events: ChainEvent[] = []
   await deps.db.transaction(async (tx) => {
-    for (const log of logs) {
-      const decoded = decode(log, names)
-      if (!decoded) continue
+    for (const [log, decoded] of decodedLogs) {
       const event = { ...decoded, blockTs: times.get(log.blockNumber!)! }
       const inserted = await tx.query<{ tx_hash: string }>(
         `INSERT INTO chain.events (tx_hash, log_index, block_number, block_hash, block_ts, contract, event, args, processed)
@@ -184,9 +203,9 @@ async function clearDerivedWrites(tx: Db, forkBlock: bigint) {
   await tx.exec("UPDATE chain.vault_state SET last_settled_hour = initial_settled_hour, usage_paused = false, settles_paused = false")
 }
 
-/** Drops events past the fork, rebuilds derived state by replay, and tells consumers. */
+/** Drops events past the fork, rebuilds derived state by replay, and tells consumers. One transaction, so a failed replay undoes the wipe. */
 async function rewind(deps: IngestDeps, forkBlock: bigint) {
-  const events = await deps.db.transaction(async (tx) => {
+  await deps.db.transaction(async (tx) => {
     await clearDerivedWrites(tx, forkBlock)
     await tx.query("DELETE FROM chain.events WHERE block_number > $1", [forkBlock])
     for (const table of ["buyers", "hosts", "host_models", "host_status_log", "host_credits", "settlements", "roots", "refunds_paid", "collections", "signer_sets", "challenges", "channels", "channel_claims", "escrows", "orphan_writeoffs", "swept_payments", "windows", "window_holdings", "listings"]) {
@@ -203,11 +222,9 @@ async function rewind(deps: IngestDeps, forkBlock: bigint) {
       event: string
       args: Record<string, unknown>
     }>("SELECT * FROM chain.events ORDER BY block_number, log_index")
-    return kept.rows
-  })
-  await deps.db.transaction(async (tx) => {
-    for (const row of events) {
-      await applyEvent(tx, {
+    await tx.exec("UPDATE chain.events SET processed = true, error = NULL")
+    for (const row of kept.rows) {
+      await applySafely(deps, tx, {
         txHash: row.tx_hash,
         logIndex: row.log_index,
         blockNumber: BigInt(row.block_number),
@@ -228,7 +245,11 @@ async function findForkBlock(deps: IngestDeps, cursor: bigint) {
     [cursor],
   )
   for (const row of seen.rows) {
-    const block = await deps.reader.getBlock({ blockNumber: BigInt(row.block_number) }).catch(() => null)
+    // A block the node does not have is past the fork. Any other failure says nothing about the chain.
+    const block = await deps.reader.getBlock({ blockNumber: BigInt(row.block_number) }).catch((err) => {
+      if (err instanceof BlockNotFoundError) return null
+      throw err
+    })
     if (block?.hash === row.block_hash) return BigInt(row.block_number)
   }
   return 0n
@@ -242,8 +263,9 @@ export async function tick(deps: IngestDeps, state: IngestState): Promise<bigint
   if (!cursor) {
     await seedVaultState(deps, 0n)
   } else {
-    const onChain = await deps.reader.getBlock({ blockNumber: cursor.block }).catch(() => null)
-    if (onChain?.hash !== cursor.hash) {
+    // Only a block with another hash proves a fork. A failed read throws, and the next tick looks again.
+    const onChain = await deps.reader.getBlock({ blockNumber: cursor.block })
+    if (onChain.hash !== cursor.hash) {
       await rewind(deps, await findForkBlock(deps, cursor.block))
       // Whatever survives the fork comes through again from the rewound cursor, so nothing is held back.
       state.fastLaned.clear()

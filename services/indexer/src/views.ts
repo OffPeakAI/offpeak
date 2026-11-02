@@ -107,7 +107,7 @@ export async function hostView(db: Db, address: string, now: number) {
   const hosts = await db.query<Record<string, string>>("SELECT * FROM chain.hosts WHERE address = $1", [address])
   const host = hosts.rows[0]
   if (!host) return null
-  const models = await db.query<{ digest: string; max_tps: number }>("SELECT digest, max_tps FROM chain.host_models WHERE host = $1 ORDER BY digest", [address])
+  const models = await db.query<{ digest: string; max_tps: string | number }>("SELECT digest, max_tps FROM chain.host_models WHERE host = $1 ORDER BY digest", [address])
   const credits = await db.query<{ releasable: string | null; pending: string | null }>(
     `SELECT
        COALESCE(SUM(amount) FILTER (WHERE releasable_at <= $2), 0) AS releasable,
@@ -131,7 +131,7 @@ export async function hostView(db: Db, address: string, now: number) {
     openChallenges: Number(host.open_challenges),
     releasableCredits: BigInt(credits.rows[0]?.releasable ?? 0),
     pendingCredits: BigInt(credits.rows[0]?.pending ?? 0),
-    models: models.rows.map((m) => ({ digest: m.digest, maxTps: m.max_tps })),
+    models: models.rows.map((m) => ({ digest: m.digest, maxTps: Number(m.max_tps) })),
     routable: Number(host.status) === 2 && bondUsdg >= required,
     routingBonusBps: 0,
     endpointHash: host.endpoint_hash,

@@ -49,10 +49,12 @@ export class MockFacilitator implements PaymentClient {
     const reqId = String(body.paymentPayload.payload.witness.reqId)
     const delay = this.delayMs
     const fail = this.failReqIds.has(reqId)
+    const amount = body.mode === "exact" ? { amount: String(body.paymentPayload.payload.witness.amount) } : {}
     setTimeout(() => {
       this.emit({
         type: fail ? "AuthorizeFailed" : body.mode === "exact" ? "ExactSettled" : "Authorized",
         reqId,
+        ...amount,
         block: 1,
         txHash: `0x${"ab".repeat(32)}` as Hex,
       })
