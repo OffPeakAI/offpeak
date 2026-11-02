@@ -9,7 +9,7 @@
     "@offpeak/audit-tests": "workspace:*",
     "@offpeak/shared": "workspace:*",
     "bullmq": "5.81.5",
-    "viem": "^2.38.0",
+    "viem": "2.57.11",
     "zod": "^4.0.0"
   }
 }

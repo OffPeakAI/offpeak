@@ -6,7 +6,7 @@
       "name": "offpeak",
       "dependencies": {
         "@electric-sql/pglite": "^0.3.0",
-        "viem": "^2.38.0",
+        "viem": "2.57.11",
       },
       "devDependencies": {
         "@openzeppelin/contracts": "5.4.0",
@@ -23,7 +23,7 @@
         "@offpeak/audit-tests": "workspace:*",
         "@offpeak/shared": "workspace:*",
         "bullmq": "5.81.5",
-        "viem": "^2.38.0",
+        "viem": "2.57.11",
         "zod": "^4.0.0",
       },
     },
@@ -38,7 +38,7 @@
         "@offpeak/abis": "workspace:*",
         "@offpeak/shared": "workspace:*",
         "hono": "^4.7.0",
-        "viem": "^2.38.0",
+        "viem": "2.57.11",
         "yaml": "2.9.1",
         "zod": "^4.0.0",
       },
@@ -57,7 +57,7 @@
         "bullmq": "5",
         "hono": "^4.7.0",
         "ioredis": "5",
-        "viem": "^2.38.0",
+        "viem": "2.57.11",
         "zod": "^4.0.0",
       },
     },
@@ -95,7 +95,7 @@
       "name": "@offpeak/abis",
       "version": "0.1.0",
       "dependencies": {
-        "viem": "^2.38.0",
+        "viem": "2.57.11",
       },
     },
     "packages/audit-tests": {
@@ -120,7 +120,7 @@
         "@offpeak/abis": "workspace:*",
         "@offpeak/shared": "workspace:*",
         "openai": "^5.0.0",
-        "viem": "^2.38.0",
+        "viem": "2.57.11",
         "zod": "^4.0.0",
       },
     },
@@ -134,7 +134,7 @@
         "@noble/hashes": "1.8.0",
         "drizzle-orm": "0.45.4",
         "secp256k1": "5.0.2",
-        "viem": "^2.38.0",
+        "viem": "2.57.11",
         "zod": "^4.0.0",
       },
     },
@@ -146,7 +146,7 @@
         "@offpeak/abis": "workspace:*",
         "@offpeak/shared": "workspace:*",
         "pg": "^8.13.0",
-        "viem": "^2.38.0",
+        "viem": "2.57.11",
         "zod": "^4.0.0",
       },
       "devDependencies": {
@@ -163,7 +163,7 @@
         "bullmq": "5",
         "hono": "^4.7.0",
         "ioredis": "5",
-        "viem": "^2.38.0",
+        "viem": "2.57.11",
       },
     },
     "services/indexer": {
@@ -175,7 +175,7 @@
         "@offpeak/shared": "workspace:*",
         "hono": "^4.7.0",
         "ioredis": "5",
-        "viem": "^2.38.0",
+        "viem": "2.57.11",
       },
     },
     "services/keepers": {
@@ -187,7 +187,7 @@
         "@offpeak/shared": "workspace:*",
         "bullmq": "5",
         "ioredis": "5",
-        "viem": "^2.38.0",
+        "viem": "2.57.11",
       },
     },
     "services/mock-facilitator": {
@@ -196,7 +196,7 @@
       "dependencies": {
         "@offpeak/shared": "workspace:*",
         "hono": "^4.7.0",
-        "viem": "^2.38.0",
+        "viem": "2.57.11",
         "zod": "^4.0.0",
       },
     },
@@ -218,7 +218,7 @@
         "@offpeak/audit-tests": "workspace:*",
         "@offpeak/common": "workspace:*",
         "@offpeak/shared": "workspace:*",
-        "viem": "^2.38.0",
+        "viem": "2.57.11",
       },
     },
     "services/settlement": {
@@ -228,7 +228,7 @@
         "@offpeak/abis": "workspace:*",
         "@offpeak/common": "workspace:*",
         "@offpeak/shared": "workspace:*",
-        "viem": "^2.38.0",
+        "viem": "2.57.11",
       },
     },
   },
@@ -243,6 +243,7 @@
   ],
   "overrides": {
     "ws": "8.21.0",
+    "zod": "4.6.7",
   },
   "packages": {
     "@adraffy/ens-normalize": ["@adraffy/ens-normalize@1.11.1", "", {}, "sha512-nhCBV3quEgesuf7c7KYfperqSS14T8bYuvJ8PcLJp6znkZpFc0AuW4qBtr8eKVyPPe/8RSr7sglCWPU5eaxwKQ=="],
@@ -1447,8 +1448,6 @@
 
     "@coinbase/cdp-sdk/abitype": ["abitype@1.0.6", "", { "peerDependencies": { "typescript": ">=5.0.4", "zod": "^3 >=3.22.0" }, "optionalPeers": ["typescript", "zod"] }, "sha512-MMSqYh4+C/aVqI2RQaWqbvI4Kxo5cQV40WQ4QFtDnNzCkqChm8MuENhElmynZlO0qUy/ObkEUaXtKqYnx1Kp3A=="],
 
-    "@coinbase/cdp-sdk/zod": ["zod@3.25.76", "", {}, "sha512-gzUt/qt81nXsFGKIFcC3YnfEAx5NkunCfnDlvuBSSFS02bcXu4Lmea0AFIUwbLWxWPx3d9p8S5QoaujKcNQxcQ=="],
-
     "@coinbase/wallet-sdk/@noble/hashes": ["@noble/hashes@1.4.0", "", {}, "sha512-V1JJ1WTRUqHHrOSh597hURcMqVKVGL/ea3kv0gSnEdsEZ0/+VyPghM1lMNGc00z7CIQorSvbKpuJkxvuHbvdbg=="],
 
     "@coinbase/wallet-sdk/ox": ["ox@0.6.9", "", { "dependencies": { "@adraffy/ens-normalize": "^1.10.1", "@noble/curves": "^1.6.0", "@noble/hashes": "^1.5.0", "@scure/bip32": "^1.5.0", "@scure/bip39": "^1.4.0", "abitype": "^1.0.6", "eventemitter3": "5.0.1" }, "peerDependencies": { "typescript": ">=5.4.0" }, "optionalPeers": ["typescript"] }, "sha512-wi5ShvzE4eOcTwQVsIPdFr+8ycyX+5le/96iAJutaZAvCes1J0+RvpEPg5QDPDiaR0XQQAvZVl7AwqQcINuUug=="],
@@ -1486,8 +1485,6 @@
     "@reown/appkit-controllers/@walletconnect/universal-provider": ["@walletconnect/universal-provider@2.21.0", "", { "dependencies": { "@walletconnect/events": "1.0.1", "@walletconnect/jsonrpc-http-connection": "1.0.8", "@walletconnect/jsonrpc-provider": "1.0.14", "@walletconnect/jsonrpc-types": "1.0.4", "@walletconnect/jsonrpc-utils": "1.0.8", "@walletconnect/keyvaluestorage": "1.1.1", "@walletconnect/logger": "2.1.2", "@walletconnect/sign-client": "2.21.0", "@walletconnect/types": "2.21.0", "@walletconnect/utils": "2.21.0", "es-toolkit": "1.33.0", "events": "3.3.0" } }, "sha512-mtUQvewt+X0VBQay/xOJBvxsB3Xsm1lTwFjZ6WUwSOTR1X+FNb71hSApnV5kbsdDIpYPXeQUbGt2se1n5E5UBg=="],
 
     "@reown/appkit-utils/@walletconnect/universal-provider": ["@walletconnect/universal-provider@2.21.0", "", { "dependencies": { "@walletconnect/events": "1.0.1", "@walletconnect/jsonrpc-http-connection": "1.0.8", "@walletconnect/jsonrpc-provider": "1.0.14", "@walletconnect/jsonrpc-types": "1.0.4", "@walletconnect/jsonrpc-utils": "1.0.8", "@walletconnect/keyvaluestorage": "1.1.1", "@walletconnect/logger": "2.1.2", "@walletconnect/sign-client": "2.21.0", "@walletconnect/types": "2.21.0", "@walletconnect/utils": "2.21.0", "es-toolkit": "1.33.0", "events": "3.3.0" } }, "sha512-mtUQvewt+X0VBQay/xOJBvxsB3Xsm1lTwFjZ6WUwSOTR1X+FNb71hSApnV5kbsdDIpYPXeQUbGt2se1n5E5UBg=="],
-
-    "@reown/appkit-wallet/zod": ["zod@3.22.4", "", {}, "sha512-iC+8Io04lddc+mVqQ9AZ7OQ2MrUKGN+oIQyq1vemgt46jwCwLfhq7/pwnBnNXXXZb8VTVLKwp9EDkx+ryxIWmg=="],
 
     "@scure/bip32/@noble/curves": ["@noble/curves@1.9.7", "", { "dependencies": { "@noble/hashes": "1.8.0" } }, "sha512-gbKGcRUYIjA3/zCCNaWDciTMFI0dCkvou3TL8Zmy5Nc7sJ47a0jtOeZoTaMxkuqRo9cRhjOdZJXegxYE5FN/xw=="],
 

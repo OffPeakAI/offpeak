@@ -9,6 +9,6 @@
     "./deployments/4663.json": "./deployments/4663.json"
   },
   "dependencies": {
-    "viem": "^2.38.0"
+    "viem": "2.57.11"
   }
 }

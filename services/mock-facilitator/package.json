@@ -7,7 +7,7 @@
   "dependencies": {
     "@offpeak/shared": "workspace:*",
     "hono": "^4.7.0",
-    "viem": "^2.38.0",
+    "viem": "2.57.11",
     "zod": "^4.0.0"
   }
 }

@@ -7,6 +7,6 @@
     "@offpeak/abis": "workspace:*",
     "@offpeak/common": "workspace:*",
     "@offpeak/shared": "workspace:*",
-    "viem": "^2.38.0"
+    "viem": "2.57.11"
   }
 }
