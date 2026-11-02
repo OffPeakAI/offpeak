@@ -18,7 +18,7 @@ import {
   type UsageEnvelope,
   type UsageRecord,
 } from "@offpeak/shared"
-import { addressSchema, bytes32Schema, digitsSchema, hexSchema } from "./core.ts"
+import { OffpeakError, addressSchema, bytes32Schema, digitsSchema, hexSchema, usdToMicro } from "./core.ts"
 
 const envelopeShape = z.object({
   v: z.literal(1),
@@ -99,6 +99,17 @@ export function overMaxPrice(record: UsageRecord, cap: MaxPrice) {
   if (record.payMode === 4) return false
   if (record.priceIn > cap.inPerM || record.priceOut > cap.outPerM) return true
   return record.hostCostMicro + record.feeMicro > hostCostMicro(record.tokensIn, record.tokensOut, cap.inPerM, cap.outPerM) + CAP_ROUNDING_MICRO
+}
+
+/** The cap on a request, wherever it was set, so the openai client's headers count too. */
+export function capFrom(headers: Headers): MaxPrice | undefined {
+  const match = /^in=([\d.]+),out=([\d.]+)$/.exec(headers.get("x-offpeak-max-price") ?? "")
+  return match ? { inPerM: usdToMicro(match[1]!), outPerM: usdToMicro(match[2]!) } : undefined
+}
+
+/** The router promised this cap. A record above it is paid for, so the caller hears of it rather than a quiet answer. */
+export function assertWithinCap(envelope: UsageEnvelope, cap: MaxPrice | undefined) {
+  if (cap && overMaxPrice(envelope.record, cap)) throw new OffpeakError("over_max_price", `Request ${envelope.record.reqId} bills above your max price. You can dispute it within 7 days.`, undefined, { reqId: envelope.record.reqId })
 }
 
 /** A fee over the default rate is an overcharge. A lower one is a discount a tier or opt-in can give. */

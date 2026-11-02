@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs"
-import { Offpeak, localWallet, type Deployment, type OffpeakOptions } from "@offpeak/sdk"
+import { Offpeak, fileChannelStore, localWallet, usdToMicro, type Deployment, type OffpeakOptions } from "@offpeak/sdk"
 import { z } from "zod"
+import { Budget, DEFAULT_LIMITS } from "./budget.ts"
 
 const ROLE_KEYS = [
   "OFFPEAK_ROUTER_SIGNER_KEY",
@@ -16,6 +17,8 @@ const ROLE_KEYS = [
 
 const DEFAULT_MCP_PORT = 8790
 const MIN_MCP_TOKEN_LENGTH = 32
+const MAX_PRICE_FORMAT = /^in=(\d+(?:\.\d{1,6})?),out=(\d+(?:\.\d{1,6})?)$/
+const capMicro = z.string().regex(/^[1-9]\d*$/, "must be whole µUSDG above zero")
 
 const envSchema = z.object({
   OFFPEAK_PUBLIC_BASE_URL: z.url(),
@@ -47,6 +50,11 @@ const envSchema = z.object({
     .regex(/^\d+$/, "must be whole µUSDG")
     .optional(),
   OFFPEAK_CHANNEL_EXPIRY_S: z.coerce.number().int().positive().optional(),
+  OFFPEAK_CHANNEL_STATE_FILE: z.string().min(1).optional(),
+  OFFPEAK_CALL_CAP_MICRO: capMicro.default(DEFAULT_LIMITS.callCapMicro.toString()),
+  OFFPEAK_DAY_CAP_MICRO: capMicro.default(DEFAULT_LIMITS.dayCapMicro.toString()),
+  OFFPEAK_MAX_PRICE: z.string().regex(MAX_PRICE_FORMAT, "must be in=<usd>,out=<usd>").optional(),
+  OFFPEAK_SPEND_FILE: z.string().min(1).optional(),
   OFFPEAK_MCP_HOST: z.string().min(1).default("127.0.0.1"),
   OFFPEAK_MCP_PORT: z.coerce.number().int().min(1).max(65_535).default(DEFAULT_MCP_PORT),
   OFFPEAK_MCP_TOKEN: z.string().min(MIN_MCP_TOKEN_LENGTH).optional(),
@@ -67,6 +75,7 @@ export function readConfig(source: Record<string, string | undefined>): McpConfi
   if ((config.OFFPEAK_CHANNEL_ID || config.OFFPEAK_CHANNEL_DEPOSIT) && !config.OFFPEAK_AGENT_WALLET_KEY) throw new Error("A channel needs OFFPEAK_AGENT_WALLET_KEY")
   if (config.OFFPEAK_CHANNEL_DEPOSIT && !config.OFFPEAK_RPC_URL) throw new Error("Opening a channel needs OFFPEAK_RPC_URL")
   if (config.OFFPEAK_CHANNEL_ID && !config.OFFPEAK_RPC_URL) throw new Error("A channel is read from the chain, which needs OFFPEAK_RPC_URL")
+  if (config.OFFPEAK_CHANNEL_DEPOSIT && !config.OFFPEAK_CHANNEL_STATE_FILE) throw new Error("A deposit needs OFFPEAK_CHANNEL_STATE_FILE, or every start would fund a new channel")
   if (Boolean(config.OFFPEAK_CHANNEL_SEQ) !== Boolean(config.OFFPEAK_CHANNEL_CUMULATIVE)) throw new Error("Set OFFPEAK_CHANNEL_SEQ and OFFPEAK_CHANNEL_CUMULATIVE as a pair")
   return config
 }
@@ -83,13 +92,24 @@ function deployment(file: string | undefined): Deployment | undefined {
   return file ? deploymentSchema.parse(JSON.parse(readFileSync(file, "utf8"))) : undefined
 }
 
+export function budgetFrom(config: McpConfig) {
+  const [, inUsd, outUsd] = MAX_PRICE_FORMAT.exec(config.OFFPEAK_MAX_PRICE ?? "") ?? []
+  return new Budget({
+    callCapMicro: BigInt(config.OFFPEAK_CALL_CAP_MICRO),
+    dayCapMicro: BigInt(config.OFFPEAK_DAY_CAP_MICRO),
+    maxPrice: inUsd && outUsd ? { inPerM: usdToMicro(inUsd), outPerM: usdToMicro(outUsd) } : DEFAULT_LIMITS.maxPrice,
+    file: config.OFFPEAK_SPEND_FILE,
+  })
+}
+
 /** The key signs inside this process. Requests carry signatures, never the key. */
-export function clientFrom(config: McpConfig, fetcher?: typeof fetch, publicClient?: OffpeakOptions["publicClient"]) {
+export function clientFrom(config: McpConfig, budget: Budget, fetcher?: typeof fetch, publicClient?: OffpeakOptions["publicClient"]) {
   const known = config.OFFPEAK_CHANNEL_SEQ && config.OFFPEAK_CHANNEL_CUMULATIVE ? { seq: BigInt(config.OFFPEAK_CHANNEL_SEQ), cumulative: BigInt(config.OFFPEAK_CHANNEL_CUMULATIVE) } : undefined
+  const store = config.OFFPEAK_CHANNEL_STATE_FILE ? fileChannelStore(config.OFFPEAK_CHANNEL_STATE_FILE) : undefined
   const channel = config.OFFPEAK_CHANNEL_ID
-    ? { id: config.OFFPEAK_CHANNEL_ID, known }
+    ? { id: config.OFFPEAK_CHANNEL_ID, known, store }
     : config.OFFPEAK_CHANNEL_DEPOSIT
-      ? { deposit: BigInt(config.OFFPEAK_CHANNEL_DEPOSIT), expirySeconds: config.OFFPEAK_CHANNEL_EXPIRY_S }
+      ? { deposit: BigInt(config.OFFPEAK_CHANNEL_DEPOSIT), expirySeconds: config.OFFPEAK_CHANNEL_EXPIRY_S, store }
       : undefined
   return new Offpeak({
     baseURL: config.OFFPEAK_PUBLIC_BASE_URL,
@@ -100,6 +120,8 @@ export function clientFrom(config: McpConfig, fetcher?: typeof fetch, publicClie
     deployment: deployment(config.OFFPEAK_DEPLOYMENT_FILE),
     router: config.OFFPEAK_ROUTER_ADDRESS,
     channel,
+    uptoCapMicro: BigInt(config.OFFPEAK_CALL_CAP_MICRO),
+    onUpto: (amount) => budget.authorized(amount),
     fetch: fetcher,
   })
 }

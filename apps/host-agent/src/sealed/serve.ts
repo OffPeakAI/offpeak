@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto"
-import type { Hono, MiddlewareHandler } from "hono"
+import type { Context, Hono, MiddlewareHandler } from "hono"
 import { MAX_REQUEST_S, type ChatBody, type ChatMessage } from "@offpeak/shared"
 import { bytesToHex, keccak256, type Hex } from "viem"
 import { z } from "zod"
@@ -20,6 +20,12 @@ export const SEALED_COUNTS_ROUTE = "/offpeak/v1/sealed/counts"
 const MAX_TOKENS_LIMIT = 4096
 /** Quotes and GPU evidence are slow. A queue this long means somebody is asking on purpose. */
 const ATTEST_QUEUE_MAX = 4
+/** Quotes a source may ask for in one window. The route takes no key, so this is all that tells callers apart. */
+const ATTEST_SOURCE_MAX = 6
+const ATTEST_WINDOW_S = 60
+/** Sources tracked in one window. Past this a new source waits for the next one. */
+const ATTEST_SOURCES_MAX = 10_000
+const LOOPBACK = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"])
 
 const nonceSchema = z
   .string()
@@ -51,12 +57,40 @@ export type SealedBoot = {
   gpuTool?: string[]
 }
 
+/** Counts quotes by source over a fixed window. */
+class SourceLimit {
+  private counts = new Map<string, number>()
+  private resets = 0
+
+  take(source: string, now: number) {
+    if (now >= this.resets) {
+      this.counts.clear()
+      this.resets = now + ATTEST_WINDOW_S
+    }
+    const used = this.counts.get(source) ?? 0
+    if (used >= ATTEST_SOURCE_MAX || (used === 0 && this.counts.size >= ATTEST_SOURCES_MAX)) return false
+    this.counts.set(source, used + 1)
+    return true
+  }
+}
+
+type PeerBindings = { server?: { requestIP?: (request: Request) => { address: string } | null } }
+
+/** The agent sits behind a TLS proxy on this machine, so a loopback peer's source is the hop that proxy added last. From anyone else the header proves nothing. */
+function sourceOf(c: Context) {
+  const peer = (c.env as PeerBindings | undefined)?.server?.requestIP?.(c.req.raw)?.address
+  if (!peer) return "unknown"
+  return LOOPBACK.has(peer) ? c.req.header("x-forwarded-for")?.split(",").at(-1)?.trim() || peer : peer
+}
+
 export type AttestBody = { nonce: Hex; hpkePublicKey: Hex; bindings: Bindings; quote: Hex; gpuEvidence: GpuEvidence; boot: { bindings: Bindings; quote: Hex } }
 
 /** The VM's sealed identity: its key pair and the boot quote that ties that key to this image and model. */
 export class SealedAgent {
-  private queue: Promise<unknown> = Promise.resolve()
+  private jobs: (() => Promise<void>)[] = []
+  private draining = false
   private waiting = 0
+  private sweeping = false
 
   private constructor(
     readonly boot: Required<SealedBoot>,
@@ -91,13 +125,31 @@ export class SealedAgent {
     return { nonce, hpkePublicKey: this.identity.publicKey, bindings, quote, gpuEvidence, boot: { bindings: this.bootBindings, quote: this.bootQuote } }
   }
 
-  /** One at a time, since the configfs entry is shared. `null` when the queue is full. */
-  attest(nonce: Hex): Promise<AttestBody> | null {
-    if (this.waiting >= ATTEST_QUEUE_MAX) return null
-    this.waiting += 1
-    const run = this.queue.then(() => this.fresh(nonce)).finally(() => (this.waiting -= 1))
-    this.queue = run.catch(() => undefined)
-    return run
+  /**
+   * One at a time, since the configfs entry is shared. `null` when the queue is full. The router's sweep has
+   * a place of its own at the front, because a host that misses it stops being listed as verified.
+   */
+  attest(nonce: Hex, sweep = false): Promise<AttestBody> | null {
+    if (sweep ? this.sweeping : this.waiting >= ATTEST_QUEUE_MAX) return null
+    if (sweep) this.sweeping = true
+    else this.waiting += 1
+    const left = () => {
+      if (sweep) this.sweeping = false
+      else this.waiting -= 1
+    }
+    return new Promise((resolve, reject) => {
+      const job = () => this.fresh(nonce).then(resolve, reject).finally(left)
+      if (sweep) this.jobs.unshift(job)
+      else this.jobs.push(job)
+      void this.drain()
+    })
+  }
+
+  private async drain() {
+    if (this.draining) return
+    this.draining = true
+    for (let job = this.jobs.shift(); job; job = this.jobs.shift()) await job()
+    this.draining = false
   }
 }
 
@@ -197,14 +249,18 @@ async function encryptStream({ upstream, control, run, tokenizer, body, tokensIn
 /** The sealed routes. Decrypted bytes stay inside these handlers. Only counts and ciphertext hashes leave. */
 export function mountSealed(deps: SealedRoutes) {
   const { app, sealed, model, limit, signed, served, clock, admit, inflight } = deps
+  const sources = new SourceLimit()
 
-  /** With no nonce this only says which boot is running, so the router can notice a restart cheaply. */
+  /** With no nonce this only says which boot is running, so the router can notice a restart cheaply. A router-signed nonce is its sweep. */
   app.get("/offpeak/v1/attest", async (c) => {
     const raw = c.req.query("nonce")
     if (raw === undefined) return c.json({ attestationRef: sealed.attestationRef, hpkePublicKey: sealed.identity.publicKey })
     const nonce = nonceSchema.safeParse(raw)
     if (!nonce.success) return refusal(400, "bad_nonce", "Nonce must be 32 bytes of hex and not zero")
-    const running = sealed.attest(nonce.data)
+    const header = c.req.header("x-offpeak-req")
+    const sweep = header !== undefined && (await checkSignedReq(header, deps.routerAddress, nonce.data, clock())) !== null
+    if (!sweep && !sources.take(sourceOf(c), clock())) return refusal(429, "attest_rate_limited", "Too many attestations from this source")
+    const running = sealed.attest(nonce.data, sweep)
     if (!running) return refusal(429, "attest_busy", "Too many attestations are running")
     return running.then(
       (body) => c.json(body),

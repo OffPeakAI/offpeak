@@ -57,9 +57,13 @@ Every channel request carries a proof signed by the payer over its own body and 
 
 Set `channel: { deposit, expirySeconds }` in the constructor to open on the first call, or `channel: { id, known }` to use a channel you already have. `op.channels.attach(id, { seq, cumulative })` picks one up after a restart. Keep those two numbers from `op.channels.snapshot()`.
 
+`channel.store` keeps the channel across restarts. With `deposit` and `store: fileChannelStore(path)`, a start reuses the kept channel, and deposits again only once that channel has closed or is about to expire. A store that cannot be read stops the start, and so does a kept channel that cannot be read. Without a store, `deposit` opens a new channel in every process. Give each running client its own store.
+
 Attaching reads the channel from the chain, so it needs an RPC. It starts from what the chain shows you have paid, plus `cumulative` if you pass it. Debt from before the attach is never signed by itself, because no record you hold covers it: the router's `owed` shows in `snapshot().unsigned`, and only `op.channels.voucher(owed)` takes it on.
 
-**A voucher is signed only for what verified records cover.** After each response the client checks the record's signatures, cost and leaf, that its host is registered, that it belongs to your wallet and this channel, that it is within any `maxPrice`, and that it was not used before. It then signs the reported `owed` only if those records add up to it. If they do not, nothing is signed, `op.channels.snapshot().refused` says why, and the router's credit limit stops further spend.
+**A voucher is signed only for what verified records cover.** After each response the client checks the record's signatures, cost and leaf, that its host is registered, that it belongs to your wallet and this channel, that it is within any `maxPrice`, and that it was not used before. It also holds the record to the request that paid for it: `promptHash` must match the body you sent, `outputHash` the reply you received, `tokensOut` must fit that request's `max_tokens`, and `ts` must fall while it ran. With the model's tokenizer it recounts both token counts too. When the deployment publishes none, those two counts go unchecked here, and the limit on `tokensOut` still holds. It then signs the reported `owed` only if those records add up to it. If they do not, nothing is signed, `op.channels.snapshot().refused` says why, and the router's credit limit stops further spend.
+
+A `store` also keeps the ids of the records already counted, so the same record cannot be paid for again after a restart. Without one, the time check still turns away a record more than a minute older than the request.
 
 If you stop a stream early, the router bills what it served, and you get no record for that part. The next `owed` is then higher than your records. Check it, then accept it with `op.channels.voucher(owed)`. The same call with no argument sends what is verified, which is how you voucher by hand with `channel: { autoVoucher: false }`.
 
@@ -88,7 +92,7 @@ const { header } = await op.x402.payUpto(requirement, { maxAmount })
 // send it as the PAYMENT-SIGNATURE header
 ```
 
-The requirement comes over the network, so the client checks the token, payee, spender, Permit2 address and `validBefore` against the deployment before signing. It also refuses anything over `uptoCapMicro`, which defaults to 1 USDG.
+The requirement comes over the network, so the client checks the token, payee, spender, Permit2 address and `validBefore` against the deployment before signing. It also refuses anything over `uptoCapMicro`, which defaults to 1 USDG. `onUpto` is called with the amount just before signing, and throwing from it refuses the payment, so you can keep your own total.
 
 ## Checking usage
 
@@ -132,7 +136,7 @@ For each host, this client picks a nonce, asks for a fresh quote through the rou
 
 A stream that ends before the host's last frame throws `sealed_truncated`. A record that does not describe the bytes you sent and received, names another model, or fails its signatures throws `sealed_record_mismatch`.
 
-Token counts on a sealed record come from the attested host, since the router cannot read the request. The VM signs them with a key that never leaves it, and the router and this client both check that signature. A record that bills more than the VM signed for throws `sealed_counts_mismatch`. The router also checks ciphertext length against those counts and flags outliers. `verifyUsage` cannot recount a sealed record, and it does not see the VM's signature, which comes with the stream.
+Token counts on a sealed record come from the attested host, since the router cannot read the request. The VM signs them with a key that never leaves it, and the router and this client both check that signature. A record that bills more than the VM signed for throws `sealed_counts_mismatch`. The router also checks ciphertext length against those counts and flags outliers. A record above `maxPrice` throws `over_max_price`, on a stream too, when the stream ends. On a channel the voucher waits for all of these, so a sealed reply you do not read to the end, or one that fails any check, is not signed for. `verifyUsage` cannot recount a sealed record, and it does not see the VM's signature, which comes with the stream.
 
 ## Honest limits
 

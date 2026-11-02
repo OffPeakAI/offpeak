@@ -9,7 +9,7 @@ import { ChannelManagerAbi, HostRegistryAbi, addressOf } from "../../abis/src/in
 import { addChannel, ask, BASE, bootRouter, buyerAccount, chainView, channelRow, client, inProcess, type Booted } from "../../sdk/test/support.ts"
 import { anvilAccount } from "../../shared/src/test-keys.ts"
 import { decodeFunctionData, encodeFunctionResult } from "viem"
-import { clientFrom, createMcp, readConfig, serveHttp } from "../src/index.ts"
+import { Budget, clientFrom, createMcp, readConfig, serveHttp } from "../src/index.ts"
 import { nextHours } from "../src/tools/prices.ts"
 
 const AGENT_KEY = `0x${Buffer.from(anvilAccount(3).getHdKey().privateKey!).toString("hex")}`
@@ -144,7 +144,7 @@ describe("offpeak_complete", () => {
       return send(input, init)
     }) as typeof fetch
     const config = readConfig({ OFFPEAK_PUBLIC_BASE_URL: BASE, OFFPEAK_AGENT_WALLET_KEY: AGENT_KEY, OFFPEAK_CHANNEL_ID: id, OFFPEAK_RPC_URL: "http://rpc.test", OFFPEAK_DEPLOYMENT_FILE: DEPLOYMENT_FILE })
-    const mcp = await connected(clientFrom(config, recording, chainView(booted)))
+    const mcp = await connected(clientFrom(config, new Budget(), recording, chainView(booted)))
     const first = await call(mcp, "offpeak_complete", complete)
     const second = await call(mcp, "offpeak_complete", { ...complete, messages: [{ role: "user", content: "again" }] })
     expect(first.body.usage.record.payMode).toBe(3)
@@ -362,7 +362,7 @@ describe("configuration", () => {
 
   test("an all-zero key is refused without printing it", () => {
     const config = readConfig({ ...good, OFFPEAK_AGENT_WALLET_KEY: `0x${"0".repeat(64)}` })
-    expect(() => clientFrom(config)).toThrow("not a usable key")
+    expect(() => clientFrom(config, new Budget())).toThrow("not a usable key")
   })
 
   test("refuses to run beside a service key", () => {
@@ -375,6 +375,12 @@ describe("configuration", () => {
     expect(() => readConfig({ ...good, OFFPEAK_AGENT_WALLET_KEY: AGENT_KEY, OFFPEAK_CHANNEL_ID: id, OFFPEAK_CHANNEL_DEPOSIT: "1" })).toThrow("not both")
     expect(() => readConfig({ ...good, OFFPEAK_AGENT_WALLET_KEY: AGENT_KEY, OFFPEAK_CHANNEL_DEPOSIT: "1000000" })).toThrow("OFFPEAK_RPC_URL")
     expect(() => readConfig({ ...good, OFFPEAK_AGENT_WALLET_KEY: AGENT_KEY, OFFPEAK_CHANNEL_ID: id })).toThrow("OFFPEAK_RPC_URL")
+  })
+
+  test("a deposit needs a state file, so a restart cannot fund a second channel", () => {
+    const base = { ...good, OFFPEAK_AGENT_WALLET_KEY: AGENT_KEY, OFFPEAK_CHANNEL_DEPOSIT: "1000000", OFFPEAK_RPC_URL: "http://rpc.test" }
+    expect(() => readConfig(base)).toThrow("OFFPEAK_CHANNEL_STATE_FILE")
+    expect(readConfig({ ...base, OFFPEAK_CHANNEL_STATE_FILE: "/run/offpeak/channel.json" }).OFFPEAK_CHANNEL_DEPOSIT).toBe("1000000")
   })
 
   test("a restart states both halves of what it signed, or neither", () => {

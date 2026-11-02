@@ -4,10 +4,10 @@ import { bytesToHex, hexToBytes, keccak256, type Hex } from "viem"
 import { z } from "zod"
 import { OffpeakError, addressSchema, bytes32Schema, errorFrom, nowSeconds, type ClientContext } from "../core.ts"
 import { SseParser } from "../sse.ts"
-import { envelopeSchema } from "../verify.ts"
+import { assertWithinCap, capFrom, envelopeSchema, type MaxPrice } from "../verify.ts"
 import { ZERO_NONCE, attestReplySchema, checkTranscript, countsSignedBy, dcapVerify, gpuVerify, measurementSchema, quotesAllowed, sealedCountsSchema, transcriptSchema, type Measurement, type Transcript } from "./attest.ts"
 import { HPKE_CONTENT_TYPE, SEALED_PATH, publicKeyFrom, sealRequest } from "./hpke.ts"
-import { openResponse, type OpenedResponse } from "./stream.ts"
+import { SealedGate, openResponse, type OpenedResponse } from "./stream.ts"
 
 const DEFAULT_MAX_TOKENS = 4096
 
@@ -60,11 +60,11 @@ const sealedParams = z.looseObject({ model: z.string().min(1), messages: z.array
 
 export type SealedResult = { id: string; text: string; toolCalls?: ToolCall[]; finishReason: string | null; envelope: UsageEnvelope; host: string; price: string | null }
 
-type ToolCall = { id: string; type: string; function: { name: string; arguments: string } }
+export type ToolCall = { id: string; type: string; function: { name: string; arguments: string } }
 type ToolDelta = { index?: number; id?: string; type?: string; function?: { name?: string; arguments?: string } }
-type EngineChunk = { id?: string; choices?: { delta?: { content?: string | null; tool_calls?: ToolDelta[] }; finish_reason?: string | null }[] }
+export type EngineChunk = { id?: string; choices?: { delta?: { content?: string | null; tool_calls?: ToolDelta[] }; finish_reason?: string | null }[] }
 
-const addTool = (calls: ToolCall[], delta: ToolDelta) => {
+export const addTool = (calls: ToolCall[], delta: ToolDelta) => {
   const call = (calls[delta.index ?? calls.length] ??= { id: "", type: "function", function: { name: "", arguments: "" } })
   if (delta.id) call.id = delta.id
   if (delta.type) call.type = delta.type
@@ -86,6 +86,8 @@ export class SealedStream implements AsyncIterable<Record<string, unknown>> {
     private request: { bytes: Uint8Array; enc: Uint8Array; secret: Uint8Array },
     private host: SealedHost,
     private verify: ClientContext["verify"],
+    private gate: SealedGate,
+    private cap?: MaxPrice,
   ) {}
 
   async *[Symbol.asyncIterator]() {
@@ -93,15 +95,19 @@ export class SealedStream implements AsyncIterable<Record<string, unknown>> {
     this.consumed = true
     const parser = new SseParser()
     let opened: OpenedResponse | null = null
-    for await (const plaintext of openResponse(this.res.body!, this.request.secret, this.request.enc, (result) => (opened = result))) {
-      for (const event of parser.push(plaintext)) {
-        if (event.data === "[DONE]") continue
-        const chunk = JSON.parse(event.data) as EngineChunk
-        this.absorb(chunk)
-        yield chunk as Record<string, unknown>
+    try {
+      for await (const plaintext of openResponse(this.res.body!, this.request.secret, this.request.enc, (result) => (opened = result))) {
+        for (const event of parser.push(plaintext)) {
+          if (event.data === "[DONE]") continue
+          const chunk = JSON.parse(event.data) as EngineChunk
+          this.absorb(chunk)
+          yield chunk as Record<string, unknown>
+        }
       }
+      await this.close(opened!)
+    } finally {
+      await this.gate.release(this.envelope ?? undefined)
     }
-    await this.close(opened!)
   }
 
   private absorb(chunk: EngineChunk) {
@@ -131,6 +137,7 @@ export class SealedStream implements AsyncIterable<Record<string, unknown>> {
     const signed = counted?.reqId === record.reqId && counted.promptHash === promptHash && counted.outputHash === outputHash && (await countsSignedBy(counted, this.host.transcript.bindings.countsSigner))
     const billable = signed && record.tokensIn <= counted.tokensIn && record.tokensOut <= counted.tokensOut && hostCounts.tokensIn === counted.tokensIn && hostCounts.tokensOut === counted.tokensOut
     if (!billable) throw new OffpeakError("sealed_counts_mismatch", "The VM did not sign these counts")
+    assertWithinCap(parsed.data, this.cap)
     this.envelope = parsed.data
   }
 
@@ -156,7 +163,7 @@ export class SealedClient {
     private ctx: ClientContext,
     options: SealedOptions | undefined,
     /** The client's own paid dispatch, which handles keys, channels and `upto`. */
-    private send: (url: string, init: RequestInit) => Promise<Response>,
+    private send: (url: string, init: RequestInit, gate?: SealedGate) => Promise<Response>,
   ) {
     this.options = optionsSchema.parse(options ?? {})
     // A client that never touches sealed needs none of this, so with no options the refusal waits for first use.
@@ -271,13 +278,18 @@ export class SealedClient {
     const plaintext = new TextEncoder().encode(JSON.stringify({ ...rest, stream: true, max_tokens: maxTokens }))
     const publicKey = await publicKeyFrom(hexToBytes(host.hpkePublicKey))
     const request = await sealRequest(publicKey, plaintext, SEALED_PATH, Date.now())
-    const res = await this.send(`${this.ctx.baseURL}${SEALED_PATH}`, {
-      method: "POST",
-      headers: { ...opts.headers, "content-type": HPKE_CONTENT_TYPE, "x-offpeak-model": body.model, "x-offpeak-max-tokens": String(maxTokens), "x-offpeak-sealed-host": host.host },
-      body: request.bytes,
-    })
+    const gate = new SealedGate()
+    const res = await this.send(
+      `${this.ctx.baseURL}${SEALED_PATH}`,
+      {
+        method: "POST",
+        headers: { ...opts.headers, "content-type": HPKE_CONTENT_TYPE, "x-offpeak-model": body.model, "x-offpeak-max-tokens": String(maxTokens), "x-offpeak-sealed-host": host.host },
+        body: request.bytes,
+      },
+      gate,
+    )
     if (!res.ok) throw await errorFrom(res)
-    return new SealedStream(res, request, host, this.ctx.verify)
+    return new SealedStream(res, request, host, this.ctx.verify, gate, capFrom(new Headers(opts.headers)))
   }
 
   /** Encrypts on this machine, sends only ciphertext, and decrypts the reply as it arrives. */
