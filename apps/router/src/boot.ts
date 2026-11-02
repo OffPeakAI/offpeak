@@ -23,7 +23,7 @@ import { LoadMeter } from "./pricing/load.ts"
 import { loadSheets } from "./pricing/sheets.ts"
 import { writeHostStats } from "./pricing/stats.ts"
 import { AttestBook, readAttestConfig, sweepAttestations } from "./routing/attest.ts"
-import { loadEndpoints, probeHosts } from "./routing/probes.ts"
+import { hostFetch, loadEndpoints, probeHosts } from "./routing/probes.ts"
 import { openDb } from "./store.ts"
 
 const PROBE_EVERY_MS = 10_000
@@ -84,7 +84,7 @@ export async function bootRouter(source: NodeJS.ProcessEnv = process.env) {
     hosts: {
       request: (_host, endpoint, path, init) => {
         if (!endpoint) throw new Error("host has no endpoint")
-        return fetch(`${endpoint}${path}`, init)
+        return hostFetch(env.OFFPEAK_ENV === "mainnet", endpoint, path, init)
       },
     },
     models,
