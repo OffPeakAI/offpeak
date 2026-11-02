@@ -32,6 +32,7 @@ contract UsageLedger is IUsageLedger, EIP712, Ownable2Step {
     function setVault(address vault_) external onlyOwner {
         if (vault != address(0)) revert AlreadySet();
         vault = vault_;
+        emit VaultSet(vault_);
     }
 
     function setRouterSigner(address next) external onlyOwner {

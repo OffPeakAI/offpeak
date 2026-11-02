@@ -33,6 +33,7 @@ interface IHostRegistry {
     event CreditsClawedBack(address indexed host, uint64 indexed hour, uint128 amount, bytes32 reason);
     event CreditsWithdrawn(address indexed host, uint256 amount);
     event GpuClassSet(bytes32 indexed gpuClass, bool allowed);
+    event PeersSet(address vault, address windowMarket, address auditCourt, address feeSplitter);
 
     function register(RegisterParams calldata p) external;
     function updateServing(

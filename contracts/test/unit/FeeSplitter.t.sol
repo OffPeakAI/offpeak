@@ -5,6 +5,7 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {FeeSplitter} from "../../src/FeeSplitter.sol";
 import {IFeeSplitter} from "../../src/interfaces/IFeeSplitter.sol";
+import {IHostRegistry} from "../../src/interfaces/IHostRegistry.sol";
 import "../../src/interfaces/OffpeakTypes.sol";
 import {ThresholdSig} from "../../src/lib/ThresholdSig.sol";
 import {Typehashes} from "../../src/lib/Typehashes.sol";
@@ -234,6 +235,18 @@ contract FeeSplitterTest is VaultFixture {
         vm.prank(owner);
         vm.expectRevert(FeeSplitter.AlreadySet.selector);
         splitter.setPeers(address(1), address(2));
+    }
+
+    function test_setPeersEmits() public {
+        FeeSplitter fresh = new FeeSplitter(owner, IERC20(address(usdg)), IHostRegistry(address(registry)), ops, treasury);
+        vm.startPrank(owner);
+        vm.expectEmit(address(fresh));
+        emit IFeeSplitter.PeersSet(address(1), address(0));
+        fresh.setPeers(address(1), address(0));
+        vm.expectEmit(address(fresh));
+        emit IFeeSplitter.PeersSet(address(1), address(2));
+        fresh.setPeers(address(0), address(2));
+        vm.stopPrank();
     }
 
     function testFuzz_distributeAccountsForEveryUnit(uint128 amount, bool hooksOn) public {
