@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { OffpeakVaultAbi } from "@offpeak/abis"
 import { applySchemas, openDatabase, storeSignature, type Db } from "@offpeak/common"
-import { emptyTotals, totalsHashOf } from "@offpeak/shared"
+import { agentPaymentsHash, emptyTotals, totalsHashOf } from "@offpeak/shared"
 import { concat, encodeFunctionData, type Hex, type LocalAccount } from "viem"
 import { roleAccount } from "../../../packages/shared/src/test-keys.ts"
 import { batchHashOf } from "../../settlement/src/build.ts"
@@ -155,15 +155,15 @@ describe("the outcome of a landed settlement", () => {
     hour: BigInt(HOUR),
     root: ROOT,
     totalsHash: totalsHashOf(emptyTotals()),
-    debits: [],
-    credits: [],
-    windowDraws: [],
+    debits: [{ buyer: BUYER, amount: 5_000_000n, lastTs: 1_800_000_000n }],
+    credits: [{ host: HOST, amount: 5_000_000n }],
+    windowDraws: [{ windowId: 1n, holder: BUYER, tokens: 300n }],
     fees: 0n,
     agentPoolDraw: 0n,
     reserveDraw: 0n,
-    agentPaymentsHash: testHash("payments"),
+    agentPaymentsHash: agentPaymentsHash([PAYMENT]),
   })
-  const outcome = (payments: Record<string, unknown>) => ({ b: { root: ROOT, totalsHash: totalsHashOf(emptyTotals()) }, t: {}, rejects: [], payments })
+  const outcome = (payments: Record<string, unknown>) => ({ b: landedBatch(), t: {}, rejects: [], payments })
   const drawn = outcome({ drawn: [PAYMENT], writtenOff: [] })
 
   async function scenario(rows: (db: Db, hash: Hex) => Promise<void>, pair = [lowest, middle]) {
@@ -210,7 +210,7 @@ describe("the outcome of a landed settlement", () => {
 
   test("a forged row for the landed hash is ignored", async () => {
     const { drawnHour, refunds } = await scenario(async (db, hash) => {
-      await storeSignature(db, "settle", HOUR, lowest.address, hash, "0x00", outcome({ drawn: [], writtenOff: [], refunds: [REFUND] }))
+      await storeSignature(db, "settle", HOUR, lowest.address, hash, "0x00", outcome({ drawn: [PAYMENT], writtenOff: [], refunds: [REFUND] }))
       await honest(middle, hash, db)
     })
     expect(Number(await drawnHour())).toBe(HOUR)
@@ -219,10 +219,33 @@ describe("the outcome of a landed settlement", () => {
 
   test("a row from a signer the vault did not accept is ignored", async () => {
     const { drawnHour, refunds } = await scenario(async (db, hash) => {
-      await honest(highest, hash, db, outcome({ drawn: [], writtenOff: [], refunds: [REFUND] }))
+      await honest(highest, hash, db, outcome({ drawn: [PAYMENT], writtenOff: [], refunds: [REFUND] }))
     })
     expect(await drawnHour()).toBeNull()
     expect(await refunds()).toBe(0)
+  })
+
+  test("a true signature over false payments is ignored, whichever row sorts first", async () => {
+    const { drawnHour } = await scenario(async (db, hash) => {
+      await honest(lowest, hash, db, outcome({ drawn: [], writtenOff: [] }))
+      await honest(middle, hash, db)
+    })
+    expect(Number(await drawnHour())).toBe(HOUR)
+  })
+
+  test("a true signature over a different batch is ignored", async () => {
+    const { drawnHour } = await scenario(async (db, hash) => {
+      await honest(lowest, hash, db, { ...drawn, b: { ...landedBatch(), fees: 1n } })
+      await honest(middle, hash, db, { ...drawn, b: { ...landedBatch(), fees: 1n } })
+    })
+    expect(await drawnHour()).toBeNull()
+  })
+
+  test("a row with no batch in it is ignored", async () => {
+    const { drawnHour } = await scenario(async (db, hash) => {
+      await honest(lowest, hash, db, { rejects: [], payments: { drawn: [PAYMENT], writtenOff: [] } })
+    })
+    expect(await drawnHour()).toBeNull()
   })
 
   test("one signer re-signing after the landing leaves the other's row to stand", async () => {

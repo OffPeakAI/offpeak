@@ -1,11 +1,12 @@
 import { agreedSignatures, log, type Db, type SigRow } from "@offpeak/common"
-import { hourIndex } from "@offpeak/shared"
-import { recoverAddress, type Address, type Hex } from "viem"
+import { agentPaymentsHash, domain, hourIndex, settleTypes } from "@offpeak/shared"
+import { hashTypedData, recoverAddress, type Address, type Hex } from "viem"
 import type { ChainEvent } from "./index.ts"
 
 const addr = (v: unknown) => String(v).toLowerCase()
 
 type StoredOutcome = {
+  b?: { vault: Address; chainId: string; agentPaymentsHash: Hex }
   rejects?: { reqId: string; reason: string }[]
   payments?: {
     drawn: string[]
@@ -20,9 +21,20 @@ async function touchBuyer(tx: Db, buyer: string) {
   await tx.query("INSERT INTO chain.buyers (address) VALUES ($1) ON CONFLICT DO NOTHING", [buyer])
 }
 
+/** A signature covers the batch hash, not the JSON stored beside it, so the JSON has to hash back to that batch. */
+function hashesToBatch(row: SigRow) {
+  try {
+    const { b, payments } = row.batch as StoredOutcome
+    const hash = hashTypedData({ domain: domain("OffpeakSettlement", b!.vault, Number(b!.chainId)), types: settleTypes, primaryType: "SettleBatch", message: b as never })
+    return hash === row.batch_hash && agentPaymentsHash([...payments!.drawn, ...payments!.writtenOff]) === b!.agentPaymentsHash
+  } catch {
+    return false
+  }
+}
+
 /**
- * What landed, from the rows for the landed hash whose signatures hold. Both signers normally agree. One
- * may have re-signed since, which replaces its row, so the other's row alone still stands for the batch.
+ * What landed, from the rows for the landed hash whose signatures hold and whose JSON is that batch. Both signers
+ * normally agree. One may have re-signed since, which replaces its row, so the other's row alone still stands for it.
  */
 async function landedOutcome(tx: Db, e: ChainEvent) {
   const { hour, batchHash, signers } = e.args as { hour: unknown; batchHash?: Hex; signers?: Address[] }
@@ -30,9 +42,10 @@ async function landedOutcome(tx: Db, e: ChainEvent) {
     ? await tx.query<SigRow>("SELECT signer, batch_hash, sig, batch FROM chain.settlement_sigs WHERE kind = 'settle' AND hour = $1 AND batch_hash = $2", [hour, batchHash])
     : { rows: [] }
   const accepted = signers ?? []
-  const agreed = await agreedSignatures(rows.rows, accepted)
+  const genuine = rows.rows.filter(hashesToBatch)
+  const agreed = await agreedSignatures(genuine, accepted)
   if (agreed) return agreed.batch as StoredOutcome
-  for (const row of rows.rows) {
+  for (const row of genuine) {
     if (!accepted.some((signer) => addr(signer) === row.signer)) continue
     const recovered = await recoverAddress({ hash: row.batch_hash, signature: row.sig }).catch(() => null)
     if (recovered?.toLowerCase() === row.signer) return row.batch as StoredOutcome
