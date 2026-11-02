@@ -14,7 +14,7 @@ import { serveUsageList, usageRecord } from "./offpeak/usage.ts"
 import { windowBoard, windowCalldata } from "./offpeak/windows.ts"
 import { openDispute } from "./offpeak/disputes.ts"
 import { serviceStatus } from "./offpeak/status.ts"
-import { channelView, closeChannel } from "./offpeak/channels.ts"
+import { closeChannel, payerChannelView } from "./offpeak/channels.ts"
 import { sealedHostsView } from "./routing/attest.ts"
 import { channelId, voucherBody } from "./pay/schemas.ts"
 import { registerCalldata, rememberHost } from "./hosts-api/register.ts"
@@ -132,11 +132,7 @@ export function createApp(stack: Stack) {
     if (!wallet) return c.json({ error: { message: "Sign in first", type: "auth", code: "no_session" } }, 401)
     return c.json(await issueKey(stack, wallet))
   })
-  app.get("/v1/channels/:id", async (c) => {
-    const row = await channelView(stack, c.req.param("id"))
-    if (!row) return c.json({ error: { message: "Not found", type: "invalid_request", code: "not_found" } }, 404)
-    return c.json(row)
-  })
+  app.get("/v1/channels/:id", (c) => payerChannelView(stack, c.req.param("id"), c.req.header("x-offpeak-channel-auth")))
   app.post("/v1/hosts/register", async (c) => {
     const body = await c.req.json()
     const remembered = await rememberHost(stack, body)

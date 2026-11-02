@@ -1,8 +1,10 @@
 import { ChannelManagerAbi } from "@offpeak/abis"
 import { CHAIN_ID, coopCloseTypes, domain, signTyped, type Hex } from "@offpeak/shared"
 import { encodeFunctionData } from "viem"
+import { parseProof } from "../auth/keys.ts"
+import { channelProof } from "../pay/authorize.ts"
 import { freezeForClose, keepRouterSig, readChannel } from "../pay/channel-store.ts"
-import { closeBody } from "../pay/schemas.ts"
+import { channelId, closeBody } from "../pay/schemas.ts"
 import { verifyTyped } from "../pay/signatures.ts"
 import type { Stack } from "../pipeline.ts"
 import { oai } from "../http.ts"
@@ -21,6 +23,17 @@ export async function channelView(stack: Stack, id: string) {
     expiry: chain.expiry.toString(),
     closing: local.closeFinal !== null || local.frozenUntil > stack.clock(),
   }
+}
+
+/** What is owed tells anyone what a payer spends, so only the payer reads it. The proof signs an empty body. */
+export async function payerChannelView(stack: Stack, raw: string, proof: string | undefined) {
+  const id = channelId.safeParse(raw)
+  const chain = id.success ? await stack.indexer.channel(id.data) : null
+  if (!id.success || !chain) return oai(404, "Not found", "invalid_request", "not_found")
+  const proved = await channelProof(stack, chain, id.data, parseProof(proof ?? null), "")
+  if (proved === "unavailable") return oai(503, "Could not check the wallet's signature", "server_error", "verify_unavailable")
+  if (proved === "bad") return oai(401, "Channel request is not signed by the payer", "auth", "bad_channel_auth")
+  return Response.json(await channelView(stack, id.data))
 }
 
 /**

@@ -87,7 +87,7 @@ export async function applyVoucher(stack: Stack, ch: ChannelChain, channelId: He
 }
 
 /** A channel id is public, so every request proves the payer sent it. */
-async function channelProof(stack: Stack, ch: ChannelChain, channelId: Hex, proof: { ts: number; nonce: string; sig: Hex } | undefined, rawBody: string): Promise<SigVerdict> {
+export async function channelProof(stack: Stack, ch: ChannelChain, channelId: Hex, proof: { ts: number; nonce: string; sig: Hex } | undefined, rawBody: string): Promise<SigVerdict> {
   if (!proof || Math.abs(stack.clock() - proof.ts) > CHANNEL_PROOF_WINDOW_S) return "bad"
   const message = channelAuthMessage({ channelId, ts: proof.ts, nonce: proof.nonce, bodyHash: keccak256(toBytes(rawBody)) })
   const signed = await verifyPersonal(stack, ch.payer, message, proof.sig)

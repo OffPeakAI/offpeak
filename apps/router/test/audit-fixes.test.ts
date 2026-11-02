@@ -159,3 +159,42 @@ describe("x402 payment ids", () => {
     expect((await records(booted)).rows.length).toBe(before + 1)
   })
 })
+
+describe("reading a channel", () => {
+  const read = (booted: Booted, headers: Record<string, string> = {}) => booted.app.request(`/v1/channels/${channelId}`, { headers })
+
+  test("what is owed is not public", async () => {
+    const booted = await bootStack()
+    openChannel(booted)
+    await owedOnChannel(booted)
+    const res = await read(booted)
+    expect(res.status).toBe(401)
+    expect(await errorCode(res)).toBe("bad_channel_auth")
+  })
+
+  test("a stranger's proof and a proof signed over a body are refused, and neither can be replayed", async () => {
+    const booted = await bootStack()
+    openChannel(booted)
+    const stranger = await channelAuthHeader(roleAccount("settlerB"), { channelId, ts: booted.stack.clock(), body: "" })
+    expect((await read(booted, { "x-offpeak-channel-auth": stranger })).status).toBe(401)
+    const other = await channelAuthHeader(buyer, { channelId, ts: booted.stack.clock(), body: "{}" })
+    expect((await read(booted, { "x-offpeak-channel-auth": other })).status).toBe(401)
+    const once = await channelAuthHeader(buyer, { channelId, ts: booted.stack.clock(), body: "" })
+    expect((await read(booted, { "x-offpeak-channel-auth": once })).status).toBe(200)
+    expect((await read(booted, { "x-offpeak-channel-auth": once })).status).toBe(401)
+  })
+
+  test("the payer reads it", async () => {
+    const booted = await bootStack()
+    openChannel(booted)
+    const owed = await owedOnChannel(booted)
+    const res = await read(booted, { "x-offpeak-channel-auth": await channelAuthHeader(buyer, { channelId, ts: booted.stack.clock(), body: "" }) })
+    expect(res.status).toBe(200)
+    expect(((await res.json()) as { owed: string }).owed).toBe(owed.toString())
+  })
+
+  test("an unknown channel is still not found", async () => {
+    const booted = await bootStack()
+    expect((await read(booted)).status).toBe(404)
+  })
+})

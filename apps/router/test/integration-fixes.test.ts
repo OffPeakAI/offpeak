@@ -301,7 +301,10 @@ describe("channel view", () => {
     const booted = await bootStack()
     const id = keccak256(toBytes("view-channel"))
     booted.indexer.channels.set(id, { payer: booted.buyer as Hex, deposit: 50_000_000n, claimed: 0n, lastSeq: 0n, expiry: BigInt(booted.stack.clock() + 86_400), challengeEndsAt: 0n, status: 1, closeRequested: false })
-    const view = async () => (await (await booted.app.request(`/v1/channels/${id}`)).json()) as { cumulative: string; owed: string }
+    const view = async () => {
+      const proof = await channelAuthHeader(roleAccount("buyer"), { channelId: id, ts: booted.stack.clock(), body: "" })
+      return (await (await booted.app.request(`/v1/channels/${id}`, { headers: { "x-offpeak-channel-auth": proof } })).json()) as { cumulative: string; owed: string }
+    }
     expect(await view()).toMatchObject({ cumulative: "0", owed: "0" })
     const body = JSON.stringify(chatBody())
     const auth = await channelAuthHeader(roleAccount("buyer"), { channelId: id, ts: booted.stack.clock(), body })
