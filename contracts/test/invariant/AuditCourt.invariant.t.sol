@@ -17,6 +17,7 @@ contract AuditCourtInvariant is StdInvariant, Test {
         court = AuditCourt(handler.courtAddress());
         registry = HostRegistry(handler.registryAddress());
         targetContract(address(handler));
+        excludeSender(address(handler));
     }
 
     /// Bonds only ever fall by the amounts the mirror applied, so a full slash needs a panel Confirm.
