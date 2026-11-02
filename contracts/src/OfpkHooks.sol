@@ -14,6 +14,7 @@ import {IOfpkHooks} from "./interfaces/IOfpkHooks.sol";
 contract OfpkHooks is IOfpkHooks, Ownable2Step, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
 
+    error BonusTooHigh(uint256 bonus);
     error HooksDisabled();
     error NothingToUnlock();
     error StillCoolingDown(uint64 availableAt);
@@ -30,6 +31,8 @@ contract OfpkHooks is IOfpkHooks, Ownable2Step, ReentrancyGuardTransient {
 
     uint256 public constant COOLDOWN = 7 days;
     uint16 public constant MAX_ROUTING_BONUS_BPS = 2_500;
+    /// One bps per whole $OFPK. Keeps `routingBonusBps` from overflowing on any bond, so it can never start reverting.
+    uint256 public constant MAX_BONUS_PER_OFPK = 1e18;
     /// `FEE_BPS_DEFAULT` less `FEE_BPS_MIN`: a discount can never take the fee below the floor.
     uint16 public constant MAX_DISCOUNT_BPS = 300;
     uint256 public constant TIERS = 4;
@@ -60,9 +63,12 @@ contract OfpkHooks is IOfpkHooks, Ownable2Step, ReentrancyGuardTransient {
         }
         tierThresholds = thresholds;
         tierDiscountBps = discountBps;
+        emit TiersChanged(thresholds, discountBps);
     }
 
     function setBonusPerOfpk(uint256 bonus) external onlyOwner {
+        if (bonus > MAX_BONUS_PER_OFPK) revert BonusTooHigh(bonus);
+        emit BonusPerOfpkChanged(bonusPerOfpk, bonus);
         bonusPerOfpk = bonus;
     }
 

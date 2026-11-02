@@ -552,6 +552,19 @@ export const UsageLedgerAbi = [
     "anonymous": false
   },
   {
+    "type": "event",
+    "name": "VaultSet",
+    "inputs": [
+      {
+        "name": "vault",
+        "type": "address",
+        "indexed": false,
+        "internalType": "address"
+      }
+    ],
+    "anonymous": false
+  },
+  {
     "type": "error",
     "name": "AlreadySet",
     "inputs": []

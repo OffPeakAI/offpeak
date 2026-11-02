@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {stdJson} from "forge-std/StdJson.sol";
 import {HostRegistry} from "../../src/HostRegistry.sol";
 import {IHostRegistry} from "../../src/interfaces/IHostRegistry.sol";
@@ -791,6 +792,18 @@ contract HostRegistryTest is VaultFixture {
         vm.prank(owner);
         vm.expectRevert(HostRegistry.AlreadySet.selector);
         registry.setPeers(address(1), address(2), address(3), address(4));
+    }
+
+    function test_setPeersEmits() public {
+        HostRegistry fresh = new HostRegistry(owner, IERC20(address(usdg)), IERC20(address(ofpk)), guardian, treasury);
+        vm.startPrank(owner);
+        vm.expectEmit(address(fresh));
+        emit IHostRegistry.PeersSet(address(1), address(0), address(0), address(0));
+        fresh.setPeers(address(1), address(0), address(0), address(0));
+        vm.expectEmit(address(fresh));
+        emit IHostRegistry.PeersSet(address(1), address(2), address(3), address(4));
+        fresh.setPeers(address(0), address(2), address(3), address(4));
+        vm.stopPrank();
     }
 
     // Helpers

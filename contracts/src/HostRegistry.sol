@@ -119,6 +119,7 @@ contract HostRegistry is IHostRegistry, EIP712, Ownable2Step, ReentrancyGuardTra
         windowMarket = _once(windowMarket, windowMarket_);
         auditCourt = _once(auditCourt, auditCourt_);
         feeSplitter = _once(feeSplitter, feeSplitter_);
+        emit PeersSet(vault, windowMarket, auditCourt, feeSplitter);
     }
 
     /// Peers arrive with their launch phase. Each can be set once; zero leaves a slot for later.

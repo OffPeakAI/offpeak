@@ -78,6 +78,14 @@ contract UsageLedgerTest is Test {
         ledger.setVault(makeAddr("other"));
     }
 
+    function test_setVaultEmits() public {
+        UsageLedger fresh = new UsageLedger(owner, makeAddr("router"));
+        vm.expectEmit(address(fresh));
+        emit IUsageLedger.VaultSet(vault);
+        vm.prank(owner);
+        fresh.setVault(vault);
+    }
+
     function test_setRouterSignerIsOwnerOnly() public {
         address next = makeAddr("next");
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));

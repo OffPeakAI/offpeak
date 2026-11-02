@@ -23,6 +23,7 @@ interface IOffpeakVault {
     event SignersChanged(address[3] oldSigners, address[3] newSigners);
     event GuardianChanged(address oldGuardian, address newGuardian);
     event BetaCapDisabled();
+    event PeersSet(address windowMarket, address feeSplitter, address x402Escrow, address channelManager);
 
     function deposit(uint256 amount) external;
     function depositWithPermit2(ISignatureTransfer.PermitTransferFrom calldata p, bytes calldata sig) external;

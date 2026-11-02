@@ -858,10 +858,14 @@ contract OffpeakVaultTest is VaultFixture {
             guardian
         );
         vm.startPrank(owner);
+        vm.expectEmit(address(fresh));
+        emit IOffpeakVault.PeersSet(address(0), address(2), address(0), address(0));
         fresh.setPeers(address(0), address(2), address(0), address(0));
         assertEq(address(fresh.feeSplitter()), address(2));
         assertEq(fresh.x402Escrow(), address(0));
 
+        vm.expectEmit(address(fresh));
+        emit IOffpeakVault.PeersSet(address(0), address(2), address(3), address(4));
         fresh.setPeers(address(0), address(0), address(3), address(4));
         assertEq(fresh.x402Escrow(), address(3));
         assertEq(fresh.channelManager(), address(4));

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import {Vm} from "forge-std/Vm.sol";
 import {X402Escrow} from "../../src/X402Escrow.sol";
 import {ISignatureTransfer} from "../../src/interfaces/ISignatureTransfer.sol";
 import {IX402Escrow} from "../../src/interfaces/IX402Escrow.sol";
@@ -17,6 +18,22 @@ contract GasBurningWallet {
     function isValidSignature(bytes32, bytes calldata) external pure returns (bytes4) {
         while (true) {}
         return 0x1626ba7e;
+    }
+}
+
+contract ReturnBombWallet {
+    uint256 internal immutable _size;
+
+    constructor(MockUSDG usdg, uint256 size) {
+        _size = size;
+        usdg.approve(0x000000000022D473030F116dDEE9F6B43aC78BA3, type(uint256).max);
+    }
+
+    function isValidSignature(bytes32, bytes calldata) external view returns (bytes4) {
+        uint256 size = _size;
+        assembly ("memory-safe") {
+            revert(0, size)
+        }
     }
 }
 
@@ -185,6 +202,44 @@ contract X402EscrowTest is AgentFixture {
         assertEq(x402.escrowView(keccak256("a")).status, 1);
         assertEq(x402.escrowView(keccak256("b")).status, 0);
         assertEq(x402.escrowView(keccak256("c")).status, 1);
+    }
+
+    function test_hugeRevertDataSinksOnlyItsOwnItem() public {
+        AuthorizeCall[] memory calls = new AuthorizeCall[](20);
+        for (uint256 i; i < 19; ++i) {
+            address wallet = address(new ReturnBombWallet(usdg, 120_000));
+            usdg.mint(wallet, MAX);
+            calls[i].p = _permit(MAX);
+            calls[i].w = _upto(keccak256(abi.encode("bomb", i)), MAX);
+            calls[i].payer = wallet;
+            calls[i].sig = hex"00";
+        }
+        calls[19] = _authorizeCall(REQ, MAX);
+
+        vm.recordLogs();
+        vm.prank(relay);
+        (bool ok,) = address(x402).call{gas: 32_000_000}(abi.encodeCall(x402.authorizeBatch, (calls)));
+        assertTrue(ok);
+        assertEq(x402.escrowView(REQ).status, x402.STATUS_AUTHORIZED());
+
+        uint256 failed;
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].topics[0] != IX402Escrow.AuthorizeFailed.selector) continue;
+            assertEq(abi.decode(logs[i].data, (bytes)).length, 68);
+            ++failed;
+        }
+        assertEq(failed, 19);
+    }
+
+    function test_aFailedItemStillReportsItsReason() public {
+        AuthorizeCall[] memory calls = new AuthorizeCall[](1);
+        calls[0] = _authorizeCall(REQ, MAX);
+        calls[0].p.permitted.amount = MAX - 1;
+        vm.expectEmit(address(x402));
+        emit IX402Escrow.AuthorizeFailed(REQ, abi.encodeWithSelector(X402Escrow.WrongPermit.selector));
+        vm.prank(relay);
+        x402.authorizeBatch(calls);
     }
 
     function test_aFrozenPayerCannotHoldUpACapture() public {

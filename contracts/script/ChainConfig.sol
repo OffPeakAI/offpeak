@@ -19,6 +19,12 @@ import {DeployCore} from "./DeployCore.sol";
 abstract contract ChainConfig is Script, DeployCore {
     using stdJson for string;
 
+    /// Field order is alphabetical, which is how forge decodes a JSON object.
+    struct ImmutableRef {
+        uint256 length;
+        uint256 start;
+    }
+
     /// `deploy:rehearse` points these at throwaway files so the real ones stay untouched.
     function _configPath() internal view returns (string memory) {
         return vm.envOr("OFFPEAK_CHAIN_CONFIG", string("config/chains/4663.json"));
@@ -74,6 +80,70 @@ abstract contract ChainConfig is Script, DeployCore {
         string memory json = vm.readFile(_deploymentPath());
         m.hooks = OfpkHooks(json.readAddress(".contracts.OfpkHooks"));
         m.windows = WindowMarket(json.readAddress(".contracts.WindowMarket"));
+    }
+
+    /// `DeployCore` imports WindowMarket, so what it deploys is the compact build wherever a contract has both.
+    function _artifact(string memory name) private view returns (string memory) {
+        string memory base = string.concat("out/", name, ".sol/", name);
+        string memory compact = string.concat(base, ".compact.json");
+        return vm.readFile(vm.exists(compact) ? compact : string.concat(base, ".json"));
+    }
+
+    /// Cuts the CBOR trailer, whose last two bytes give its length. It can change with no change to the code.
+    function _withoutMetadata(bytes memory code) private pure returns (bytes memory) {
+        if (code.length < 2) return code;
+        uint256 size = (uint256(uint8(code[code.length - 2])) << 8 | uint8(code[code.length - 1])) + 2;
+        if (size > code.length) return code;
+        assembly ("memory-safe") {
+            mstore(code, sub(mload(code), size))
+        }
+        return code;
+    }
+
+    function _zeroImmutables(bytes memory code, string memory artifact) private view {
+        string memory root = ".deployedBytecode.immutableReferences";
+        if (!vm.keyExistsJson(artifact, root)) return;
+        string[] memory ids = vm.parseJsonKeys(artifact, root);
+        for (uint256 i; i < ids.length; ++i) {
+            ImmutableRef[] memory refs = abi.decode(vm.parseJson(artifact, string.concat(root, ".", ids[i])), (ImmutableRef[]));
+            for (uint256 j; j < refs.length; ++j) {
+                for (uint256 k; k < refs[j].length; ++k) {
+                    code[refs[j].start + k] = 0;
+                }
+            }
+        }
+    }
+
+    /// Compares deployed code with the local build. Immutables differ per deployment, so they are zeroed in both,
+    /// and `_verify` checks the public ones by value.
+    function _verifyCode(string memory name, address deployed) internal view {
+        string memory artifact = _artifact(name);
+        bytes memory actual = _withoutMetadata(deployed.code);
+        bytes memory expected = _withoutMetadata(artifact.readBytes(".deployedBytecode.object"));
+        if (actual.length == expected.length) {
+            _zeroImmutables(actual, artifact);
+            _zeroImmutables(expected, artifact);
+        }
+        if (keccak256(actual) != keccak256(expected)) revert CodeMismatch(name, keccak256(actual), keccak256(expected));
+    }
+
+    function _verifyCoreCode(Core memory d, TimelockController timelock) internal view {
+        string[5] memory names = ["UsageLedger", "HostRegistry", "OffpeakVault", "AuditCourt", "FeeSplitter"];
+        address[5] memory owned = _owned(d);
+        for (uint256 i; i < owned.length; ++i) {
+            _verifyCode(names[i], owned[i]);
+        }
+        _verifyCode("TimelockController", address(timelock));
+    }
+
+    function _verifyPaymentsCode(Payments memory p) internal view {
+        _verifyCode("X402Escrow", address(p.escrow));
+        _verifyCode("ChannelManager", address(p.channels));
+    }
+
+    function _verifyMarketsCode(Markets memory m) internal view {
+        _verifyCode("OfpkHooks", address(m.hooks));
+        _verifyCode("WindowMarket", address(m.windows));
     }
 
     function _proposalPath(string memory phase) internal view returns (string memory) {

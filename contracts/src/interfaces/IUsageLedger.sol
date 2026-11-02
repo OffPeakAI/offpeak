@@ -6,6 +6,7 @@ import "./OffpeakTypes.sol";
 interface IUsageLedger {
     event RootPosted(uint64 indexed hour, bytes32 root, bytes32 totalsHash, uint32 records);
     event RouterSignerChanged(address oldSigner, address newSigner);
+    event VaultSet(address vault);
 
     function postRoot(uint64 hour, bytes32 root, bytes32 totalsHash, uint32 records) external;
     function rootOf(uint64 hour) external view returns (bytes32 root, bytes32 totalsHash);

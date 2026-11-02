@@ -11,6 +11,7 @@ interface IFeeSplitter {
     event TokenHooksChanged(bool enabled);
     event SwapAdapterChanged(address adapter);
     event BurnKeeperChanged(address keeper);
+    event PeersSet(address vault, address windowMarket);
 
     function tokenHooksEnabled() external view returns (bool);
     function notify(uint256 amount) external;

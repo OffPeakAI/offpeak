@@ -33,6 +33,7 @@ abstract contract DeployCore {
     error BadChain(uint256 chainId);
     error BadPermit2CodeHash(bytes32 actual, bytes32 expected);
     error BadUsdg(string reason);
+    error CodeMismatch(string name, bytes32 actual, bytes32 expected);
     error PanelOverlap(address owner);
     error PanelNotASafe(address panel);
     error RoleMissing(string role);
@@ -275,17 +276,23 @@ abstract contract DeployCore {
         _require(address(d.vault.feeSplitter()) == address(d.splitter), "vault.feeSplitter");
         _require(d.ledger.vault() == address(d.vault), "ledger.vault");
         _require(d.ledger.routerSigner() == c.routerSigner, "ledger.routerSigner");
+        _require(address(d.registry.usdg()) == c.usdg, "registry.usdg");
+        _require(address(d.registry.ofpk()) == c.ofpk, "registry.ofpk");
         _require(d.registry.vault() == address(d.vault), "registry.vault");
         _require(d.registry.auditCourt() == address(d.court), "registry.auditCourt");
         _require(d.registry.feeSplitter() == address(d.splitter), "registry.feeSplitter");
         _require(d.registry.guardian() == c.guardian, "registry.guardian");
         _require(d.registry.treasury() == c.treasury, "registry.treasury");
+        _require(address(d.splitter.usdg()) == c.usdg, "splitter.usdg");
+        _require(address(d.splitter.registry()) == address(d.registry), "splitter.registry");
         _require(address(d.splitter.vault()) == address(d.vault), "splitter.vault");
         _require(d.splitter.treasury() == c.treasury, "splitter.treasury");
         _require(d.splitter.opsWallet() == c.opsWallet, "splitter.opsWallet");
+        _require(address(d.court.usdg()) == c.usdg, "court.usdg");
         _require(address(d.court.vault()) == address(d.vault), "court.vault");
         _require(address(d.court.registry()) == address(d.registry), "court.registry");
         _require(d.court.panel() == c.panel, "court.panel");
+        _require(d.court.treasury() == c.treasury, "court.treasury");
     }
 
     function _verifySigners(Core memory d, Config memory c) private view {

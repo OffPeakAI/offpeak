@@ -71,6 +71,7 @@ contract FeeSplitter is IFeeSplitter, Ownable2Step, ReentrancyGuardTransient {
             if (windowMarket != address(0)) revert AlreadySet();
             windowMarket = windowMarket_;
         }
+        emit PeersSet(address(vault), windowMarket);
     }
 
     function setTokenHooksEnabled(bool enabled) external onlyOwner {

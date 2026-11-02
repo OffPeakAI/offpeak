@@ -585,6 +585,25 @@ export const FeeSplitterAbi = [
   },
   {
     "type": "event",
+    "name": "PeersSet",
+    "inputs": [
+      {
+        "name": "vault",
+        "type": "address",
+        "indexed": false,
+        "internalType": "address"
+      },
+      {
+        "name": "windowMarket",
+        "type": "address",
+        "indexed": false,
+        "internalType": "address"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "RewardsDistributed",
     "inputs": [
       {

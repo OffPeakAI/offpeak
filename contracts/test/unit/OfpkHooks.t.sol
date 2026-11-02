@@ -166,13 +166,44 @@ contract OfpkHooksTest is WindowFixture {
         vm.stopPrank();
     }
 
+    function test_theBonusIsOwnerOnlyAndBounded() public {
+        uint256 max = hooks.MAX_BONUS_PER_OFPK();
+        vm.prank(alice);
+        vm.expectRevert();
+        hooks.setBonusPerOfpk(1);
+
+        vm.startPrank(owner);
+        vm.expectRevert(abi.encodeWithSelector(OfpkHooks.BonusTooHigh.selector, max + 1));
+        hooks.setBonusPerOfpk(max + 1);
+        hooks.setBonusPerOfpk(0);
+        assertEq(hooks.bonusPerOfpk(), 0);
+        hooks.setBonusPerOfpk(max);
+        assertEq(hooks.bonusPerOfpk(), max);
+        vm.stopPrank();
+    }
+
+    function test_settingsEmit() public {
+        uint256[3] memory thresholds = [uint256(1), 2, 3];
+        uint16[4] memory discounts = [uint16(0), 1, 2, 3];
+        vm.startPrank(owner);
+        vm.expectEmit(address(hooks));
+        emit IOfpkHooks.TiersChanged(thresholds, discounts);
+        hooks.setTiers(thresholds, discounts);
+
+        vm.expectEmit(address(hooks));
+        emit IOfpkHooks.BonusPerOfpkChanged(1e15, 2e15);
+        hooks.setBonusPerOfpk(2e15);
+        vm.stopPrank();
+    }
+
     function test_theRoutingBonusIsCapped() public {
         _setUpWindows();
         assertEq(hooks.routingBonusBps(host), 0);
         _on();
         assertEq(hooks.routingBonusBps(host), 0);
+        uint256 maxBonus = hooks.MAX_BONUS_PER_OFPK();
         vm.prank(owner);
-        hooks.setBonusPerOfpk(type(uint128).max);
+        hooks.setBonusPerOfpk(maxBonus);
         ofpk.mint(host, 1e30);
         vm.startPrank(host);
         ofpk.approve(address(registry), type(uint256).max);

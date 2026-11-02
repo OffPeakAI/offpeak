@@ -122,6 +122,7 @@ contract OffpeakVault is IOffpeakVault, EIP712, Ownable2Step, ReentrancyGuardTra
         feeSplitter = IFeeSplitter(_once(address(feeSplitter), feeSplitter_));
         x402Escrow = _once(x402Escrow, x402Escrow_);
         channelManager = _once(channelManager, channelManager_);
+        emit PeersSet(address(windowMarket), address(feeSplitter), x402Escrow, channelManager);
     }
 
     /// Peers arrive with their launch phase. Each can be set once; zero leaves a slot for later.

@@ -41,6 +41,19 @@ export const OfpkHooksAbi = [
   },
   {
     "type": "function",
+    "name": "MAX_BONUS_PER_OFPK",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "MAX_DISCOUNT_BPS",
     "inputs": [],
     "outputs": [
@@ -392,6 +405,25 @@ export const OfpkHooksAbi = [
   },
   {
     "type": "event",
+    "name": "BonusPerOfpkChanged",
+    "inputs": [
+      {
+        "name": "oldBonus",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      },
+      {
+        "name": "newBonus",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "Locked",
     "inputs": [
       {
@@ -455,6 +487,25 @@ export const OfpkHooksAbi = [
   },
   {
     "type": "event",
+    "name": "TiersChanged",
+    "inputs": [
+      {
+        "name": "thresholds",
+        "type": "uint256[3]",
+        "indexed": false,
+        "internalType": "uint256[3]"
+      },
+      {
+        "name": "discountBps",
+        "type": "uint16[4]",
+        "indexed": false,
+        "internalType": "uint16[4]"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "UnlockRequested",
     "inputs": [
       {
@@ -496,6 +547,17 @@ export const OfpkHooksAbi = [
       }
     ],
     "anonymous": false
+  },
+  {
+    "type": "error",
+    "name": "BonusTooHigh",
+    "inputs": [
+      {
+        "name": "bonus",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
   },
   {
     "type": "error",
