@@ -43,6 +43,8 @@ contract X402Escrow is IX402Escrow, ReentrancyGuardTransient {
     uint256 public constant MIN_ITEM_GAS = 350_000;
     /// Each item runs on this much, so a contract wallet that burns gas sinks only itself.
     uint256 public constant ITEM_GAS = 300_000;
+    /// A selector and two words: all of a custom error here, and the head of any other reason.
+    uint256 internal constant MAX_REASON_BYTES = 68;
 
     IERC20 public immutable usdg;
     ISignatureTransfer public immutable permit2;
@@ -85,9 +87,7 @@ contract X402Escrow is IX402Escrow, ReentrancyGuardTransient {
         if (calls.length > MAX_BATCH) revert BatchTooLarge(calls.length, MAX_BATCH);
         for (uint256 i; i < calls.length; ++i) {
             if (gasleft() < MIN_ITEM_GAS) revert NotEnoughGasForItem(i);
-            try this.authorizeOne{gas: ITEM_GAS}(calls[i]) {} catch (bytes memory reason) {
-                emit AuthorizeFailed(calls[i].w.reqId, reason);
-            }
+            _authorizeItem(calls[i]);
         }
     }
 
@@ -175,6 +175,25 @@ contract X402Escrow is IX402Escrow, ReentrancyGuardTransient {
             sig
         );
         emit Authorized(w.reqId, payer, w.maxAmount, w.validBefore);
+    }
+
+    /// ITEM_GAS caps the call, not what this frame pays to copy and log the revert data, so that is cut short here.
+    /// Memory is handed back after each item, so its cost does not grow with the batch.
+    function _authorizeItem(AuthorizeCall calldata item) private {
+        bytes memory data = abi.encodeCall(this.authorizeOne, (item));
+        bytes memory reason = new bytes(MAX_REASON_BYTES);
+        bool ok;
+        assembly ("memory-safe") {
+            ok := call(ITEM_GAS, address(), 0, add(data, 0x20), mload(data), 0, 0)
+            let size := returndatasize()
+            if gt(size, MAX_REASON_BYTES) { size := MAX_REASON_BYTES }
+            returndatacopy(add(reason, 0x20), 0, size)
+            mstore(reason, size)
+        }
+        if (!ok) emit AuthorizeFailed(item.w.reqId, reason);
+        assembly ("memory-safe") {
+            mstore(0x40, data)
+        }
     }
 
     function _capture(bytes32 reqId, uint256 actual) private {
