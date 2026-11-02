@@ -2,9 +2,12 @@ import { domain, hourIndex, leafFor, recordToMessage, recoverUsageSigner, serial
 import type { PayHold, Payer, Stack } from "../context.ts"
 import { queueCapture } from "../pay/captures.ts"
 import { noteChannel } from "../pay/channel-store.ts"
+import { boundedText } from "../routing/dispatch.ts"
 import { captureTx } from "../store.ts"
 
 const SIGN_TIMEOUT_MS = 10_000
+/** A signature and two counts. */
+const MAX_SIGN_REPLY_BYTES = 16 * 1024
 
 export type Commit = {
   stack: Stack
@@ -48,7 +51,7 @@ export async function commitRecord(commit: Commit) {
     body: JSON.stringify({ record: serializeRecord(record), routerSig, partial }),
     signal: AbortSignal.timeout(SIGN_TIMEOUT_MS),
   })
-  const signBody = (await signed.json()) as { hostSig: Hex; hostCounts: { tokensIn: number; tokensOut: number }; reason?: string }
+  const signBody = JSON.parse(await boundedText(signed, MAX_SIGN_REPLY_BYTES)) as { hostSig: Hex; hostCounts: { tokensIn: number; tokensOut: number }; reason?: string }
   if (!signed.ok) return { refused: signBody.reason ?? "sign_refused", hostCounts: signBody.hostCounts ?? {} }
   // Settlement drops a record the host did not sign, so one stored here would be billed and never debited.
   const signer = await recoverUsageSigner(recordToMessage(record), signBody.hostSig, stack.usageLedger).catch(() => "")

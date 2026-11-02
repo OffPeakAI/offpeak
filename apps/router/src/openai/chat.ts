@@ -343,10 +343,10 @@ function streamResponse(ctx: Ctx, opened: Opened, priced: Priced, entered: numbe
 async function jsonResponse(ctx: Ctx, opened: Opened, priced: Priced, headers: Record<string, string>) {
   const { stack, reqId, started, modelName, pay } = ctx
   const output = emptyAssembly()
-  meterWindow(ctx, opened.first, absorb(output, opened.first))
   const limit = setTimeout(() => opened.abort(), requestLimitMs())
   let cut = false
   try {
+    meterWindow(ctx, opened.first, absorb(output, opened.first))
     for await (const event of opened.events) meterWindow(ctx, event, absorb(output, event))
   } catch {
     cut = true

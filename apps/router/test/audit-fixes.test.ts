@@ -1,9 +1,10 @@
 import { describe, expect, test } from "bun:test"
-import { PERMIT2, channelAuthHeader, channelPaymentId, domain, permitWitnessTypes, voucherTypes } from "@offpeak/shared"
+import { PERMIT2, channelAuthHeader, channelPaymentId, domain, parseRecord, permitWitnessTypes, recordToMessage, signTyped, usageTypes, voucherTypes } from "@offpeak/shared"
 import { keccak256, toBytes, type Hex } from "viem"
 import { roleAccount } from "../../../packages/shared/src/test-keys.ts"
 import { bootStack } from "./support/stack.ts"
 import { uptoHeader } from "./support/upto.ts"
+import { absorb, boundedText, emptyAssembly, hostEvents } from "../src/routing/dispatch.ts"
 
 type Booted = Awaited<ReturnType<typeof bootStack>>
 
@@ -196,5 +197,95 @@ describe("reading a channel", () => {
   test("an unknown channel is still not found", async () => {
     const booted = await bootStack()
     expect((await read(booted)).status).toBe(404)
+  })
+})
+
+describe("host replies", () => {
+  const toolChunk = (index: unknown) => `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index, id: "a", type: "function", function: { name: "f", arguments: "{}" } }] }, finish_reason: null }] })}\n\ndata: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "tool_calls" }] })}\n\ndata: [DONE]\n\n`
+
+  /** A host that sends `reply` and signs whatever it is asked to. */
+  function hostAnswers(booted: Booted, reply: string) {
+    booted.stack.hosts = {
+      request: async (_host, _endpoint, path, init) => {
+        if (path === "/offpeak/v1/chat/completions") return new Response(reply, { status: 200, headers: { "content-type": "text/event-stream" } })
+        const { record } = JSON.parse(String(init?.body))
+        const hostSig = await signTyped(roleAccount("host") as never, { domain: domain("OffpeakUsage", booted.stack.usageLedger), types: usageTypes, primaryType: "UsageRecord", message: recordToMessage(parseRecord(record)) as never })
+        return Response.json({ hostSig, hostCounts: {} })
+      },
+    }
+  }
+
+  const toolEvent = (index: unknown) => ({ choices: [{ delta: { tool_calls: [{ index: index as number, id: "from-host", type: "from-host" }] } }] })
+
+  test("a large index does not grow the assembly", () => {
+    const state = emptyAssembly()
+    expect(() => absorb(state, toolEvent(1 << 25))).toThrow("bad tool call index")
+    expect(() => absorb(state, toolEvent(1))).toThrow("bad tool call index")
+    expect(state.toolCalls.length).toBe(0)
+  })
+
+  test("an index that is not a small integer never reaches the array", () => {
+    for (const index of ["__proto__", "length", -1, 0.5, Number.NaN]) expect(() => absorb(emptyAssembly(), toolEvent(index))).toThrow("bad tool call index")
+    expect(([] as unknown as { id?: string }).id).toBeUndefined()
+  })
+
+  test("tool calls stop at the limit", () => {
+    const state = emptyAssembly()
+    for (let index = 0; index < 128; index += 1) absorb(state, toolEvent(index))
+    expect(state.toolCalls.length).toBe(128)
+    expect(() => absorb(state, toolEvent(128))).toThrow("bad tool call index")
+  })
+
+  test("calls in order fold together", () => {
+    const state = emptyAssembly()
+    absorb(state, { choices: [{ delta: { tool_calls: [{ index: 0, id: "a", function: { name: "f", arguments: "{" } }] } }] })
+    absorb(state, { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: "}" } }] } }] })
+    absorb(state, { choices: [{ delta: { tool_calls: [{ index: 1, id: "b", function: { name: "g", arguments: "{}" } }] } }] })
+    expect(state.toolCalls.map((call) => call.function.arguments)).toEqual(["{}", "{}"])
+  })
+
+  test("a bad index on the first chunk ends the reply without hanging the hold", async () => {
+    const booted = await bootStack()
+    hostAnswers(booted, toolChunk(1 << 25))
+    const started = performance.now()
+    const res = await chat(booted)
+    expect(performance.now() - started).toBeLessThan(2000)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { choices: { finish_reason: string; message: { tool_calls?: unknown[] } }[] }
+    expect(body.choices[0]!.finish_reason).toBe("length")
+    expect(body.choices[0]!.message.tool_calls).toBeUndefined()
+  })
+
+  test("a normal tool call still bills", async () => {
+    const booted = await bootStack()
+    hostAnswers(booted, toolChunk(0))
+    const res = await chat(booted)
+    expect(res.status).toBe(200)
+    expect(((await res.json()) as { choices: { finish_reason: string }[] }).choices[0]!.finish_reason).toBe("tool_calls")
+  })
+
+  test("a stream past the byte limit stops, with no more read", async () => {
+    let sent = 0
+    const huge = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        sent += 1 << 20
+        controller.enqueue(new Uint8Array(1 << 20).fill(32))
+      },
+    })
+    const read = async () => {
+      for await (const _ of hostEvents(new Response(huge))) continue
+    }
+    await expect(read()).rejects.toThrow("too large")
+    expect(sent).toBeLessThanOrEqual(10 << 20)
+  })
+
+  test("a sign reply past its limit is not parsed", async () => {
+    await expect(boundedText(new Response("x".repeat(1024)), 16)).rejects.toThrow("too large")
+    expect(await boundedText(new Response("short"), 16)).toBe("short")
+    const booted = await bootStack()
+    const inner = booted.stack.hosts.request
+    booted.stack.hosts = { request: async (host, endpoint, path, init) => (path === "/offpeak/v1/sign" ? new Response(JSON.stringify({ hostSig: "x".repeat(1 << 20) })) : inner(host, endpoint, path, init)) }
+    expect((await chat(booted)).status).toBe(502)
+    expect((await records(booted)).rows.length).toBe(0)
   })
 })
