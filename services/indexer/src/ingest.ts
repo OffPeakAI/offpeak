@@ -1,6 +1,6 @@
 import { OffpeakVaultAbi, abis } from "@offpeak/abis"
 import { log, type Db, type Metrics } from "@offpeak/common"
-import { decodeEventLog, type Abi, type Address, type Log, type PublicClient } from "viem"
+import { BlockNotFoundError, decodeEventLog, type Abi, type Address, type Log, type PublicClient } from "viem"
 import { applyEvent, type ChainEvent } from "./apply/index.ts"
 
 const CURSOR = "main"
@@ -184,9 +184,9 @@ async function clearDerivedWrites(tx: Db, forkBlock: bigint) {
   await tx.exec("UPDATE chain.vault_state SET last_settled_hour = initial_settled_hour, usage_paused = false, settles_paused = false")
 }
 
-/** Drops events past the fork, rebuilds derived state by replay, and tells consumers. */
+/** Drops events past the fork, rebuilds derived state by replay, and tells consumers. One transaction, so a failed replay undoes the wipe. */
 async function rewind(deps: IngestDeps, forkBlock: bigint) {
-  const events = await deps.db.transaction(async (tx) => {
+  await deps.db.transaction(async (tx) => {
     await clearDerivedWrites(tx, forkBlock)
     await tx.query("DELETE FROM chain.events WHERE block_number > $1", [forkBlock])
     for (const table of ["buyers", "hosts", "host_models", "host_status_log", "host_credits", "settlements", "roots", "refunds_paid", "collections", "signer_sets", "challenges", "channels", "channel_claims", "escrows", "orphan_writeoffs", "swept_payments", "windows", "window_holdings", "listings"]) {
@@ -203,11 +203,9 @@ async function rewind(deps: IngestDeps, forkBlock: bigint) {
       event: string
       args: Record<string, unknown>
     }>("SELECT * FROM chain.events ORDER BY block_number, log_index")
-    return kept.rows
-  })
-  await deps.db.transaction(async (tx) => {
-    for (const row of events) {
-      await applyEvent(tx, {
+    await tx.exec("UPDATE chain.events SET processed = true, error = NULL")
+    for (const row of kept.rows) {
+      await applySafely(deps, tx, {
         txHash: row.tx_hash,
         logIndex: row.log_index,
         blockNumber: BigInt(row.block_number),
@@ -228,7 +226,11 @@ async function findForkBlock(deps: IngestDeps, cursor: bigint) {
     [cursor],
   )
   for (const row of seen.rows) {
-    const block = await deps.reader.getBlock({ blockNumber: BigInt(row.block_number) }).catch(() => null)
+    // A block the node does not have is past the fork. Any other failure says nothing about the chain.
+    const block = await deps.reader.getBlock({ blockNumber: BigInt(row.block_number) }).catch((err) => {
+      if (err instanceof BlockNotFoundError) return null
+      throw err
+    })
     if (block?.hash === row.block_hash) return BigInt(row.block_number)
   }
   return 0n
@@ -242,8 +244,9 @@ export async function tick(deps: IngestDeps, state: IngestState): Promise<bigint
   if (!cursor) {
     await seedVaultState(deps, 0n)
   } else {
-    const onChain = await deps.reader.getBlock({ blockNumber: cursor.block }).catch(() => null)
-    if (onChain?.hash !== cursor.hash) {
+    // Only a block with another hash proves a fork. A failed read throws, and the next tick looks again.
+    const onChain = await deps.reader.getBlock({ blockNumber: cursor.block })
+    if (onChain.hash !== cursor.hash) {
       await rewind(deps, await findForkBlock(deps, cursor.block))
       // Whatever survives the fork comes through again from the rewound cursor, so nothing is held back.
       state.fastLaned.clear()

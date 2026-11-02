@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS chain.hosts (
 CREATE TABLE IF NOT EXISTS chain.host_models (
   host    text NOT NULL,
   digest  text NOT NULL,
-  max_tps integer NOT NULL,
+  max_tps bigint NOT NULL,
   PRIMARY KEY (host, digest)
 );
 
@@ -160,7 +160,7 @@ CREATE TABLE IF NOT EXISTS chain.challenges (
   evidence_hash  text NOT NULL,
   model_digest   text,
   samples_root   text,
-  sample_count   integer,
+  sample_count   bigint,
   test_id        text,
   statistic      numeric(78,0),
   threshold      numeric(78,0),
@@ -282,3 +282,14 @@ CREATE TABLE IF NOT EXISTS chain.listings (
   units          numeric(78,0) NOT NULL,
   price_per_unit numeric(78,0) NOT NULL
 );
+
+-- Both come from uint32 event fields. Changed here as well as above, so a database from an earlier step upgrades on boot.
+DO $$
+BEGIN
+  IF EXISTS (SELECT FROM information_schema.columns WHERE table_schema = 'chain' AND table_name = 'challenges' AND column_name = 'sample_count' AND data_type = 'integer') THEN
+    ALTER TABLE chain.challenges ALTER COLUMN sample_count TYPE bigint;
+  END IF;
+  IF EXISTS (SELECT FROM information_schema.columns WHERE table_schema = 'chain' AND table_name = 'host_models' AND column_name = 'max_tps' AND data_type = 'integer') THEN
+    ALTER TABLE chain.host_models ALTER COLUMN max_tps TYPE bigint;
+  END IF;
+END $$;
