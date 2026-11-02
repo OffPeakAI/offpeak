@@ -21,17 +21,17 @@ export type ChallengeRow = {
   id: string
   host: string
   kind: number
-  samples_root: string
-  sample_count: number
-  test_id: string
-  statistic: string
-  threshold: string
+  samples_root: string | null
+  sample_count: number | null
+  test_id: string | null
+  statistic: string | null
+  threshold: string | null
   filed_at: string
   filed_block: string
   response_hash: string | null
 }
 
-export async function loadBundle(db: Db, samplesRoot: string): Promise<EvidenceBundle | null> {
+export async function loadBundle(db: Db, samplesRoot: string | null): Promise<EvidenceBundle | null> {
   const rows = await db.query<{ body: EvidenceBundle }>("SELECT body FROM shared.evidence_bundles WHERE samples_root = $1", [samplesRoot])
   return rows.rows[0]?.body ?? null
 }
@@ -52,15 +52,16 @@ export async function leavesProven(deps: Pick<RulingDeps, "db" | "reader" | "con
   return true
 }
 
+/** An evidence event that never applied leaves these NULL. With no root there is no bundle, so the ruling dismisses. */
 export function factsOf(row: ChallengeRow): ChallengeFacts {
   return {
     host: row.host,
     kind: Number(row.kind),
-    samplesRoot: row.samples_root,
-    sampleCount: Number(row.sample_count),
-    testId: row.test_id,
-    statistic: BigInt(row.statistic),
-    threshold: BigInt(row.threshold),
+    samplesRoot: row.samples_root ?? "",
+    sampleCount: Number(row.sample_count ?? 0),
+    testId: row.test_id ?? "",
+    statistic: BigInt(row.statistic ?? 0),
+    threshold: BigInt(row.threshold ?? 0),
   }
 }
 
@@ -134,12 +135,18 @@ export async function rulingTick(deps: RulingDeps) {
   )
   const results: { id: number; reason: string; submitted: unknown }[] = []
   for (const row of ready.rows) {
-    const decision = await signRuling(deps, row)
-    const submitted = await trySubmit(deps, Number(row.id)).catch((err) => {
-      log("rulings", "submit_retry", { id: row.id, error: String(err).slice(0, 200) })
-      return "retry"
-    })
-    results.push({ id: Number(row.id), reason: decision.reason, submitted })
+    try {
+      const decision = await signRuling(deps, row)
+      const submitted = await trySubmit(deps, Number(row.id)).catch((err) => {
+        log("rulings", "submit_retry", { id: row.id, error: String(err).slice(0, 200) })
+        return "retry"
+      })
+      results.push({ id: Number(row.id), reason: decision.reason, submitted })
+    } catch (err) {
+      // One challenge that cannot be ruled must not hold back the ones after it.
+      log("rulings", "ruling_failed", { id: row.id, error: String(err).slice(0, 200) })
+      results.push({ id: Number(row.id), reason: "ruling_failed", submitted: "retry" })
+    }
   }
   return results
 }
