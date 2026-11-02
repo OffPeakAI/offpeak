@@ -468,11 +468,10 @@ describe("IC4", () => {
     const good = keccak256(toBytes("batch-good"))
     const bad = keccak256(toBytes("batch-bad"))
     const goodPayment = await signPayment(good, 2_000n)
-    const badPayment = await signPayment(bad, 2_001n)
+    // Both pass verify on the same Permit2 nonce, the way a racing wallet would, so the second burns in the batch.
+    const badPayment = await signPayment(bad, 2_000n)
     expect(await facilitatorCall("/x402/verify", { paymentPayload: goodPayment, paymentRequirements: requirements() })).toMatchObject({ isValid: true })
     expect(await facilitatorCall("/x402/verify", { paymentPayload: badPayment, paymentRequirements: requirements() })).toMatchObject({ isValid: true })
-    // The nonce burns between verify and the batch landing, the way a racing wallet would.
-    badPayment.payload.signature = goodPayment.payload.signature
     await facilitatorCall("/x402/settle", { paymentPayload: goodPayment, mode: "authorize" })
     await facilitatorCall("/x402/settle", { paymentPayload: badPayment, mode: "authorize" })
     await until(async () => (await escrowOf(good)).status === 1, "the good escrow")
