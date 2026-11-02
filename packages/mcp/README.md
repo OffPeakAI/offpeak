@@ -56,7 +56,7 @@ Use an API key, an agent wallet, or both.
 
 With a wallet, set `OFFPEAK_CHANNEL_ID` to use an open channel, or `OFFPEAK_CHANNEL_DEPOSIT`, `OFFPEAK_CHANNEL_STATE_FILE` and `OFFPEAK_RPC_URL` to open one on the first call. The state file keeps the channel's id, so a restart reuses it and funds a new one only once that channel has closed or is about to expire. A start that cannot read the file, or cannot read the channel it names, stops rather than deposit again. Give each running server its own file. With neither, and no API key, a call pays by `upto`, which needs a Permit2 approval and has a 1 USDG limit per call. The router offers `upto` only from 0.05 USDG, so most single calls need a channel or a key. A channel wins over an API key when both are set.
 
-A voucher is signed only for what verified usage records cover. Each record must match the prompt sent and the output received, fit that request's `max_tokens`, and carry a time from while it ran. If the records do not add up, `offpeak_complete` shows the reason in `channel.voucher_problem` and no voucher is signed, so the router's credit limit stops further spend. On restart, an existing channel starts from the last voucher you kept, and the router's `owed` past that is not signed, because no record you hold covers it. `OFFPEAK_CHANNEL_STATE_FILE` also keeps the ids of counted records, so none is paid for twice across a restart.
+A voucher is signed only for what verified usage records cover. Each record must match the prompt sent and the output received, recount with the model's tokenizer, bill no more input tokens than the request could hold, fit that request's `max_tokens`, and carry a time from while it ran. A deployment that publishes no tokenizer gets no voucher unless you set `OFFPEAK_CHANNEL_PAY_UNCOUNTED=true`. If the records do not add up, `offpeak_complete` shows the reason in `channel.voucher_problem` and no voucher is signed, so the router's credit limit stops further spend. On restart, an existing channel starts from the last voucher you kept, and the router's `owed` past that is not signed, because no record you hold covers it. `OFFPEAK_CHANNEL_STATE_FILE` also keeps the ids of counted records, so none is paid for twice across a restart.
 
 These tools do not close a channel. Use `op.channels.close()` from `@offpeak/sdk`.
 
@@ -75,6 +75,7 @@ These tools do not close a channel. Use `op.channels.close()` from `@offpeak/sdk
 | `OFFPEAK_CHANNEL_DEPOSIT` | no | µUSDG to deposit when opening one |
 | `OFFPEAK_CHANNEL_EXPIRY_S` | no | That channel's lifetime in seconds |
 | `OFFPEAK_CHANNEL_STATE_FILE` | with a deposit | Path this server keeps its channel in. With `OFFPEAK_CHANNEL_ID` it replaces `OFFPEAK_CHANNEL_SEQ` and `OFFPEAK_CHANNEL_CUMULATIVE` |
+| `OFFPEAK_CHANNEL_PAY_UNCOUNTED` | no | `true` signs vouchers for a model with no published tokenizer, leaving its token counts unchecked |
 | `OFFPEAK_CALL_CAP_MICRO` | no | Most one tool call can cost, in µUSDG. Default `1000000` |
 | `OFFPEAK_DAY_CAP_MICRO` | no | Most these tools spend in a UTC day, in µUSDG. Default `10000000` |
 | `OFFPEAK_MAX_PRICE` | no | Default and highest `max_price`, as `in=<usd>,out=<usd>`. Default `in=1,out=4` |

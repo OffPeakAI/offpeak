@@ -41,7 +41,7 @@ These come from [`docs/launch/security-review.md`](docs/launch/security-review.m
 ### Contracts, P1 and P2
 
 - **Challenge griefing.** Any challenge blocks a host's credit withdrawals and exit. Holding one open costs about 50 USDG per cycle, or nothing if the rulers stay silent for 14 days, because a timeout gives the whole bond back. The build doc sets those amounts.
-- **USDG pauses.** A pause longer than 2 hours can make a voucher miss its challenge. See [`docs/runbooks/usdg-freeze.md`](docs/runbooks/usdg-freeze.md).
+- **USDG pauses.** A pause longer than 2 hours can make a voucher miss its challenge. One that outlasts an escrow's 15 minute grace can make a capture miss its window, so the payer keeps the money and the host is paid from the reserve after 24 hours. See [`docs/runbooks/usdg-freeze.md`](docs/runbooks/usdg-freeze.md).
 - **Settler keys.** Two of three can understate a buyer's `lastTs` inside the request hour, and new settlers take effect after the 48 hour timelock. Buyers can leave in 2 hours, so that delay is enough for them.
 - **Stray transfers.** USDG sent directly to a contract stays there. There is deliberately no owner function that could move it.
 

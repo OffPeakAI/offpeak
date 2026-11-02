@@ -143,7 +143,7 @@ describe("offpeak_complete", () => {
       outgoing.push(String(input), JSON.stringify([...new Headers(init?.headers).entries()]), String(init?.body ?? ""))
       return send(input, init)
     }) as typeof fetch
-    const config = readConfig({ OFFPEAK_PUBLIC_BASE_URL: BASE, OFFPEAK_AGENT_WALLET_KEY: AGENT_KEY, OFFPEAK_CHANNEL_ID: id, OFFPEAK_RPC_URL: "http://rpc.test", OFFPEAK_DEPLOYMENT_FILE: DEPLOYMENT_FILE })
+    const config = readConfig({ OFFPEAK_PUBLIC_BASE_URL: BASE, OFFPEAK_AGENT_WALLET_KEY: AGENT_KEY, OFFPEAK_CHANNEL_ID: id, OFFPEAK_CHANNEL_PAY_UNCOUNTED: "true", OFFPEAK_RPC_URL: "http://rpc.test", OFFPEAK_DEPLOYMENT_FILE: DEPLOYMENT_FILE })
     const mcp = await connected(clientFrom(config, new Budget(), recording, chainView(booted)))
     const first = await call(mcp, "offpeak_complete", complete)
     const second = await call(mcp, "offpeak_complete", { ...complete, messages: [{ role: "user", content: "again" }] })
@@ -414,7 +414,7 @@ describe("transports", () => {
     const transport = new StdioClientTransport({
       command: "bun",
       args: ["run", MAIN],
-      env: { PATH: process.env.PATH!, OFFPEAK_PUBLIC_BASE_URL: routerUrl, OFFPEAK_AGENT_WALLET_KEY: AGENT_KEY, OFFPEAK_CHANNEL_ID: id, OFFPEAK_RPC_URL: `http://127.0.0.1:${rpc.port}`, OFFPEAK_DEPLOYMENT_FILE: DEPLOYMENT_FILE },
+      env: { PATH: process.env.PATH!, OFFPEAK_PUBLIC_BASE_URL: routerUrl, OFFPEAK_AGENT_WALLET_KEY: AGENT_KEY, OFFPEAK_CHANNEL_ID: id, OFFPEAK_CHANNEL_PAY_UNCOUNTED: "true", OFFPEAK_RPC_URL: `http://127.0.0.1:${rpc.port}`, OFFPEAK_DEPLOYMENT_FILE: DEPLOYMENT_FILE },
       stderr: "pipe",
     })
     const logged: string[] = []

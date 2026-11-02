@@ -169,6 +169,7 @@ async function readOrphans(db: Db, hour: number): Promise<PaymentRow[]> {
 /**
  * A router crash between collecting and writing its row leaves money nothing would draw. After a day
  * it joins fees, the same as a late collection, since the records it paid for wrote off from the reserve.
+ * An unserved `exact` stays in the pool instead, because its refund comes from the reserve either way.
  */
 async function readStranded(db: Db, hour: number): Promise<PaymentRow[]> {
   const rows = await db.query<{ source: string; payer: string; amount: string }>(
@@ -177,6 +178,7 @@ async function readStranded(db: Db, hour: number): Promise<PaymentRow[]> {
      WHERE c.hour <= $1 AND e.captured > 0
        AND NOT EXISTS (SELECT 1 FROM shared.agent_payments p WHERE p.payment_id = e.req_id)
        AND NOT EXISTS (SELECT 1 FROM chain.swept_payments s WHERE s.source = e.req_id)
+       AND NOT EXISTS (SELECT 1 FROM shared.refunds r WHERE r.id = 'exact-unserved:' || e.req_id)
      UNION ALL
      SELECT c.channel_id, c.payer, c.claimed - rowed.total - swept.total
      FROM chain.channels c

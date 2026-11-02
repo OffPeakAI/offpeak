@@ -185,11 +185,11 @@ describe("buildBatch", () => {
     expect(built.writtenOff).toHaveLength(1)
   })
 
-  test("a payment that paid for an excluded record draws in full and refunds the difference", async () => {
+  test("a payment that paid for an excluded record draws what it owes and refunds the difference", async () => {
     const paid = { ...payment("a", 100n), amountMicro: 130n }
     const built = await buildBatch(input([], { payments: [paid] }))
-    expect(built.b.agentPoolDraw).toBe(130n)
-    expect(built.b.fees).toBe(31n)
+    expect(built.b.agentPoolDraw).toBe(100n)
+    expect(built.b.fees).toBe(1n)
     expect(built.b.credits).toEqual([{ host: hostAddress as Hex, amount: 99n }])
     expect(built.refunds).toEqual([
       { id: `agent-excess:${paid.paymentId}`, payer: buyer as Hex, amount: 30n, reason: "excluded_record", reqIds: ["a"] },
@@ -206,7 +206,8 @@ describe("buildBatch", () => {
     const built = await buildBatch(input([bad], { payments: [paid] }))
     expect(built.rejects.map((r) => r.reqId)).toEqual([bad.req_id])
     expect(built.b.credits).toEqual([])
-    expect(built.b.agentPoolDraw).toBe(500n)
+    expect(built.b.agentPoolDraw).toBe(0n)
+    expect(built.b.fees).toBe(0n)
     expect(built.refunds[0]!.amount).toBe(500n)
   })
 

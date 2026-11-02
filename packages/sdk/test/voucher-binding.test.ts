@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test"
 import { mkdtempSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { buyerRefOf, domain, feeMicro, hostChatBody, hostCostMicro, leafFor, outputHashOf, outputLimit, promptHashOf, recordToMessage, serializeEnvelope, signTyped, usageTypes, type Hex, type UsageRecord } from "../../shared/src/index.ts"
+import { buyerRefOf, domain, feeMicro, hostChatBody, hostCostMicro, leafFor, loadModelTokenizer, manifestDigest, outputHashOf, outputLimit, promptHashOf, readManifest, recordToMessage, serializeEnvelope, signTyped, usageTypes, type Hex, type UsageRecord } from "../../shared/src/index.ts"
 import { roleAccount } from "../../shared/src/test-keys.ts"
 import { fileChannelStore, type ChatResult, type ChatStream } from "../src/index.ts"
 import { addChannel, ask, bootRouter, buyerAccount, channelRow, client, costOf, inProcess, type Booted } from "./support.ts"
@@ -168,6 +168,77 @@ describe("a voucher answers one request", () => {
     await Bun.sleep(20)
     expect(op.channels.snapshot()!.refused).toBeNull()
     expect(await channelRow(booted, id)).toEqual({ seq: 2n, cumulative: costOf(first.envelope) + costOf(second.envelope) })
+  })
+})
+
+describe("a router that withholds the tokenizer", () => {
+  const TOKENS_IN = 40_000_000
+  /** Signed by router and host, hashes right, one output token, and 40M input tokens on a 2-word question. */
+  async function withheld(booted: Booted, id: Hex, body: ReturnType<typeof ask>, tokensIn: number) {
+    const host = hostCostMicro(tokensIn, 1, 104_000n, 416_000n)
+    const { env, total } = await forged(booted, id, { ...hashesFor(body, "hi"), tokensIn, tokensOut: 1, hostCostMicro: host, feeMicro: feeMicro(host, 400) })
+    const { fetcher, vouchers } = compromised(booted, () => ({ envelope: env, owed: total }))
+    const blind = (async (input: RequestInfo | URL, init?: RequestInit) => (String(input).includes("/v1/tokenizers/") ? Response.json({ context_length: 8192, tokenizer: null }) : fetcher(input, init))) as typeof fetch
+    return { blind, vouchers, total }
+  }
+
+  async function paid(payUncounted: boolean, tokensIn: number) {
+    const booted = await bootRouter()
+    const id = addChannel(booted, 5n * USDG)
+    const body = ask("short question", 8)
+    const { blind, vouchers, total } = await withheld(booted, id, body, tokensIn)
+    const op = client(booted, { fetch: blind, channel: { payUncounted } })
+    await op.channels.attach(id)
+    await op.chat(body, { maxPrice: { inPerM: 200_000n, outPerM: 800_000n } })
+    await Bun.sleep(20)
+    return { vouchers, total, refused: op.channels.snapshot()!.refused }
+  }
+
+  test("gets no voucher for the 4.33 USDG forgery", async () => {
+    const { vouchers, total, refused } = await paid(false, TOKENS_IN)
+    expect(total).toBeGreaterThan(4n * USDG)
+    expect(vouchers).toEqual([])
+    expect(refused).toContain("token_count_not_checked")
+  })
+
+  test("gets no voucher for an honest record either, unless the caller opts out", async () => {
+    const { vouchers, refused } = await paid(false, 10)
+    expect(vouchers).toEqual([])
+    expect(refused).toContain("token_count_not_checked")
+  })
+
+  test("an honest record pays with no opt-out once the tokenizer is published", async () => {
+    const booted = await bootRouter()
+    const id = addChannel(booted, 5n * USDG)
+    const dir = new URL("../../shared/fixtures/tokenizers/qwen2.5-0.5b-instruct/", import.meta.url).pathname
+    const manifest = readManifest(`${dir}manifest.json`)
+    const modelDigest = manifestDigest(manifest) as Hex
+    booted.indexer.hosts.get(booted.host.toLowerCase() as Hex)!.models.push({ digest: modelDigest } as never)
+    const files = Object.fromEntries(["tokenizer.json", "tokenizer_config.json"].map((path) => [path, readFileSync(join(dir, path), "utf8")]))
+    const body = ask("short question", 8)
+    const tokensIn = loadModelTokenizer(manifest, dir).countChat(body as never)
+    const host = hostCostMicro(tokensIn, 1, 104_000n, 416_000n)
+    const { env, total } = await forged(booted, id, { ...hashesFor(body, "hi"), modelDigest, tokensIn, tokensOut: 1, hostCostMicro: host, feeMicro: feeMicro(host, 400) })
+    const { fetcher, vouchers } = compromised(booted, () => ({ envelope: env, owed: total }))
+    const published = (async (input: RequestInfo | URL, init?: RequestInit) => (String(input).includes("/v1/tokenizers/") ? Response.json({ context_length: 8192, tokenizer: { ...manifest, files } }) : fetcher(input, init))) as typeof fetch
+    const op = client(booted, { fetch: published, channel: { payUncounted: false } })
+    await op.channels.attach(id)
+    await op.chat(body)
+    await Bun.sleep(20)
+    expect(op.channels.snapshot()!.refused).toBeNull()
+    expect(BigInt(vouchers.at(-1)!.cumulative)).toBe(total)
+  })
+
+  test("the opt-out still pays an honest record", async () => {
+    const { vouchers, total, refused } = await paid(true, 10)
+    expect(refused).toBeNull()
+    expect(BigInt(vouchers.at(-1)!.cumulative)).toBe(total)
+  })
+
+  test("the opt-out does not pay for more than the body could hold", async () => {
+    const { vouchers, refused } = await paid(true, TOKENS_IN)
+    expect(vouchers).toEqual([])
+    expect(refused).toContain(`${TOKENS_IN} input tokens`)
   })
 })
 

@@ -53,6 +53,6 @@ Settlement handles each of these by rule, so none needs a person:
 
 - **Served but never paid:** the record's host is paid from the reserve after 24 hours.
 - **Paid after that write-off:** the late money joins fees.
-- **Paid for an excluded record:** the payment draws in full, and the payer gets the difference back as a refund.
-- **Collected with no payment row,** such as a router crash mid-request: after 24 hours the money joins fees.
+- **Paid for an excluded record:** the payment draws what it owes, and the payer gets the difference back as a refund from the reserve. That difference stays in the agent pool, so it never joins fees as well.
+- **Collected with no payment row,** such as a router crash mid-request: after 24 hours the money joins fees. An unserved `exact` is refunded from the reserve instead, and its money stays in the agent pool.
 - **A row asking for more than the pool holds:** it waits, so it cannot stall the hour.

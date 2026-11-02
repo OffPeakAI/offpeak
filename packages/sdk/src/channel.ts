@@ -16,7 +16,9 @@ const STATUS_OPEN = 1
 const RECORD_SKEW_S = 60
 /** The time check turns away anything this many records back, so the saved list need not grow for good. */
 const COUNTED_KEPT = 1_000
-/** A model with no published tokenizer can still be paid for. Its hashes are checked, and `tokensOut` against `max_tokens`. */
+/** What a chat template adds around a body: special tokens, the generation prompt, a default system prompt. */
+const TEMPLATE_TOKENS = 4_096
+/** Paid for only with `payUncounted`, or a router could skip the recount by withholding the tokenizer. */
 const NOT_COUNTED = "token_count_not_checked"
 
 const channelView = z.object({ deposit: digitsSchema, claimed: digitsSchema, cumulative: digitsSchema, owed: digitsSchema, latestSeq: digitsSchema, status: z.number().int(), expiry: digitsSchema })
@@ -34,6 +36,8 @@ export type ChannelConfig = {
   store?: ChannelStore
   /** Sign a voucher after each response. On unless you call `.voucher()` yourself. */
   autoVoucher?: boolean
+  /** Sign for a model whose tokenizer you cannot get. The counts go unchecked, past the limits on `tokensIn` and `tokensOut`. Off by default. */
+  payUncounted?: boolean
 }
 
 export type VoucherReceipt = { seq: bigint; cumulative: Micro; sig: Hex; delivered: boolean }
@@ -371,7 +375,8 @@ export class Channels {
   /**
    * A record counts once, and only if it is signed, adds up, names a registered host, belongs to this payer and
    * channel, stays under any cap on the request, and describes the request this ticket paid for: its prompt, the
-   * output that came back, no more output tokens than `max_tokens` allowed, and a time while it ran.
+   * output that came back, no more input tokens than its body could hold, no more output tokens than `max_tokens`
+   * allowed, and a time while it ran.
    */
   private async count({ channel: ch, cap, body, startedAt, sealedMaxTokens }: Ticket, envelope: UsageEnvelope, output: RecountOutput | undefined) {
     const { record } = envelope
@@ -382,7 +387,7 @@ export class Channels {
     const sealed = sealedMaxTokens !== undefined
     const prompt = sealed ? undefined : (JSON.parse(body) as BuyerBody)
     const report = await this.ctx.verify(envelope, { payer: this.needSigner().address, recount: prompt && { prompt, output: output ?? "" } })
-    const failed = report.reasons.filter((reason) => reason !== NOT_COUNTED)
+    const failed = report.reasons.filter((reason) => reason !== NOT_COUNTED || !this.config?.payUncounted)
     if (failed.length > 0) {
       ch.refused = `Usage record failed: ${failed.join(", ")}`
       return
@@ -401,6 +406,12 @@ export class Channels {
     }
     if (sealed && (!envelope.sealed || record.promptHash !== keccak256(body as Hex))) {
       ch.refused = `Record ${record.reqId} does not describe the request you sent`
+      return
+    }
+    // Every token covers at least one byte of what it came from. A sealed body is hex, and holds at most its ciphertext.
+    const bytes = Buffer.byteLength(body, sealed ? "hex" : "utf8")
+    if (record.tokensIn > bytes + TEMPLATE_TOKENS) {
+      ch.refused = `Record ${record.reqId} bills ${record.tokensIn} input tokens on a ${bytes} byte body`
       return
     }
     const allowed = sealedMaxTokens ?? outputLimit(askedTokens(prompt!))
