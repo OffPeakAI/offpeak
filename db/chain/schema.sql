@@ -235,6 +235,7 @@ CREATE TABLE IF NOT EXISTS chain.x402_claims (
   reason     text,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE chain.x402_claims ADD COLUMN IF NOT EXISTS payload_hash text;
 
 -- Agent records no payment ever covered, paid to their hosts from the reserve.
 CREATE TABLE IF NOT EXISTS chain.orphan_writeoffs (

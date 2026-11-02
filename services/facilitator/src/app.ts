@@ -19,12 +19,14 @@ export type FacilitatorDeps = {
 export function facilitatorApp(deps: FacilitatorDeps) {
   const app = new Hono()
   const cache = new ReadCache(deps.verify.reader)
+  const authorized = (header: string | undefined) => header === `Bearer ${deps.internalToken}`
 
   app.get("/x402/supported", (c) =>
     c.json({ kinds: ["channel", "upto", "exact"].map((scheme) => ({ scheme, network: NETWORK })) }),
   )
 
   app.post("/x402/verify", async (c) => {
+    if (!authorized(c.req.header("authorization"))) return c.json({ error: "unauthorized" }, 401)
     const started = performance.now()
     const result = await verifyPayment(deps.verify, cache, (await c.req.json()) as VerifyBody)
     deps.metrics.set("x402_verify_ms", performance.now() - started)
@@ -32,12 +34,13 @@ export function facilitatorApp(deps: FacilitatorDeps) {
   })
 
   app.post("/x402/settle", async (c) => {
+    if (!authorized(c.req.header("authorization"))) return c.json({ error: "unauthorized" }, 401)
     const body = (await c.req.json()) as { paymentPayload: PaymentPayload; mode: "authorize" | "exact" }
     return c.json(await acceptSettle(deps.db, deps.batcher, body.paymentPayload, body.mode))
   })
 
   app.post("/x402/capture", async (c) => {
-    if (c.req.header("authorization") !== `Bearer ${deps.internalToken}`) return c.json({ error: "unauthorized" }, 401)
+    if (!authorized(c.req.header("authorization"))) return c.json({ error: "unauthorized" }, 401)
     const body = (await c.req.json()) as { reqId: Hex; actual: string }
     await deps.captures.add(body.reqId, BigInt(body.actual))
     return c.json({ queued: true })

@@ -217,7 +217,7 @@ async function signPayment(reqId: Hex, nonce: bigint, signer: HDAccount = agent,
   }
 }
 
-const facilitatorCall = async (path: string, body: unknown, headers: Record<string, string> = {}) => {
+const facilitatorCall = async (path: string, body: unknown, headers: Record<string, string> = { authorization: `Bearer ${TOKEN}` }) => {
   const res = await fac.request(path, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) })
   return (await res.json()) as Record<string, unknown>
 }

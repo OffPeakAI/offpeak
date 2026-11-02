@@ -1,6 +1,6 @@
 import type { Db } from "@offpeak/common"
 import { CHAIN_ID, PERMIT2, UPTO_MIN_MAX_MICRO, permitWitnessTypes } from "@offpeak/shared"
-import { erc20Abi, getAddress, hashTypedData, isAddressEqual, parseAbi, recoverTypedDataAddress, type Address, type Hex, type PublicClient } from "viem"
+import { concat, erc20Abi, getAddress, hashTypedData, isAddressEqual, keccak256, parseAbi, recoverTypedDataAddress, type Address, type Hex, type PublicClient } from "viem"
 import type { Denylist } from "./denylist.ts"
 
 const NETWORK = `eip155:${CHAIN_ID}`
@@ -90,6 +90,11 @@ function typedMessage(payload: PaymentPayload["payload"], scheme: "upto" | "exac
   } as const
 }
 
+/** What a claim binds: the signed terms and the signature, so settle queues only the payload verify accepted. */
+export function payloadHash(payload: PaymentPayload["payload"], scheme: "upto" | "exact"): Hex {
+  return keccak256(concat([hashTypedData(typedMessage(payload, scheme) as never), payload.signature]))
+}
+
 /** An EOA recovers. A contract wallet names itself and answers EIP-1271. */
 async function recoverPayer(deps: VerifyDeps, payload: PaymentPayload["payload"], scheme: "upto" | "exact"): Promise<Address | null> {
   const typed = typedMessage(payload, scheme)
@@ -175,8 +180,8 @@ export async function verifyPayment(deps: VerifyDeps, cache: ReadCache, body: Ve
   if (deps.denylist.has(payer)) return reply("denied")
 
   const claimed = await deps.db.query(
-    "INSERT INTO chain.x402_claims (req_id, payer, scheme) VALUES ($1,$2,$3) ON CONFLICT (req_id) DO NOTHING RETURNING req_id",
-    [String(payload.witness.reqId).toLowerCase(), payer.toLowerCase(), scheme],
+    "INSERT INTO chain.x402_claims (req_id, payer, scheme, payload_hash) VALUES ($1,$2,$3,$4) ON CONFLICT (req_id) DO NOTHING RETURNING req_id",
+    [String(payload.witness.reqId).toLowerCase(), payer.toLowerCase(), scheme, payloadHash(payload, permitScheme)],
   )
   if (claimed.rows.length === 0) return reply("req_id_used")
   return { isValid: true, payer: payer.toLowerCase() }

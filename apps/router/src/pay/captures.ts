@@ -42,19 +42,19 @@ export async function sweepCaptures(stack: Stack) {
 
 /**
  * `exact` takes the money before serving, so a request that was never served owes it back. The chain
- * decides: money it holds becomes a refund, and a payment past its expiry with nothing taken is dropped.
+ * decides: what it took becomes a refund, whatever amount was noted here, and a payment past its expiry with nothing taken is dropped.
  */
 export async function sweepExact(stack: Stack) {
   const now = stack.clock()
-  const rows = await stack.db.query<{ req_id: string; payer: string; max_amount: string; valid_before: string }>(
-    "SELECT req_id, payer, max_amount, valid_before FROM serving.x402_requests WHERE status = 'refund_due' OR (status = 'submitted' AND created_at <= $1) LIMIT 200",
+  const rows = await stack.db.query<{ req_id: string; payer: string; valid_before: string }>(
+    "SELECT req_id, payer, valid_before FROM serving.x402_requests WHERE status = 'refund_due' OR (status = 'submitted' AND created_at <= $1) LIMIT 200",
     [now - EXACT_LOST_AFTER_S],
   )
   for (const row of rows.rows) {
     const escrow = await stack.indexer.escrow(row.req_id).catch(() => null)
     if (escrow?.status === "captured") {
       await stack.db.transaction(async (tx) => {
-        await tx.query("INSERT INTO shared.refunds (id, payer, amount, reason, req_ids) VALUES ($1,$2,$3,'exact_unserved',$4) ON CONFLICT (id) DO NOTHING", [`exact-unserved:${row.req_id}`, row.payer, row.max_amount, [row.req_id]])
+        await tx.query("INSERT INTO shared.refunds (id, payer, amount, reason, req_ids) VALUES ($1,$2,$3,'exact_unserved',$4) ON CONFLICT (id) DO NOTHING", [`exact-unserved:${row.req_id}`, row.payer, escrow.captured.toString(), [row.req_id]])
         await tx.query("UPDATE serving.x402_requests SET status = 'refunded' WHERE req_id = $1", [row.req_id])
       })
     } else if (now > Number(row.valid_before) + X402_EXPIRY_GRACE_S) {

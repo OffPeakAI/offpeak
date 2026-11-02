@@ -2,7 +2,7 @@ import { X402EscrowAbi } from "@offpeak/abis"
 import { log, type Db, type Metrics } from "@offpeak/common"
 import { parseEventLogs, type Account, type Address, type Hex, type PublicClient, type TransactionReceipt, type WalletClient } from "viem"
 import { recordGas } from "./gas.ts"
-import type { PaymentPayload } from "./verify.ts"
+import { payloadHash, type PaymentPayload } from "./verify.ts"
 
 const MAX_AUTHORIZE_BATCH = 20
 
@@ -175,14 +175,23 @@ export class RelayBatcher {
   }
 }
 
+function samePayload(payment: PaymentPayload, scheme: "upto" | "exact", claimed: string | null) {
+  try {
+    return payloadHash(payment.payload, scheme) === claimed
+  } catch {
+    return false
+  }
+}
+
 /** Queues a payment that passed verify. Nothing here waits on the chain, so it answers inside the 50 ms budget. */
 export async function acceptSettle(db: Db, batcher: RelayBatcher, payment: PaymentPayload, mode: "authorize" | "exact") {
   const reqId = String(payment.payload.witness.reqId).toLowerCase() as Hex
-  const claims = await db.query<{ payer: string; scheme: string; status: string }>("SELECT payer, scheme, status FROM chain.x402_claims WHERE req_id = $1", [reqId])
+  const claims = await db.query<{ payer: string; scheme: "upto" | "exact"; status: string; payload_hash: string | null }>("SELECT payer, scheme, status, payload_hash FROM chain.x402_claims WHERE req_id = $1", [reqId])
   const claim = claims.rows[0]
   if (!claim) return { success: false, txHash: null, status: "submitted" as const, errorReason: "not_verified" }
   if (claim.status !== "accepted") return { success: false, txHash: null, status: "submitted" as const, errorReason: "already_settled" }
   if ((mode === "exact") !== (claim.scheme === "exact")) return { success: false, txHash: null, status: "submitted" as const, errorReason: "wrong_mode" }
+  if (!samePayload(payment, claim.scheme, claim.payload_hash)) return { success: false, txHash: null, status: "submitted" as const, errorReason: "payload_mismatch" }
   await db.query("UPDATE chain.x402_claims SET status = 'submitted' WHERE req_id = $1 AND status = 'accepted'", [reqId])
   batcher.enqueue(mode, { payload: payment.payload, reqId, payer: claim.payer as Address })
   return { success: true, txHash: null, status: "submitted" as const }
