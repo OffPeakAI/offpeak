@@ -2,6 +2,7 @@ import { DISPUTE_WINDOW_S, LOAD_FACTOR_MAX_BPS, countsWithinTolerance, hourOfWee
 import { randomBytes } from "node:crypto"
 import { z } from "zod"
 import { tokenizerFor } from "../metering/tokenize.ts"
+import { flagMetering } from "../openai/commit.ts"
 import { livePrice } from "../pricing/live.ts"
 import type { Stack } from "../pipeline.ts"
 
@@ -205,11 +206,7 @@ export async function openDispute(stack: Stack, wallet: string, raw: unknown) {
     }
     for (const check of upheld) {
       const row = rows.rows.find((r) => r.req_id === check.req_id)!
-      await tx.query("INSERT INTO serving.metering_flags (req_id, host, router_counts, host_counts, reason) VALUES ($1,$2,$3::jsonb,'{}'::jsonb,'dispute_upheld') ON CONFLICT (req_id) DO NOTHING", [
-        check.req_id,
-        row.host,
-        JSON.stringify({ tokensIn: row.tokens_in, tokensOut: row.tokens_out }),
-      ])
+      await flagMetering({ db: tx }, check.req_id, row.host, { tokensIn: row.tokens_in, tokensOut: row.tokens_out }, {}, "dispute_upheld")
     }
     await tx.query("INSERT INTO serving.disputes (id, wallet, req_ids, reason, submitted_material_hash, status, outcome, refund_id, refund_micro, checks, created_at) VALUES ($1,$2,$3,$4,$5,'decided',$6,$7,$8,$9::jsonb,$10)", [
       id,

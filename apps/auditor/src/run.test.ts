@@ -361,6 +361,19 @@ describe("metering", () => {
     expect(d.metrics.get("auditor_metering_unprovable")).toBe(30)
   })
 
+  test("sustained upheld disputes go to filing, since each has a signed record behind it", async () => {
+    for (let i = 0; i < 500; i++) {
+      await insertRecord(db, keccakUtf8(`r${i}`), { ts: weekStart + i * 600 })
+      if (i < 60) await flag(keccakUtf8(`r${i}`), "dispute_upheld", weekStart + i * 600)
+    }
+    const d = deps(db, {
+      chain: { proof: async (reqId: string) => ({ hour: 1, leaf: keccakUtf8(`leaf-${reqId}`), proof: [], root: "0x0", txHash: "0x0" }) } as never,
+      reader: { readContract: async () => false } as never,
+      contracts: { UsageLedger: `0x${"11".repeat(20)}`, AuditCourt: `0x${"22".repeat(20)}`, MockUSDG: `0x${"33".repeat(20)}` },
+    })
+    expect(await runMetering(d, week)).toEqual([{ host: HOST, result: "leaf_unproven" }])
+  })
+
   test("sustained flags go to filing with a random draw of the host's records", async () => {
     const proofs: string[] = []
     for (let i = 0; i < 500; i++) {

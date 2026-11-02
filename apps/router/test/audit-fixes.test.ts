@@ -4,7 +4,9 @@ import { keccak256, toBytes, type Hex } from "viem"
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts"
 import { roleAccount } from "../../../packages/shared/src/test-keys.ts"
 import { bootStack } from "./support/stack.ts"
+import { resignedOverbill } from "./support/overbill.ts"
 import { uptoHeader } from "./support/upto.ts"
+import { flagMetering } from "../src/openai/commit.ts"
 import { sweepSessions } from "../src/auth/siwe.ts"
 import { clientIp } from "../src/http.ts"
 import * as tokenize from "../src/metering/tokenize.ts"
@@ -639,5 +641,61 @@ describe("counting tokens", () => {
     const booted = await bootStack()
     for (let i = 0; i < 40; i++) expect((await send(booted, "/v1/embeddings", embedBody("hello"))).status).toBe(402)
     expect((await send(booted, "/v1/embeddings", embedBody("hello"), { authorization: `Bearer ${booted.key.token}` })).status).toBe(200)
+  })
+})
+
+describe("metering flags", () => {
+  const reqId = `0x${"12".repeat(32)}`
+  const flagRows = (booted: Booted) => booted.stack.db.query<{ req_id: string; reason: string; router_counts: unknown; host_counts: unknown }>("SELECT req_id, reason, router_counts, host_counts FROM serving.metering_flags")
+
+  const hostSays = (booted: Booted, counts: (mine: { tokensIn: number; tokensOut: number }) => object) => rewriteReply(booted, "/offpeak/v1/sign", async (body) => ({ ...body, hostCounts: counts(body.hostCounts as { tokensIn: number; tokensOut: number }) }))
+
+  test("a signed record whose counts the host does not share is flagged, with the record kept", async () => {
+    const booted = await bootStack()
+    hostSays(booted, (mine) => ({ ...mine, tokensOut: mine.tokensOut + 50 }))
+    expect((await chat(booted)).status).toBe(200)
+    const [row] = (await flagRows(booted)).rows
+    expect(row!.reason).toBe("counts")
+    expect((await records(booted)).rows.map((record) => record.req_id)).toEqual([row!.req_id])
+  })
+
+  test("counts inside the tolerance, or none at all, are not a difference", async () => {
+    const booted = await bootStack()
+    hostSays(booted, (mine) => ({ ...mine, tokensOut: mine.tokensOut + 2 }))
+    expect((await chat(booted)).status).toBe(200)
+    expect(await flags(booted)).toEqual([])
+    const quiet = await bootStack()
+    hostSays(quiet, () => ({}))
+    expect((await chat(quiet)).status).toBe(200)
+    expect(await flags(quiet)).toEqual([])
+  })
+
+  test("a flag against the host takes over a flag from the router's own side", async () => {
+    const booted = await bootStack()
+    await flagMetering(booted.stack, reqId, booted.host, {}, {}, "over_hold")
+    await flagMetering(booted.stack, reqId, booted.host, { tokensOut: 9 }, { tokensOut: 90 }, "counts")
+    expect((await flagRows(booted)).rows).toEqual([{ req_id: reqId, reason: "counts", router_counts: { tokensOut: 9 }, host_counts: { tokensOut: 90 } }])
+  })
+
+  test("a flag against the host stays, whatever comes after it", async () => {
+    const booted = await bootStack()
+    await flagMetering(booted.stack, reqId, booted.host, {}, {}, "counts")
+    await flagMetering(booted.stack, reqId, booted.host, {}, {}, "bill_failed")
+    await flagMetering(booted.stack, reqId, booted.host, {}, {}, "dispute_upheld")
+    expect(await flags(booted)).toEqual(["counts"])
+  })
+
+  test("a dispute upheld on a record the router flagged for itself reaches the auditor", async () => {
+    const booted = await bootStack()
+    const body = chatBody("count my tokens")
+    const res = await chat(booted, body)
+    const json = (await res.json()) as { choices: { message: { content: string } }[]; offpeak_usage: { record: { reqId: string; tokensOut: number } } }
+    const { reqId: id, tokensOut } = json.offpeak_usage.record
+    await flagMetering(booted.stack, id, booted.host, {}, {}, "over_hold")
+    await resignedOverbill(booted, id, tokensOut + 500)
+    await booted.stack.db.query("INSERT INTO serving.siwe_sessions (id, wallet, nonce, expires_at) VALUES ('sess_test', $1, '', to_timestamp($2))", [booted.buyer, booted.stack.clock() + 86_400])
+    const disputed = await booted.app.request("/v1/disputes", { method: "POST", headers: { authorization: "Bearer sess_test" }, body: JSON.stringify({ req_ids: [id], reason: "too many", material: { prompt: JSON.parse(body), output: json.choices[0]!.message.content } }) })
+    expect(((await disputed.json()) as { outcome: string }).outcome).toBe("upheld")
+    expect(await flags(booted)).toEqual(["dispute_upheld"])
   })
 })
