@@ -1,11 +1,12 @@
 import { describe, expect, test } from "bun:test"
-import { PERMIT2, channelAuthHeader, channelPaymentId, domain, parseRecord, permitWitnessTypes, recordToMessage, signTyped, usageTypes, voucherTypes } from "@offpeak/shared"
+import { CHANNEL_CREDIT_CAP_MICRO, PERMIT2, channelAuthHeader, channelPaymentId, domain, parseRecord, permitWitnessTypes, recordToMessage, signTyped, usageTypes, voucherTypes } from "@offpeak/shared"
 import { keccak256, toBytes, type Hex } from "viem"
 import { roleAccount } from "../../../packages/shared/src/test-keys.ts"
 import { bootStack } from "./support/stack.ts"
 import { uptoHeader } from "./support/upto.ts"
 import { loadFactorBps } from "../src/pricing/live.ts"
 import { LoadMeter } from "../src/pricing/load.ts"
+import { reserveChannel } from "../src/pay/channel-store.ts"
 import { absorb, boundedText, emptyAssembly, hostEvents } from "../src/routing/dispatch.ts"
 import { selectHost, type HostCandidate } from "../src/routing/select.ts"
 
@@ -376,5 +377,93 @@ describe("the load meter", () => {
     for (let i = 0; i < 188; i++) meter.noteTtft("h", 200, 40)
     for (let i = 0; i < 12; i++) meter.noteTtft("h", 2000, 400)
     expect(selectHost([candidate(meter)], { sealed: false, interactive: true })).toHaveLength(0)
+  })
+})
+
+describe("channel credit across a payer's channels", () => {
+  const DEPOSIT = 2_500_000n
+  const open = (booted: Booted, label: string) => {
+    const id = keccak256(toBytes(label))
+    openChannel(booted, id, DEPOSIT)
+    return id
+  }
+
+  async function call(booted: Booted, id: Hex, i: number) {
+    const body = chatBody(`longform ${i}`, { max_tokens: 800 })
+    const auth = await channelAuthHeader(buyer, { channelId: id, ts: booted.stack.clock(), body })
+    return booted.app.request("/v1/chat/completions", { method: "POST", headers: { "content-type": "application/json", "x-offpeak-channel": id, "x-offpeak-channel-auth": auth }, body })
+  }
+
+  /** Serves until the channel refuses, signing no voucher at all. */
+  async function drain(booted: Booted, id: Hex) {
+    for (let i = 0; i < 40; i++) {
+      const res = await call(booted, id, i)
+      if (res.status !== 200) return errorCode(res)
+    }
+    return "never refused"
+  }
+
+  const owed = async (booted: Booted) => BigInt((await booted.stack.db.query<{ total: string }>("SELECT COALESCE(SUM(unvouchered_micro), 0) AS total FROM serving.channels_local")).rows[0]!.total)
+
+  function dearer(booted: Booted) {
+    const sheet = booted.stack.sheets[0]!
+    sheet.baseIn = sheet.baseIn.map((value) => value * 100n)
+    sheet.baseOut = sheet.baseOut.map((value) => value * 100n)
+    sheet.floorIn *= 100n
+    sheet.floorOut *= 100n
+    for (const host of booted.indexer.hosts.values()) for (const model of host.models) model.maxTps = 1_000_000
+  }
+
+  test("three channels from one payer share one limit", async () => {
+    const booted = await bootStack()
+    dearer(booted)
+    for (const label of ["a", "b", "c"]) expect(await drain(booted, open(booted, label))).toBe("credit_limit")
+    expect(await owed(booted)).toBeLessThanOrEqual(CHANNEL_CREDIT_CAP_MICRO)
+  })
+
+  test("one channel still gets its whole limit", async () => {
+    const booted = await bootStack()
+    dearer(booted)
+    expect(await drain(booted, open(booted, "one"))).toBe("credit_limit")
+    expect(await owed(booted)).toBeGreaterThan(CHANNEL_CREDIT_CAP_MICRO / 2n)
+  })
+
+  test("a reservation held on one channel counts against the next", async () => {
+    const booted = await bootStack()
+    const [a, b] = [open(booted, "a"), open(booted, "b")]
+    const row = (id: Hex) => booted.indexer.channels.get(id)!
+    const held = await reserveChannel(booted.stack.db, row(a), a, 200_000n, booted.stack.clock())
+    expect(held.ok).toBe(true)
+    expect(await reserveChannel(booted.stack.db, row(b), b, 200_000n, booted.stack.clock())).toEqual({ ok: false, error: "credit_limit" })
+    expect((await reserveChannel(booted.stack.db, row(b), b, 40_000n, booted.stack.clock())).ok).toBe(true)
+  })
+
+  test("reservations at once cannot both take the last of it", async () => {
+    const booted = await bootStack()
+    const ids = ["a", "b", "c", "d"].map((label) => open(booted, label))
+    const rows = await Promise.all(ids.map((id) => reserveChannel(booted.stack.db, booted.indexer.channels.get(id)!, id, 100_000n, booted.stack.clock())))
+    expect(rows.filter((row) => row.ok).length).toBe(2)
+  })
+
+  test("another payer has its own limit", async () => {
+    const booted = await bootStack()
+    const a = open(booted, "a")
+    expect((await reserveChannel(booted.stack.db, booted.indexer.channels.get(a)!, a, 240_000n, booted.stack.clock())).ok).toBe(true)
+    const other = keccak256(toBytes("other"))
+    booted.indexer.channels.set(other, { ...booted.indexer.channels.get(a)!, payer: `0x${"ab".repeat(20)}` })
+    expect((await reserveChannel(booted.stack.db, booted.indexer.channels.get(other)!, other, 240_000n, booted.stack.clock())).ok).toBe(true)
+  })
+
+  test("a voucher gives the room back", async () => {
+    const booted = await bootStack()
+    dearer(booted)
+    const a = open(booted, "a")
+    const body = chatBody("one call", { max_tokens: 100 })
+    const res = await booted.app.request("/v1/chat/completions", { method: "POST", headers: { "content-type": "application/json", "x-offpeak-channel": a, "x-offpeak-channel-auth": await channelAuthHeader(buyer, { channelId: a, ts: booted.stack.clock(), body }) }, body })
+    const cumulative = BigInt(res.headers.get("x-offpeak-channel-owed")!)
+    expect(await owed(booted)).toBe(cumulative)
+    const sig = await buyer.signTypedData({ domain: domain("OffpeakChannel", booted.stack.channelManager), types: voucherTypes, primaryType: "Voucher", message: { channelId: a, seq: 1n, cumulative } })
+    expect((await booted.app.request(`/v1/channels/${a}/voucher`, { method: "POST", body: JSON.stringify({ seq: "1", cumulative: cumulative.toString(), sig }) })).status).toBe(200)
+    expect(await owed(booted)).toBe(0n)
   })
 })

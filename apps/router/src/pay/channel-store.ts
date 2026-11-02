@@ -121,6 +121,21 @@ export async function acceptVoucher(db: Db, channel: ChannelChain, channelId: He
   })
 }
 
+/**
+ * What a wallet owes unsigned across its channels, held or served. A signed close covers its channel's share.
+ * The lock runs to the end of the transaction, so requests on two channels cannot each spend the same room.
+ */
+async function payerUnvouchered(tx: Db, payer: string, now: number) {
+  await tx.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`channel-credit:${payer.toLowerCase()}`])
+  const owed = await tx.query<{ total: string }>(
+    `SELECT COALESCE((SELECT SUM(unvouchered_micro) FROM serving.channels_local WHERE lower(payer) = lower($1) AND close_final IS NULL), 0)
+          + COALESCE((SELECT SUM(r.amount) FROM serving.channel_reservations r JOIN serving.channels_local l ON l.channel_id = r.channel_id
+                      WHERE lower(l.payer) = lower($1) AND r.expires_at > $2), 0) AS total`,
+    [payer, now],
+  )
+  return big(owed.rows[0]?.total)
+}
+
 export async function reserveChannel(db: Db, channel: ChannelChain, channelId: Hex, max: bigint, now: number, opts?: { contractPayer?: boolean }) {
   return db.transaction(async (tx) => {
     const local = await lock(tx, channelId, channel.payer)
@@ -137,6 +152,7 @@ export async function reserveChannel(db: Db, channel: ChannelChain, channelId: H
       unvouchered: local.unvouchered + big(held.rows[0]?.total),
       newMax: max,
       unlanded: (opts?.contractPayer || local.contractVoucher) && local.cumulative > channel.claimed ? local.cumulative - channel.claimed : 0n,
+      payerUnvouchered: await payerUnvouchered(tx, channel.payer, now),
     })
     if (!decision.ok) return decision
     const reservationId = `rsv_${randomBytes(8).toString("hex")}`
