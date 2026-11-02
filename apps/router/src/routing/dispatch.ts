@@ -1,4 +1,6 @@
+import { MAX_REQUEST_S } from "@offpeak/shared"
 import type { Stack } from "../context.ts"
+import { TTFT_PROMPT_TOKENS } from "../pricing/load.ts"
 import type { HostCandidate } from "./select.ts"
 
 export type HostEvent = { choices?: { delta?: { content?: string | null; tool_calls?: ToolDelta[] }; finish_reason?: string | null }[] }
@@ -100,10 +102,18 @@ export type Opened = {
   abort: () => void
 }
 
+/** First tokens wait on prefill, so a prompt past the length `noteTtft` scales to gets its time in proportion. */
+export function firstTokenLimitMs(stack: Stack, promptTokens: number) {
+  return Math.min((stack.ttftFailoverMs * Math.max(promptTokens, TTFT_PROMPT_TOKENS)) / TTFT_PROMPT_TOKENS, MAX_REQUEST_S * 1000)
+}
+
+/** A buyer picks a prompt's length, so a long one running out of time says nothing about the host. */
+export const promptExplainsWait = (promptTokens: number) => promptTokens > TTFT_PROMPT_TOKENS
+
 /**
  * Opens a stream on the best host, failing over once before any token has reached the client. Only a 5xx, a
- * timeout or a broken stream counts against a host: a 4xx answers this request, and a buyer can ask for those.
- * `status` is that 4xx, for a caller to say whose it was.
+ * timeout on a prompt too short to explain it or a broken stream counts against a host: a 4xx answers this
+ * request, and a buyer can ask for those. `status` is that 4xx, for a caller to say whose it was.
  */
 export async function openHost(stack: Stack, ranked: HostCandidate[], payload: string, signedHeader: string, promptTokens: number): Promise<Opened | { ok: false; error: string; status?: number }> {
   let last = "down"
@@ -111,7 +121,11 @@ export async function openHost(stack: Stack, ranked: HostCandidate[], payload: s
   for (const host of ranked.slice(0, 2)) {
     const control = new AbortController()
     const started = performance.now()
-    const timer = setTimeout(() => control.abort(), stack.ttftFailoverMs)
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      control.abort()
+    }, firstTokenLimitMs(stack, promptTokens))
     try {
       const res = await stack.hosts.request(host.host, host.endpoint, "/offpeak/v1/chat/completions", {
         method: "POST",
@@ -135,11 +149,12 @@ export async function openHost(stack: Stack, ranked: HostCandidate[], payload: s
       stack.load.noteTtft(host.host, ttftMs, promptTokens)
       stack.load.noteResult(host.host, true)
       return { ok: true, host: host.host, endpoint: host.endpoint, ttftMs, first: first.value, events, abort: () => control.abort() }
-    } catch (err) {
+    } catch {
       clearTimeout(timer)
       control.abort()
-      stack.load.noteResult(host.host, false)
-      last = control.signal.aborted && String(err).includes("abort") ? "slow" : "error"
+      const explained = timedOut && promptExplainsWait(promptTokens)
+      if (!explained) stack.load.noteResult(host.host, false)
+      last = explained ? "prefill" : timedOut ? "slow" : "error"
     }
   }
   return { ok: false, error: last, status }

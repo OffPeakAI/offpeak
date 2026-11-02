@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import type { Hex } from "viem"
 import { keccak256, toBytes } from "viem"
 import { WindowPerf, sweepWindows } from "../src/pay/window-perf.ts"
+import { firstTokenLimitMs } from "../src/routing/dispatch.ts"
 import { bootStack } from "./support/stack.ts"
 
 type Booted = Awaited<ReturnType<typeof bootStack>>
@@ -293,6 +294,66 @@ describe("shared.window_perf", () => {
     const row = (await samples(booted)).rows.find((r) => Number(r.minute) === minute)!
     expect(row.demanded).toBe(true)
     expect(row.tokens_per_s).toBe(42)
+  })
+})
+
+describe("the wait for a first token", () => {
+  const LONG = "x ".repeat(3_000)
+
+  /** A host that takes this long to answer, and gives up on an abort the way a real fetch does. */
+  function slowHost(booted: Booted, waitMs: (payload: string) => number) {
+    const real = booted.stack.hosts.request
+    booted.stack.hosts.request = (host, endpoint, path, init) =>
+      new Promise((resolve, reject) => {
+        const timer = setTimeout(() => resolve(real(host, endpoint, path, init)), waitMs(String(init?.body)))
+        init?.signal?.addEventListener("abort", () => {
+          clearTimeout(timer)
+          reject(new DOMException("The operation was aborted", "AbortError"))
+        })
+      })
+  }
+
+  const demanded = async (booted: Booted) => (await samples(booted)).rows.filter((row) => row.demanded)
+
+  test("grows with the prompt past the length TTFT is scaled to, and stops at the longest a request runs", async () => {
+    const { stack } = await bootStack()
+    expect(firstTokenLimitMs(stack, 10)).toBe(3_000)
+    expect(firstTokenLimitMs(stack, 1_024)).toBe(3_000)
+    expect(firstTokenLimitMs(stack, 8_192)).toBe(24_000)
+    expect(firstTokenLimitMs(stack, 10_000_000)).toBe(600_000)
+  })
+
+  test("a long prompt inside its time is served", async () => {
+    const booted = await bootStack()
+    holdWindow(booted)
+    booted.stack.ttftFailoverMs = 20
+    slowHost(booted, (payload) => (payload.length > 1_000 ? 40 : 0))
+    expect((await draw(booted, LONG)).status).toBe(200)
+    expect(booted.stack.load.errorRate(booted.host)).toBe(0)
+  })
+
+  test("a long prompt that runs out of time leaves the error rate and window_perf as they were, and the host in routing", async () => {
+    const booted = await bootStack()
+    holdWindow(booted)
+    booted.stack.ttftFailoverMs = 5
+    slowHost(booted, (payload) => (payload.length > 1_000 ? 10_000 : 0))
+    expect((await draw(booted, LONG)).status).toBe(503)
+    expect(booted.stack.load.errorRate(booted.host)).toBe(0)
+    await sweepAfter(booted, 2)
+    expect(await demanded(booted)).toEqual([])
+    booted.stack.candidateCache.clear()
+    expect((await draw(booted, "short")).status).toBe(200)
+  })
+
+  test("a host silent on a short prompt still counts", async () => {
+    const booted = await bootStack()
+    holdWindow(booted)
+    booted.stack.ttftFailoverMs = 5
+    slowHost(booted, () => 10_000)
+    expect((await draw(booted, "short")).status).toBe(503)
+    expect(booted.stack.load.errorRate(booted.host)).toBe(1)
+    await sweepAfter(booted, 2)
+    expect((await demanded(booted))[0]!.tokens_per_s).toBe(0)
   })
 })
 

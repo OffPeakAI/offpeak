@@ -32,7 +32,7 @@ export type LoadRow = {
 const ERROR_WINDOW_MS = 5 * 60_000
 const TTFT_WINDOW_MS = 15 * 60_000
 /** First tokens wait on prefill, so a longer prompt than this is scaled down to it. Otherwise a buyer's long prompts read as a slow host. */
-const TTFT_PROMPT_TOKENS = 1024
+export const TTFT_PROMPT_TOKENS = 1024
 
 /** Old samples age out, so one bad minute cannot exclude a quiet host for good. */
 function recent<T extends { at: number }>(list: T[] | undefined, windowMs: number): T[] {

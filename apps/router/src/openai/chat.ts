@@ -250,7 +250,8 @@ function offpeakEvent(name: string, reqId: Hex, modelName: string, created: numb
   return `event: ${name}\ndata: ${JSON.stringify({ ...chunkBody(reqId, modelName, created, {}, finish), ...fields })}\n\n`
 }
 
-const requestLimitMs = () => (MAX_REQUEST_S - BILLING_MARGIN_S) * 1000
+/** What is left of the request, since the wait for a first token now grows with the prompt. */
+const requestLimitMs = (entered: number) => (MAX_REQUEST_S - BILLING_MARGIN_S) * 1000 - (performance.now() - entered)
 
 /** A reply that ran to its end served the request even with nothing in it, since a buyer's `stop` can cut it to nothing. */
 function closeFlow(ctx: Ctx, failed: boolean) {
@@ -277,7 +278,7 @@ function streamResponse(ctx: Ctx, opened: Opened, priced: Priced, entered: numbe
         const close = () => {
           if (!cancelled) controller.close()
         }
-        const limit = setTimeout(() => opened.abort(), requestLimitMs())
+        const limit = setTimeout(() => opened.abort(), requestLimitMs(entered))
         let tokensOut = 0
         let first = false
         let gated = false
@@ -353,10 +354,10 @@ function streamResponse(ctx: Ctx, opened: Opened, priced: Priced, entered: numbe
   )
 }
 
-async function jsonResponse(ctx: Ctx, opened: Opened, priced: Priced, headers: Record<string, string>) {
+async function jsonResponse(ctx: Ctx, opened: Opened, priced: Priced, entered: number, headers: Record<string, string>) {
   const { stack, reqId, started, modelName, pay } = ctx
   const output = emptyAssembly()
-  const limit = setTimeout(() => opened.abort(), requestLimitMs())
+  const limit = setTimeout(() => opened.abort(), requestLimitMs(entered))
   let cut = false
   try {
     meterWindow(ctx, opened.first, absorb(output, opened.first))
@@ -511,7 +512,7 @@ export async function serveChat(stack: Stack, req: Request, night?: NightLine, i
   if (opened.ok) stack.hostWaitMs?.push(opened.ttftMs)
   if (!opened.ok) {
     const refused = opened.error === "refused"
-    if (refused && holderRefused(opened.status, body)) flow?.drop()
+    if (opened.error === "prefill" || (refused && holderRefused(opened.status, body))) flow?.drop()
     else await endFlow()
     await release(stack, pay)
     return refused ? oai(400, "The host refused this request", "invalid_request", "host_refused") : oai(503, "Host failed before the first token", "engine", "no_capacity")
@@ -521,7 +522,7 @@ export async function serveChat(stack: Stack, req: Request, night?: NightLine, i
   const ctx: Ctx = { stack, reqId, started, model, modelName, payer, pay, feeBps, maxTokens, body, sent, promptHash, tokensIn: inputTokens, tokenizer: tokenizerFor(model), flow }
   const shown = payer.mode === 4 ? { in: 0n, out: 0n } : { in: buyerUnitPrice(servedPrice.price.in, feeBps), out: buyerUnitPrice(servedPrice.price.out, feeBps) }
   const headers = { "x-offpeak-price": `in=${shown.in},out=${shown.out}`, "x-offpeak-host": opened.host }
-  return body.stream ? streamResponse(ctx, opened, servedPrice, entered, headers) : jsonResponse(ctx, opened, servedPrice, headers)
+  return body.stream ? streamResponse(ctx, opened, servedPrice, entered, headers) : jsonResponse(ctx, opened, servedPrice, entered, headers)
 }
 
 /** The statuses that can mean a body was at fault. Any other 4xx is about the host, whatever was asked. */

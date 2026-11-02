@@ -17,6 +17,7 @@ import { flushCapture } from "../pay/captures.ts"
 import { parseMaxPrice, priceAboveCap } from "../pay/quote.ts"
 import { noteWindowMinute, type PerfFlow } from "../pay/window-perf.ts"
 import { relayAttest, verifiedHost } from "../routing/attest.ts"
+import { firstTokenLimitMs, promptExplainsWait } from "../routing/dispatch.ts"
 import { selectHost, type HostCandidate } from "../routing/select.ts"
 import { candidates, hostPrice, windowHostFailing } from "./chat.ts"
 import { commitRecord, flagMetering } from "./commit.ts"
@@ -243,7 +244,7 @@ function relay(ctx: Ctx, res: Response, control: AbortController, first: Uint8Ar
         }
         // The rate counts time output was flowing, and this is where it starts. The rest arrives with the counts.
         ctx.flow?.tokens(1)
-        const limit = setTimeout(() => control.abort(), (MAX_REQUEST_S - BILLING_MARGIN_S) * 1000)
+        const limit = setTimeout(() => control.abort(), (MAX_REQUEST_S - BILLING_MARGIN_S) * 1000 - ctx.ttftMs)
         const budget = pay.kind === "upto" ? preconfirmBytes(priced, feeBps) : Infinity
         let gated = pay.kind !== "upto"
         let failure: string | null = null
@@ -412,12 +413,13 @@ export async function serveSealed(stack: Stack, req: Request): Promise<Response>
   const signed = await signRouterBody(stack.router, { reqId, ts: started, payload })
   const control = new AbortController()
   const startedAt = performance.now()
-  const timer = setTimeout(() => control.abort(), stack.ttftFailoverMs)
+  const timer = setTimeout(() => control.abort(), firstTokenLimitMs(stack, tokensIn))
+  const outran = () => control.signal.aborted && promptExplainsWait(tokensIn)
   const failed = async (res: Response, healthy: boolean) => {
     clearTimeout(timer)
     control.abort()
     if (!healthy) stack.load.noteResult(host.host, false)
-    // `healthy` means the host turned this request down, which is no demand either.
+    // `healthy` means the host turned this request down or a long prompt ran out of time, which is no demand either.
     if (healthy) flow?.drop()
     else await endFlow()
     await release(stack, pay)
@@ -431,7 +433,7 @@ export async function serveSealed(stack: Stack, req: Request): Promise<Response>
       signal: control.signal,
     })
     .catch(() => null)
-  if (!res) return failed(oai(503, "Host failed before the first token", "engine", "no_capacity"), false)
+  if (!res) return failed(oai(503, "Host failed before the first token", "engine", "no_capacity"), outran())
   if (!res.ok || !res.body) {
     const code = agentError.safeParse(await res.json().catch(() => null)).data?.error.code ?? "sealed_refused"
     // A request the host turned down says nothing about its health.
@@ -441,7 +443,7 @@ export async function serveSealed(stack: Stack, req: Request): Promise<Response>
   const reader = res.body.getReader()
   const opening = await reader.read().catch(() => null)
   reader.releaseLock()
-  if (!opening?.value) return failed(oai(503, "Host failed before the first token", "engine", "no_capacity"), false)
+  if (!opening?.value) return failed(oai(503, "Host failed before the first token", "engine", "no_capacity"), outran())
   clearTimeout(timer)
   const ttftMs = Math.round(performance.now() - startedAt)
   stack.load.noteTtft(host.host, ttftMs, tokensIn)

@@ -628,6 +628,21 @@ describe("other payers", () => {
     expect(other.stack.windowPerf.sofar(7n)).toBeNull()
   })
 
+  test("a long prompt that runs out of time counts against nobody, and a short one against the host", async () => {
+    for (const [pad, errors, demand] of [[8_000, 0, undefined], [0, 1, true]] as const) {
+      const booted = await rig()
+      holdWindow(booted)
+      booted.stack.ttftFailoverMs = 1
+      booted.stack.hosts.request = (_host, _endpoint, _path, init) => new Promise((_, reject) => init!.signal!.addEventListener("abort", () => reject(new Error("abort"))))
+      const sealed = await sealedBytes(booted)
+      const bytes = new Uint8Array(sealed.bytes.length + pad)
+      bytes.set(sealed.bytes)
+      expect((await post(booted, bytes, { headers: { "x-offpeak-window": "7" } })).status).toBe(503)
+      expect(booted.stack.load.errorRate(booted.host)).toBe(errors)
+      expect(booted.stack.windowPerf.sofar(7n)?.demanded).toBe(demand)
+    }
+  })
+
   test("a Window with too little left falls back or refuses as an open request does", async () => {
     const booted = await rig()
     holdWindow(booted)
