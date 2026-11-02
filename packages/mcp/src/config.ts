@@ -51,6 +51,7 @@ const envSchema = z.object({
     .optional(),
   OFFPEAK_CHANNEL_EXPIRY_S: z.coerce.number().int().positive().optional(),
   OFFPEAK_CHANNEL_STATE_FILE: z.string().min(1).optional(),
+  OFFPEAK_CHANNEL_PAY_UNCOUNTED: z.stringbool().optional(),
   OFFPEAK_CALL_CAP_MICRO: capMicro.default(DEFAULT_LIMITS.callCapMicro.toString()),
   OFFPEAK_DAY_CAP_MICRO: capMicro.default(DEFAULT_LIMITS.dayCapMicro.toString()),
   OFFPEAK_MAX_PRICE: z.string().regex(MAX_PRICE_FORMAT, "must be in=<usd>,out=<usd>").optional(),
@@ -106,10 +107,11 @@ export function budgetFrom(config: McpConfig) {
 export function clientFrom(config: McpConfig, budget: Budget, fetcher?: typeof fetch, publicClient?: OffpeakOptions["publicClient"]) {
   const known = config.OFFPEAK_CHANNEL_SEQ && config.OFFPEAK_CHANNEL_CUMULATIVE ? { seq: BigInt(config.OFFPEAK_CHANNEL_SEQ), cumulative: BigInt(config.OFFPEAK_CHANNEL_CUMULATIVE) } : undefined
   const store = config.OFFPEAK_CHANNEL_STATE_FILE ? fileChannelStore(config.OFFPEAK_CHANNEL_STATE_FILE) : undefined
+  const payUncounted = config.OFFPEAK_CHANNEL_PAY_UNCOUNTED
   const channel = config.OFFPEAK_CHANNEL_ID
-    ? { id: config.OFFPEAK_CHANNEL_ID, known, store }
+    ? { id: config.OFFPEAK_CHANNEL_ID, known, store, payUncounted }
     : config.OFFPEAK_CHANNEL_DEPOSIT
-      ? { deposit: BigInt(config.OFFPEAK_CHANNEL_DEPOSIT), expirySeconds: config.OFFPEAK_CHANNEL_EXPIRY_S, store }
+      ? { deposit: BigInt(config.OFFPEAK_CHANNEL_DEPOSIT), expirySeconds: config.OFFPEAK_CHANNEL_EXPIRY_S, store, payUncounted }
       : undefined
   return new Offpeak({
     baseURL: config.OFFPEAK_PUBLIC_BASE_URL,

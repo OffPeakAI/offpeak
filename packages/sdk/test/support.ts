@@ -50,8 +50,9 @@ export function chainView(booted: Booted) {
   return { readContract } as unknown as PublicClient
 }
 
+/** The mock model publishes no tokenizer, so a channel here pays only with the opt-out. */
 export function client(booted: Booted, opts: Partial<OffpeakOptions> = {}) {
-  return new Offpeak({ baseURL: BASE, wallet: buyerAccount, deployment: "local", fetch: inProcess(booted.app), publicClient: chainView(booted), ...opts })
+  return new Offpeak({ baseURL: BASE, wallet: buyerAccount, deployment: "local", fetch: inProcess(booted.app), publicClient: chainView(booted), ...opts, channel: { payUncounted: true, ...opts.channel } })
 }
 
 export const ask = (content: string, max_tokens = 8) => ({ model: "ofm-8b", messages: [{ role: "user", content }], max_tokens })
