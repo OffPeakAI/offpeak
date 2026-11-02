@@ -1,5 +1,6 @@
 export { ChatStream, Offpeak, type ChatOptions, type ChatParams, type ChatQueued, type ChatResult, type OffpeakOptions } from "./client.ts"
 export { Channels, type ChannelConfig, type ChannelSnapshot, type CloseResult, type VoucherReceipt } from "./channel.ts"
+export { fileChannelStore, type ChannelStore, type SavedChannel } from "./channel-store.ts"
 export { OffpeakError, localWallet, microToUsd, usdToMicro, type Deployment, type WalletLike } from "./core.ts"
 export { fetchProof, type ProofReport } from "./proofs.ts"
 export { DEFAULT_UPTO_CAP_MICRO, X402, findUpto, type UptoPayment, type UptoRequirement } from "./upto.ts"

@@ -57,6 +57,8 @@ Every channel request carries a proof signed by the payer over its own body and 
 
 Set `channel: { deposit, expirySeconds }` in the constructor to open on the first call, or `channel: { id, known }` to use a channel you already have. `op.channels.attach(id, { seq, cumulative })` picks one up after a restart. Keep those two numbers from `op.channels.snapshot()`.
 
+`channel.store` keeps the channel across restarts. With `deposit` and `store: fileChannelStore(path)`, a start reuses the kept channel, and deposits again only once that channel has closed or is about to expire. A store that cannot be read stops the start, and so does a kept channel that cannot be read. Without a store, `deposit` opens a new channel in every process. Give each running client its own store.
+
 Attaching reads the channel from the chain, so it needs an RPC. It starts from what the chain shows you have paid, plus `cumulative` if you pass it. Debt from before the attach is never signed by itself, because no record you hold covers it: the router's `owed` shows in `snapshot().unsigned`, and only `op.channels.voucher(owed)` takes it on.
 
 **A voucher is signed only for what verified records cover.** After each response the client checks the record's signatures, cost and leaf, that its host is registered, that it belongs to your wallet and this channel, that it is within any `maxPrice`, and that it was not used before. It then signs the reported `owed` only if those records add up to it. If they do not, nothing is signed, `op.channels.snapshot().refused` says why, and the router's credit limit stops further spend.

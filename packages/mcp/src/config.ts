@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs"
-import { Offpeak, localWallet, type Deployment, type OffpeakOptions } from "@offpeak/sdk"
+import { Offpeak, fileChannelStore, localWallet, type Deployment, type OffpeakOptions } from "@offpeak/sdk"
 import { z } from "zod"
 
 const ROLE_KEYS = [
@@ -47,6 +47,7 @@ const envSchema = z.object({
     .regex(/^\d+$/, "must be whole µUSDG")
     .optional(),
   OFFPEAK_CHANNEL_EXPIRY_S: z.coerce.number().int().positive().optional(),
+  OFFPEAK_CHANNEL_STATE_FILE: z.string().min(1).optional(),
   OFFPEAK_MCP_HOST: z.string().min(1).default("127.0.0.1"),
   OFFPEAK_MCP_PORT: z.coerce.number().int().min(1).max(65_535).default(DEFAULT_MCP_PORT),
   OFFPEAK_MCP_TOKEN: z.string().min(MIN_MCP_TOKEN_LENGTH).optional(),
@@ -67,6 +68,7 @@ export function readConfig(source: Record<string, string | undefined>): McpConfi
   if ((config.OFFPEAK_CHANNEL_ID || config.OFFPEAK_CHANNEL_DEPOSIT) && !config.OFFPEAK_AGENT_WALLET_KEY) throw new Error("A channel needs OFFPEAK_AGENT_WALLET_KEY")
   if (config.OFFPEAK_CHANNEL_DEPOSIT && !config.OFFPEAK_RPC_URL) throw new Error("Opening a channel needs OFFPEAK_RPC_URL")
   if (config.OFFPEAK_CHANNEL_ID && !config.OFFPEAK_RPC_URL) throw new Error("A channel is read from the chain, which needs OFFPEAK_RPC_URL")
+  if (config.OFFPEAK_CHANNEL_DEPOSIT && !config.OFFPEAK_CHANNEL_STATE_FILE) throw new Error("A deposit needs OFFPEAK_CHANNEL_STATE_FILE, or every start would fund a new channel")
   if (Boolean(config.OFFPEAK_CHANNEL_SEQ) !== Boolean(config.OFFPEAK_CHANNEL_CUMULATIVE)) throw new Error("Set OFFPEAK_CHANNEL_SEQ and OFFPEAK_CHANNEL_CUMULATIVE as a pair")
   return config
 }
@@ -86,10 +88,11 @@ function deployment(file: string | undefined): Deployment | undefined {
 /** The key signs inside this process. Requests carry signatures, never the key. */
 export function clientFrom(config: McpConfig, fetcher?: typeof fetch, publicClient?: OffpeakOptions["publicClient"]) {
   const known = config.OFFPEAK_CHANNEL_SEQ && config.OFFPEAK_CHANNEL_CUMULATIVE ? { seq: BigInt(config.OFFPEAK_CHANNEL_SEQ), cumulative: BigInt(config.OFFPEAK_CHANNEL_CUMULATIVE) } : undefined
+  const store = config.OFFPEAK_CHANNEL_STATE_FILE ? fileChannelStore(config.OFFPEAK_CHANNEL_STATE_FILE) : undefined
   const channel = config.OFFPEAK_CHANNEL_ID
-    ? { id: config.OFFPEAK_CHANNEL_ID, known }
+    ? { id: config.OFFPEAK_CHANNEL_ID, known, store }
     : config.OFFPEAK_CHANNEL_DEPOSIT
-      ? { deposit: BigInt(config.OFFPEAK_CHANNEL_DEPOSIT), expirySeconds: config.OFFPEAK_CHANNEL_EXPIRY_S }
+      ? { deposit: BigInt(config.OFFPEAK_CHANNEL_DEPOSIT), expirySeconds: config.OFFPEAK_CHANNEL_EXPIRY_S, store }
       : undefined
   return new Offpeak({
     baseURL: config.OFFPEAK_PUBLIC_BASE_URL,

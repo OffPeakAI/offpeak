@@ -377,6 +377,12 @@ describe("configuration", () => {
     expect(() => readConfig({ ...good, OFFPEAK_AGENT_WALLET_KEY: AGENT_KEY, OFFPEAK_CHANNEL_ID: id })).toThrow("OFFPEAK_RPC_URL")
   })
 
+  test("a deposit needs a state file, so a restart cannot fund a second channel", () => {
+    const base = { ...good, OFFPEAK_AGENT_WALLET_KEY: AGENT_KEY, OFFPEAK_CHANNEL_DEPOSIT: "1000000", OFFPEAK_RPC_URL: "http://rpc.test" }
+    expect(() => readConfig(base)).toThrow("OFFPEAK_CHANNEL_STATE_FILE")
+    expect(readConfig({ ...base, OFFPEAK_CHANNEL_STATE_FILE: "/run/offpeak/channel.json" }).OFFPEAK_CHANNEL_DEPOSIT).toBe("1000000")
+  })
+
   test("a restart states both halves of what it signed, or neither", () => {
     const id = `0x${"ab".repeat(32)}`
     const base = { ...good, OFFPEAK_AGENT_WALLET_KEY: AGENT_KEY, OFFPEAK_CHANNEL_ID: id, OFFPEAK_RPC_URL: "http://rpc.test" }

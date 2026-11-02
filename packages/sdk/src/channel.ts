@@ -1,7 +1,8 @@
 import { ChannelManagerAbi } from "@offpeak/abis"
-import { CHAIN_ID, CHANNEL_MIN_LIFETIME_S, channelAuthHeader, coopCloseTypes, domain, voucherTypes, type Micro, type UsageEnvelope } from "@offpeak/shared"
+import { CHAIN_ID, CHANNEL_CHALLENGE_S, CHANNEL_MIN_LIFETIME_S, channelAuthHeader, coopCloseTypes, domain, voucherTypes, type Micro, type UsageEnvelope } from "@offpeak/shared"
 import { bytesToHex, decodeFunctionData, encodeAbiParameters, erc20Abi, keccak256, type Address, type Hex, type PublicClient, type WalletClient } from "viem"
 import { z } from "zod"
+import type { ChannelStore } from "./channel-store.ts"
 import { OffpeakError, addressSchema, assertChain, bytes32Schema, digitsSchema, errorFrom, hexSchema, nowSeconds, type ClientContext, type Signer } from "./core.ts"
 import { overMaxPrice, type MaxPrice } from "./verify.ts"
 
@@ -23,6 +24,8 @@ export type ChannelConfig = {
   id?: string
   /** The `seq` and `cumulative` you kept from `snapshot()` for that channel. */
   known?: { seq: bigint; cumulative: Micro }
+  /** Keeps the channel across restarts. With `deposit`, a start reuses the kept channel instead of funding another. */
+  store?: ChannelStore
   /** Sign a voucher after each response. On unless you call `.voucher()` yourself. */
   autoVoucher?: boolean
 }
@@ -66,6 +69,8 @@ type Active = {
 export type Ticket = { channel: Active; voucher: VoucherReceipt | null; cap?: MaxPrice }
 
 export type Finished = { owed?: Micro; envelope?: UsageEnvelope; delivered: boolean; voucherRefused?: boolean }
+
+const highest = (...values: (bigint | undefined)[]) => values.reduce<bigint>((best, value) => (value !== undefined && value > best ? value : best), 0n)
 
 const encodeVoucher = (v: VoucherReceipt) => Buffer.from(JSON.stringify({ seq: v.seq.toString(), cumulative: v.cumulative.toString(), sig: v.sig })).toString("base64url")
 
@@ -115,6 +120,8 @@ export class Channels {
     if (allowance < deposit) await this.send(reader, writer, usdg, erc20Abi, "approve", [manager, deposit])
     const salt = bytesToHex(crypto.getRandomValues(new Uint8Array(32)))
     const channelId = keccak256(encodeAbiParameters([{ type: "address" }, { type: "bytes32" }], [account.address, salt]))
+    // Kept before the money moves, so a crash here cannot leave a funded channel nobody remembers.
+    await this.config?.store?.save({ id: channelId, seq: 0n, cumulative: 0n })
     const txHash = await this.send(reader, writer, manager, ChannelManagerAbi, "open", [deposit, BigInt(until), salt])
     this.active = this.fresh(channelId, deposit, until, 0n, 0n)
     await this.awaitRouter(channelId)
@@ -138,12 +145,14 @@ export class Channels {
     if (onChain.payer.toLowerCase() !== signer.address) throw new OffpeakError("not_your_channel", "This wallet is not the channel's payer")
     const view = await this.read(id)
     if (!view) throw new OffpeakError("unknown_channel", "Router does not know this channel")
-    const heard = BigInt(view.latestSeq) > onChain.lastSeq ? BigInt(view.latestSeq) : onChain.lastSeq
-    const seq = known && known.seq > heard ? known.seq : heard
-    const signed = known && known.cumulative > onChain.claimed ? known.cumulative : onChain.claimed
+    const saved = await this.config?.store?.load()
+    const kept = saved?.id === id ? saved : undefined
+    const seq = highest(BigInt(view.latestSeq), onChain.lastSeq, known?.seq, kept?.seq)
+    const signed = highest(onChain.claimed, known?.cumulative, kept?.cumulative)
     const ch = this.fresh(id, onChain.deposit, Number(onChain.expiry), seq, signed)
     const owed = BigInt(view.owed)
     if (owed > signed) ch.reported.push(owed)
+    await this.keep(ch)
     this.active = ch
     return this.snapshot()!
   }
@@ -238,6 +247,7 @@ export class Channels {
       }
       // The caller already has its answer. A voucher that fails here shows in `snapshot()`, and the credit limit stops further spend.
       try {
+        if (done.voucherRefused) await this.keep(ch)
         if (done.envelope) await this.count(ch, done.envelope, ticket.cap)
         if (done.owed !== undefined) ch.reported.push(done.owed)
         if (!this.auto) return
@@ -260,9 +270,30 @@ export class Channels {
   private async start(): Promise<Active> {
     const { config } = this
     if (config?.id) await this.attach(config.id, config.known)
-    else if (config?.deposit) await this.open(config.deposit, nowSeconds() + (config.expirySeconds ?? CHANNEL_MIN_LIFETIME_S * 2))
+    else if (config?.deposit) {
+      const saved = await config.store?.load()
+      if (!saved || !(await this.reuse(saved.id))) await this.open(config.deposit, nowSeconds() + (config.expirySeconds ?? CHANNEL_MIN_LIFETIME_S * 2))
+    }
     if (!this.active) throw new OffpeakError("no_channel", "No channel is open")
     return this.active
+  }
+
+  /** A kept channel that has ended, or that the router will no longer serve, leaves nothing to reuse. Any other failure stops the start, because a new deposit could strand the old one. */
+  private async reuse(id: Hex) {
+    try {
+      await this.attach(id)
+    } catch (err) {
+      if (err instanceof OffpeakError && err.code === "channel_not_open") return false
+      throw err
+    }
+    if (this.active!.expiry > nowSeconds() + CHANNEL_CHALLENGE_S) return true
+    this.active = null
+    return false
+  }
+
+  /** Written before a voucher leaves, so a restart never signs the same sequence number twice. */
+  private async keep(ch: Active, seq = ch.seq, cumulative = ch.signed) {
+    await this.config?.store?.save({ id: ch.id, seq, cumulative })
   }
 
   private fresh(id: Hex, deposit: Micro, expiry: number, seq: bigint, owed: Micro): Active {
@@ -375,6 +406,7 @@ export class Channels {
       primaryType: "Voucher",
       message: { channelId: ch.id, seq, cumulative },
     })
+    await this.keep(ch, seq, cumulative)
     ch.seq = seq
     ch.signed = cumulative
     ch.outbox = { seq, cumulative, sig, delivered: false }
@@ -402,6 +434,7 @@ export class Channels {
     }
     const refused = await errorFrom(res)
     ch.signed = ch.accepted
+    await this.keep(ch)
     ch.refused = `Router refused voucher ${receipt.seq}: ${refused.message}`
     if (strict) throw refused
   }

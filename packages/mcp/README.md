@@ -44,7 +44,7 @@ Use an API key, an agent wallet, or both.
 - **`OFFPEAK_API_KEY`** pays from your prepaid vault balance. Night jobs need it.
 - **`OFFPEAK_AGENT_WALLET_KEY`** is a key for a local wallet. It stays in this process and signs vouchers and payer proofs here. Requests carry signatures, never the key. Use a wallet that holds only what you mean this agent to spend.
 
-With a wallet, set `OFFPEAK_CHANNEL_ID` to use an open channel, or `OFFPEAK_CHANNEL_DEPOSIT` and `OFFPEAK_RPC_URL` to open one on the first call. With neither, and no API key, a call pays by `upto`, which needs a Permit2 approval and has a 1 USDG limit per call. The router offers `upto` only from 0.05 USDG, so most single calls need a channel or a key. A channel wins over an API key when both are set.
+With a wallet, set `OFFPEAK_CHANNEL_ID` to use an open channel, or `OFFPEAK_CHANNEL_DEPOSIT`, `OFFPEAK_CHANNEL_STATE_FILE` and `OFFPEAK_RPC_URL` to open one on the first call. The state file keeps the channel's id, so a restart reuses it and funds a new one only once that channel has closed or is about to expire. A start that cannot read the file, or cannot read the channel it names, stops rather than deposit again. Give each running server its own file. With neither, and no API key, a call pays by `upto`, which needs a Permit2 approval and has a 1 USDG limit per call. The router offers `upto` only from 0.05 USDG, so most single calls need a channel or a key. A channel wins over an API key when both are set.
 
 A voucher is signed only for what verified usage records cover. If the records do not add up, `offpeak_complete` shows the reason in `channel.voucher_problem` and no voucher is signed, so the router's credit limit stops further spend. On restart, an existing channel starts from the router's last voucher, and the router's `owed` past that goes on the next voucher unchecked.
 
@@ -64,6 +64,7 @@ These tools do not close a channel. Use `op.channels.close()` from `@offpeak/sdk
 | `OFFPEAK_CHANNEL_SEQ`, `OFFPEAK_CHANNEL_CUMULATIVE` | to restart on a used channel | The `seq` and `signed` the server last reported. Set both, or debt from before the restart stops vouchers until you settle it |
 | `OFFPEAK_CHANNEL_DEPOSIT` | no | µUSDG to deposit when opening one |
 | `OFFPEAK_CHANNEL_EXPIRY_S` | no | That channel's lifetime in seconds |
+| `OFFPEAK_CHANNEL_STATE_FILE` | with a deposit | Path this server keeps its channel in. With `OFFPEAK_CHANNEL_ID` it replaces `OFFPEAK_CHANNEL_SEQ` and `OFFPEAK_CHANNEL_CUMULATIVE` |
 | `OFFPEAK_MCP_HOST` | no | HTTP bind address, default `127.0.0.1` |
 | `OFFPEAK_MCP_PORT` | no | HTTP port, default `8790` |
 | `OFFPEAK_MCP_TOKEN` | to leave this machine | Bearer token for HTTP, at least 32 characters |
