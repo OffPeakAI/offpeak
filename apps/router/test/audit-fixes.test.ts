@@ -1,9 +1,13 @@
-import { describe, expect, test } from "bun:test"
-import { CHANNEL_CREDIT_CAP_MICRO, PERMIT2, channelAuthHeader, channelPaymentId, domain, parseRecord, permitWitnessTypes, recordToMessage, signTyped, usageTypes, voucherTypes } from "@offpeak/shared"
+import { describe, expect, spyOn, test } from "bun:test"
+import { CHANNEL_CREDIT_CAP_MICRO, PERMIT2, canonicalJson, channelAuthHeader, channelPaymentId, domain, parseRecord, permitWitnessTypes, recordToMessage, signTyped, usageTypes, voucherTypes } from "@offpeak/shared"
 import { keccak256, toBytes, type Hex } from "viem"
+import { generatePrivateKey, privateKeyToAccount } from "viem/accounts"
 import { roleAccount } from "../../../packages/shared/src/test-keys.ts"
 import { bootStack } from "./support/stack.ts"
 import { uptoHeader } from "./support/upto.ts"
+import { sweepSessions } from "../src/auth/siwe.ts"
+import { clientIp } from "../src/http.ts"
+import * as tokenize from "../src/metering/tokenize.ts"
 import { loadFactorBps } from "../src/pricing/live.ts"
 import { LoadMeter } from "../src/pricing/load.ts"
 import { reserveChannel } from "../src/pay/channel-store.ts"
@@ -465,5 +469,175 @@ describe("channel credit across a payer's channels", () => {
     const sig = await buyer.signTypedData({ domain: domain("OffpeakChannel", booted.stack.channelManager), types: voucherTypes, primaryType: "Voucher", message: { channelId: a, seq: 1n, cumulative } })
     expect((await booted.app.request(`/v1/channels/${a}/voucher`, { method: "POST", body: JSON.stringify({ seq: "1", cumulative: cumulative.toString(), sig }) })).status).toBe(200)
     expect(await owed(booted)).toBe(0n)
+  })
+})
+
+describe("routes anyone can reach", () => {
+  const wallet = `0x${"ab".repeat(20)}`
+  const post = (booted: Booted, path: string, body: unknown, headers: Record<string, string> = {}) => booted.app.request(path, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) })
+  const sessions = async (booted: Booted) => (await booted.stack.db.query("SELECT 1 FROM serving.siwe_sessions")).rows.length
+
+  test("a nonce needs a real wallet, and no row is written for anything else", async () => {
+    const booted = await bootStack()
+    expect((await post(booted, "/v1/auth/nonce", { wallet: "0x1" })).status).toBe(400)
+    expect((await post(booted, "/v1/auth/nonce", { wallet: "x".repeat(1024 * 1024) })).status).toBe(413)
+    expect((await booted.app.request("/v1/auth/nonce", { method: "POST", body: "not json" })).status).toBe(400)
+    expect(await sessions(booted)).toBe(0)
+    expect((await post(booted, "/v1/auth/nonce", { wallet })).status).toBe(200)
+    expect(await sessions(booted)).toBe(1)
+  })
+
+  test("nonces stop at the limit for one address, not for the next, and come back the next minute", async () => {
+    const booted = await bootStack()
+    booted.stack.proxyHops = 1
+    const from = (ip: string) => post(booted, "/v1/auth/nonce", { wallet }, { "x-forwarded-for": `1.1.1.1, ${ip}` })
+    for (let i = 0; i < 30; i++) expect((await from("9.9.9.9")).status).toBe(200)
+    const refused = await from("9.9.9.9")
+    expect(refused.status).toBe(429)
+    expect(await errorCode(refused)).toBe("ip_limit")
+    expect(await sessions(booted)).toBe(30)
+    expect((await from("8.8.8.8")).status).toBe(200)
+    booted.stack.setClock(booted.stack.clock() + 60)
+    expect((await from("9.9.9.9")).status).toBe(200)
+  })
+
+  test("a login that cannot be read is refused without a throw", async () => {
+    const booted = await bootStack()
+    expect((await post(booted, "/v1/auth/login", { message: 1 })).status).toBe(401)
+    expect((await post(booted, "/v1/auth/login", { message: "m".repeat(5000), signature: "0x12" })).status).toBe(401)
+  })
+
+  test("nonces nobody spent are swept, and live rows stay", async () => {
+    const booted = await bootStack()
+    await post(booted, "/v1/auth/nonce", { wallet })
+    await booted.stack.db.query("INSERT INTO serving.siwe_sessions (id, wallet, nonce, expires_at) VALUES ('sess_live', $1, '', to_timestamp($2))", [wallet, booted.stack.clock() + 86_400])
+    await sweepSessions(booted.stack)
+    expect(await sessions(booted)).toBe(2)
+    booted.stack.setClock(booted.stack.clock() + 601)
+    await sweepSessions(booted.stack)
+    expect((await booted.stack.db.query<{ id: string }>("SELECT id FROM serving.siwe_sessions")).rows).toEqual([{ id: "sess_live" }])
+  })
+
+  async function registration(booted: Booted, endpoint = "https://host.example/") {
+    const account = privateKeyToAccount(generatePrivateKey())
+    const operator = account.address.toLowerCase() as Hex
+    return { operator, endpoint, sig: await account.signMessage({ message: canonicalJson({ endpoint, operator }) }), models: [{ digest: booted.modelDigest, maxTps: 1 }], imageDigest: booted.imageDigest, gpuClass: booted.imageDigest }
+  }
+  const hostRows = async (booted: Booted) => (await booted.stack.db.query("SELECT 1 FROM serving.hosts_cache")).rows.length
+
+  test("registration bounds every field it stores", async () => {
+    const booted = await bootStack()
+    expect((await post(booted, "/v1/hosts/register", await registration(booted, `https://${"a".repeat(1024 * 1024)}.example/`))).status).toBe(413)
+    expect((await post(booted, "/v1/hosts/register", await registration(booted, `https://${"a".repeat(600)}.example/`))).status).toBe(400)
+    expect((await post(booted, "/v1/hosts/register", { operator: "0x1" })).status).toBe(400)
+    expect(await hostRows(booted)).toBe(0)
+    expect((await post(booted, "/v1/hosts/register", await registration(booted))).status).toBe(200)
+    expect(await hostRows(booted)).toBe(1)
+  })
+
+  test("fresh keys stop at the limit for one address", async () => {
+    const booted = await bootStack()
+    for (let i = 0; i < 10; i++) expect((await post(booted, "/v1/hosts/register", await registration(booted))).status).toBe(200)
+    expect((await post(booted, "/v1/hosts/register", await registration(booted))).status).toBe(429)
+    expect(await hostRows(booted)).toBe(10)
+  })
+
+  test("the address is the socket's unless a proxy is trusted, and then only what that proxy wrote", () => {
+    const req = new Request("http://router.test", { headers: { "x-forwarded-for": "6.6.6.6, 2.2.2.2" } })
+    const server = { requestIP: () => ({ address: "3.3.3.3" }) }
+    expect(clientIp(req, server, 0)).toBe("3.3.3.3")
+    expect(clientIp(req, server, 1)).toBe("2.2.2.2")
+    expect(clientIp(req, server, 2)).toBe("6.6.6.6")
+    expect(clientIp(new Request("http://router.test"), undefined, 0)).toBe("unknown")
+  })
+})
+
+describe("counting tokens", () => {
+  const big = "lorem ipsum dolor ".repeat(Math.floor((3.9 * 1024 * 1024) / 18))
+  const embedBody = (input: string) => JSON.stringify({ model: "ofm-embed", input })
+  const chatLong = (input: string) => JSON.stringify({ model: "ofm-8b", messages: [{ role: "user", content: input }] })
+  const send = (booted: Booted, path: string, body: string, headers: Record<string, string> = {}) => booted.app.request(path, { method: "POST", headers: { "content-type": "application/json", ...headers }, body })
+
+  function counts() {
+    const inputs = spyOn(tokenize, "countInputs")
+    const chats = spyOn(tokenize, "countChat")
+    inputs.mockClear()
+    chats.mockClear()
+    return {
+      total: () => inputs.mock.calls.length + chats.mock.calls.length,
+      restore: () => {
+        inputs.mockRestore()
+        chats.mockRestore()
+      },
+    }
+  }
+
+  test("a key that does not exist is turned away first", async () => {
+    const booted = await bootStack()
+    const seen = counts()
+    try {
+      const res = await send(booted, "/v1/embeddings", embedBody("hello"), { authorization: "Bearer op_live_nobody" })
+      expect(res.status).toBe(401)
+      expect(seen.total()).toBe(0)
+    } finally {
+      seen.restore()
+    }
+  })
+
+  test("a channel header with no proof is turned away first, on both routes", async () => {
+    const booted = await bootStack()
+    openChannel(booted)
+    const seen = counts()
+    try {
+      const bare = { "x-offpeak-channel": channelId }
+      expect((await send(booted, "/v1/embeddings", embedBody("hello"), bare)).status).toBe(401)
+      expect((await send(booted, "/v1/chat/completions", chatLong(big), bare)).status).toBe(401)
+      expect((await send(booted, "/v1/chat/completions", chatLong(big), { "x-offpeak-channel": `0x${"cd".repeat(32)}` })).status).toBe(402)
+      expect(seen.total()).toBe(0)
+    } finally {
+      seen.restore()
+    }
+  })
+
+  test("a channel's proof is spent once, and a proved request still bills", async () => {
+    const booted = await bootStack()
+    openChannel(booted)
+    const body = chatBody("hello")
+    const auth = await channelAuthHeader(buyer, { channelId, ts: booted.stack.clock(), body })
+    const headers = { "x-offpeak-channel": channelId, "x-offpeak-channel-auth": auth }
+    expect((await send(booted, "/v1/chat/completions", body, headers)).status).toBe(200)
+    expect((await send(booted, "/v1/chat/completions", body, headers)).status).toBe(401)
+  })
+
+  test("long unpaid bodies draw on their address, and stop before the tokenizer", async () => {
+    const booted = await bootStack()
+    const seen = counts()
+    try {
+      expect((await send(booted, "/v1/embeddings", embedBody(big))).status).toBe(402)
+      expect((await send(booted, "/v1/embeddings", embedBody(big))).status).toBe(402)
+      const before = seen.total()
+      expect(before).toBe(2)
+      const res = await send(booted, "/v1/embeddings", embedBody(big))
+      expect(res.status).toBe(429)
+      expect(await errorCode(res)).toBe("ip_limit")
+      expect((await send(booted, "/v1/chat/completions", chatLong(big))).status).toBe(429)
+      expect(seen.total()).toBe(before)
+    } finally {
+      seen.restore()
+    }
+  })
+
+  test("a junk x402 header draws on the same budget", async () => {
+    const booted = await bootStack()
+    const junk = { "payment-signature": JSON.stringify({ scheme: "upto", payload: {} }) }
+    for (let i = 0; i < 2; i++) await send(booted, "/v1/chat/completions", chatLong(big), junk)
+    const res = await send(booted, "/v1/chat/completions", chatLong(big), junk)
+    expect(res.status).toBe(429)
+  })
+
+  test("small quotes and keyed requests are not held up", async () => {
+    const booted = await bootStack()
+    for (let i = 0; i < 40; i++) expect((await send(booted, "/v1/embeddings", embedBody("hello"))).status).toBe(402)
+    expect((await send(booted, "/v1/embeddings", embedBody("hello"), { authorization: `Bearer ${booted.key.token}` })).status).toBe(200)
   })
 })

@@ -20,6 +20,8 @@ export const signature = z
   .regex(/^0x([0-9a-fA-F]{2}){1,8192}$/)
   .transform((value) => value as Hex)
 
+export const wallet = z.string().regex(/^0x[0-9a-fA-F]{40}$/)
+
 export const voucherBody = z.object({ seq: decimal, cumulative: decimal, sig: signature })
 
 export const closeBody = z.object({ finalCumulative: decimal, deadline: decimal, payerSig: signature })

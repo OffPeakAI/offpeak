@@ -34,6 +34,7 @@ import { intakeFlex } from "./batches.ts"
 import { commitRecord, flagMetering } from "./commit.ts"
 import type { ModelEntry, PayHold, Payer, Stack } from "../context.ts"
 import { auth } from "../auth/keys.ts"
+import { beforeCounting } from "../auth/limits.ts"
 import { nextCheaper } from "../offpeak/forecast.ts"
 import { authorize, paymentRequiredResponse, release, resolveWindow, waitAuthorized } from "../pay/authorize.ts"
 import { flushCapture } from "../pay/captures.ts"
@@ -409,7 +410,7 @@ function parseFlex(header: string | null) {
   return parsed.success ? Math.floor(Date.parse(parsed.data) / 1000) : null
 }
 
-export async function serveChat(stack: Stack, req: Request, night?: NightLine): Promise<Response> {
+export async function serveChat(stack: Stack, req: Request, night?: NightLine, ip = "unknown"): Promise<Response> {
   const entered = performance.now()
   const started = stack.clock()
   if (isSealed(req)) return serveSealed(stack, req)
@@ -434,6 +435,8 @@ export async function serveChat(stack: Stack, req: Request, night?: NightLine): 
   if (!model) return oai(404, "Unknown model", "invalid_request", "model_not_found")
   if (!unpaid && (authed as Payer).mode === 2) return oai(400, "exact is for fixed-cost calls such as embeddings", "invalid_request", "exact_not_allowed")
   if (!messagesOk(body.messages)) return oai(400, "Messages need text content", "invalid_request", "bad_messages")
+  const refused = await beforeCounting(stack, unpaid ? null : (authed as Payer), raw, ip)
+  if (refused) return refused
   const tokensIn = Buffer.byteLength(raw) + 64
   if (!tokenLimits.safeParse(body).success) return oai(400, "max_tokens must be a positive integer", "invalid_request", "bad_max_tokens")
   const asked = askedTokens(body) as number | null | undefined

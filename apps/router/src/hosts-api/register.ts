@@ -1,8 +1,22 @@
 import { encodeFunctionData, keccak256, toBytes, type Hex } from "viem"
 import { hostRegistryAbi } from "@offpeak/abis"
 import { CHAIN_ID, canonicalJson, recoverPersonal } from "@offpeak/shared"
+import { z } from "zod"
+import { signature, wallet } from "../pay/schemas.ts"
 import { endpointAllowed, saveEndpoint } from "../routing/probes.ts"
 import type { Stack } from "../pipeline.ts"
+
+const digest = z.string().regex(/^0x[0-9a-fA-F]{64}$/).transform((value) => value as Hex)
+const MAX_HOST_MODELS = 64
+
+export const registerBody = z.object({
+  operator: wallet.transform((value) => value as Hex),
+  endpoint: z.string().max(512),
+  sig: signature,
+  models: z.array(z.object({ digest, maxTps: z.int().positive() })).min(1).max(MAX_HOST_MODELS),
+  imageDigest: digest,
+  gpuClass: digest,
+})
 
 export function registerCalldata(registry: Hex, body: {
   operator: Hex

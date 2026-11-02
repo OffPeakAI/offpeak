@@ -15,6 +15,7 @@ import {
 } from "@offpeak/shared"
 import { randomBytes } from "node:crypto"
 import { z } from "zod"
+import { beforeCounting } from "../auth/limits.ts"
 import { countInputs } from "../metering/tokenize.ts"
 import { auth, type Payer, type PayHold, type Stack } from "../pipeline.ts"
 import { signRouterBody } from "../../../host-agent/src/proxy.ts"
@@ -69,7 +70,7 @@ async function serveOne(stack: Stack, routes: Route[], pay: PayHold, reqId: Hex,
 }
 
 /** Embeddings are billed on input tokens only. Known cost, so `exact` is a valid agent path. */
-export async function serveEmbeddings(stack: Stack, req: Request): Promise<Response> {
+export async function serveEmbeddings(stack: Stack, req: Request, ip = "unknown"): Promise<Response> {
   const raw = await req.text()
   if (raw.length > BODY_LIMIT) return oai(413, "Body too large", "invalid_request", "body_too_large")
   let json: unknown
@@ -85,10 +86,14 @@ export async function serveEmbeddings(stack: Stack, req: Request): Promise<Respo
   const modelName = body.model ?? DEFAULT_EMBEDDINGS_MODEL
   const model = stack.models.find((row) => row.name === modelName && row.kind === "embeddings")
   if (!model) return oai(404, "Unknown model", "invalid_request", "model_not_found")
-  const tokensIn = countInputs(model, inputs)
   const started = stack.clock()
   const authed = await auth(stack, new Request(req.url, { headers: req.headers }))
+  const quoteOnly = authed instanceof Response && authed.status === 402 && ((await authed.clone().json()) as { error: { code: string } }).error.code === "payment_required"
+  if (authed instanceof Response && !quoteOnly) return authed
   if (!(authed instanceof Response) && authed.mode === 4) return oai(400, "Windows draw on chat requests only", "invalid_request", "window_unsupported")
+  const refused = await beforeCounting(stack, quoteOnly ? null : (authed as Payer), raw, ip)
+  if (refused) return refused
+  const tokensIn = countInputs(model, inputs)
   const feeBps = authed instanceof Response ? FEE_BPS_DEFAULT : (authed as Exclude<Payer, { mode: 4 }>).feeBps
   const targets = selectHost(await candidates(stack, model.digest, started, feeBps), { sealed: false, canary: false, interactive: true }).slice(0, 2)
   const routes = targets.flatMap((target): Route[] => {
@@ -98,11 +103,8 @@ export async function serveEmbeddings(stack: Stack, req: Request): Promise<Respo
     return [{ target, priced, cost, total: cost.totalMicro }]
   })
   const first = routes[0]
-  if (!first) return authed instanceof Response && authed.status !== 402 ? authed : oai(503, "No healthy host", "capacity", "no_capacity")
-  if (authed instanceof Response) {
-    if (authed.status === 402 && ((await authed.clone().json()) as { error: { code: string } }).error.code === "payment_required") return paymentRequiredResponse(stack, first.total, true)
-    return authed
-  }
+  if (!first) return oai(503, "No healthy host", "capacity", "no_capacity")
+  if (authed instanceof Response) return paymentRequiredResponse(stack, first.total, true)
   const payer = authed as Exclude<Payer, { mode: 4 }>
   const quote = routes.reduce((max, route) => (route.total > max ? route.total : max), 0n)
   // `exact` pays the best host's price. A prepaid hold or a channel reservation can cover the failover too.

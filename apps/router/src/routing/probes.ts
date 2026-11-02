@@ -7,6 +7,7 @@ import type { Stack } from "../context.ts"
 const PROBE_TIMEOUT_MS = 2_000
 const RESOLVED_TTL_MS = 30_000
 const RESOLVED_MAX = 1024
+const ENDPOINT_MAX_LENGTH = 512
 
 type Subnet = [address: string, prefix: number, family: "ipv4" | "ipv6"]
 
@@ -107,6 +108,7 @@ export async function probeHosts(stack: Stack) {
 
 /** Hosts sit behind TLS in production. Local runs reach them over plain HTTP. */
 export function endpointAllowed(endpoint: string, production: boolean) {
+  if (endpoint.length > ENDPOINT_MAX_LENGTH) return false
   try {
     const url = new URL(endpoint)
     if (url.username || url.password || url.search || url.hash) return false

@@ -97,6 +97,17 @@ export async function channelProof(stack: Stack, ch: ChannelChain, channelId: He
   return used === 1n ? signed : "bad"
 }
 
+/** Checks a channel request's proof once, as early as its route can. A `Response` means it was refused. */
+export async function proveChannel(stack: Stack, payer: Extract<Payer, { mode: 3 }>, rawBody: string) {
+  const ch = await stack.indexer.channel(payer.channelId)
+  if (!ch) return oai(402, "Unknown channel", "payment", "payment_required")
+  const proved = await channelProof(stack, ch, payer.channelId, payer.proof, rawBody)
+  if (proved === "unavailable") return unverified()
+  if (proved === "bad") return oai(401, "Channel request is not signed by the payer", "auth", "bad_channel_auth")
+  payer.proved = proved
+  return null
+}
+
 /** The buyer's chain state as admission reads it, with any pending lower cap already applied. */
 export function holdView(stack: Stack, buyer: BuyerChain): HoldView {
   const caps = effectiveCaps(buyer.hourlyCap, buyer.dailyCap, buyer.pendingHourlyCap, buyer.pendingDailyCap, buyer.capsEffectiveAfterHour > 0n)
@@ -135,16 +146,15 @@ export async function authorize(stack: Stack, payer: Payer, maxCostMicro: bigint
     return { kind: "prepaid", holdId, wallet: payer.wallet, max: maxCostMicro, payRef: ZERO_BYTES32 }
   }
   if (payer.mode === 3) {
+    const refused = payer.proved ? null : await proveChannel(stack, payer, rawBody)
+    if (refused) return refused
     const ch = await stack.indexer.channel(payer.channelId)
     if (!ch) return oai(402, "Unknown channel", "payment", "payment_required")
-    const proved = await channelProof(stack, ch, payer.channelId, payer.proof, rawBody)
-    if (proved === "unavailable") return unverified()
-    if (proved === "bad") return oai(401, "Channel request is not signed by the payer", "auth", "bad_channel_auth")
     if (payer.voucher) {
-      const refused = await applyVoucher(stack, ch, payer.channelId, payer.voucher)
-      if (refused) return refused
+      const voucherRefused = await applyVoucher(stack, ch, payer.channelId, payer.voucher)
+      if (voucherRefused) return voucherRefused
     }
-    const decision = await reserveChannel(stack.db, ch, payer.channelId, maxCostMicro, stack.clock(), { contractPayer: proved === "contract" })
+    const decision = await reserveChannel(stack.db, ch, payer.channelId, maxCostMicro, stack.clock(), { contractPayer: payer.proved === "contract" })
     if (!decision.ok) return oai(402, decision.error, "payment", decision.error)
     return { kind: "channel", channelId: payer.channelId, reservationId: decision.reservationId, wallet: ch.payer as Hex, max: maxCostMicro, payRef: payer.channelId }
   }

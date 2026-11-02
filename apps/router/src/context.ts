@@ -3,7 +3,7 @@ import type { ChainReader, Hex, Keyed, PaymentClient, PaymentPayload } from "@of
 import type { PrivateKeyAccount } from "viem/accounts"
 import type { TokenizerSource } from "./metering/tokenize.ts"
 import type { HoldView } from "./pay/prepaid.ts"
-import type { WalletChain } from "./pay/signatures.ts"
+import type { SigVerdict, WalletChain } from "./pay/signatures.ts"
 import type { WindowPerf } from "./pay/window-perf.ts"
 import type { LoadMeter } from "./pricing/load.ts"
 import type { PriceSheet } from "./pricing/pricebook.ts"
@@ -105,6 +105,8 @@ export type Stack = {
   attest?: AttestBook
   internalToken?: string
   production: boolean
+  /** Proxies in front of the router that append to `X-Forwarded-For`. Zero or absent means callers connect directly. */
+  proxyHops?: number
   siweDomain?: string
   candidateCache: Map<string, { at: number; rows: HostCandidate[] }>
   serverTtftMs?: number[]
@@ -114,7 +116,7 @@ export type Stack = {
 export type Payer =
   | { mode: 0; accountId: string; wallet: Hex; feeBps: number }
   | { mode: 1 | 2; wallet: Hex; payment: PaymentPayload; feeBps: number }
-  | { mode: 3; wallet: Hex; channelId: Hex; feeBps: number; voucher?: { seq: bigint; cumulative: bigint; sig: Hex }; proof?: { ts: number; nonce: string; sig: Hex } }
+  | { mode: 3; wallet: Hex; channelId: Hex; feeBps: number; voucher?: { seq: bigint; cumulative: bigint; sig: Hex }; proof?: { ts: number; nonce: string; sig: Hex }; proved?: SigVerdict }
   | { mode: 4; wallet: Hex; windowId: bigint; accountId: string; prepaidFeeBps: number }
 
 export type PayHold =
