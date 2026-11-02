@@ -1,5 +1,5 @@
 import { ChannelManagerAbi } from "@offpeak/abis"
-import { CHAIN_ID, CHANNEL_CHALLENGE_S, CHANNEL_MIN_LIFETIME_S, channelAuthHeader, coopCloseTypes, domain, voucherTypes, type Micro, type UsageEnvelope } from "@offpeak/shared"
+import { CHAIN_ID, CHANNEL_CHALLENGE_S, CHANNEL_MIN_LIFETIME_S, askedTokens, channelAuthHeader, coopCloseTypes, countsWithinTolerance, domain, outputLimit, voucherTypes, type BuyerBody, type Micro, type RecountOutput, type UsageEnvelope } from "@offpeak/shared"
 import { bytesToHex, decodeFunctionData, encodeAbiParameters, erc20Abi, keccak256, type Address, type Hex, type PublicClient, type WalletClient } from "viem"
 import { z } from "zod"
 import type { ChannelStore } from "./channel-store.ts"
@@ -12,6 +12,12 @@ const SEEN_TIMEOUT_MS = 15_000
 const SEEN_POLL_MS = 250
 const RECEIPT_POLL_MS = 250
 const STATUS_OPEN = 1
+/** The router takes a proof this far from its own clock, so its time on a record can sit this far from ours. */
+const RECORD_SKEW_S = 60
+/** The time check turns away anything this many records back, so the saved list need not grow for good. */
+const COUNTED_KEPT = 1_000
+/** A model with no published tokenizer can still be paid for. Its hashes are checked, and `tokensOut` against `max_tokens`. */
+const NOT_COUNTED = "token_count_not_checked"
 
 const channelView = z.object({ deposit: digitsSchema, claimed: digitsSchema, cumulative: digitsSchema, owed: digitsSchema, latestSeq: digitsSchema, status: z.number().int(), expiry: digitsSchema })
 
@@ -66,9 +72,10 @@ type Active = {
   refused: string | null
 }
 
-export type Ticket = { channel: Active; voucher: VoucherReceipt | null; cap?: MaxPrice }
+/** What a response has to answer: the body as signed, its time, and for a sealed one the clear `max_tokens`, since its own body cannot be read back. */
+export type Ticket = { channel: Active; voucher: VoucherReceipt | null; cap?: MaxPrice; body: string; startedAt: number; sealedMaxTokens?: number }
 
-export type Finished = { owed?: Micro; envelope?: UsageEnvelope; delivered: boolean; voucherRefused?: boolean }
+export type Finished = { owed?: Micro; envelope?: UsageEnvelope; output?: RecountOutput; delivered: boolean; voucherRefused?: boolean }
 
 const highest = (...values: (bigint | undefined)[]) => values.reduce<bigint>((best, value) => (value !== undefined && value > best ? value : best), 0n)
 
@@ -121,7 +128,7 @@ export class Channels {
     const salt = bytesToHex(crypto.getRandomValues(new Uint8Array(32)))
     const channelId = keccak256(encodeAbiParameters([{ type: "address" }, { type: "bytes32" }], [account.address, salt]))
     // Kept before the money moves, so a crash here cannot leave a funded channel nobody remembers.
-    await this.config?.store?.save({ id: channelId, seq: 0n, cumulative: 0n })
+    await this.config?.store?.save({ id: channelId, seq: 0n, cumulative: 0n, counted: [] })
     const txHash = await this.send(reader, writer, manager, ChannelManagerAbi, "open", [deposit, BigInt(until), salt])
     this.active = this.fresh(channelId, deposit, until, 0n, 0n)
     await this.awaitRouter(channelId)
@@ -150,6 +157,7 @@ export class Channels {
     const seq = highest(BigInt(view.latestSeq), onChain.lastSeq, known?.seq, kept?.seq)
     const signed = highest(onChain.claimed, known?.cumulative, kept?.cumulative)
     const ch = this.fresh(id, onChain.deposit, Number(onChain.expiry), seq, signed)
+    ch.counted = new Set(kept?.counted)
     const owed = BigInt(view.owed)
     if (owed > signed) ch.reported.push(owed)
     await this.keep(ch)
@@ -226,15 +234,15 @@ export class Channels {
   }
 
   /** Headers for one paid request. Each call makes a new proof, so a retry never replays one. */
-  async begin(body: string, cap?: MaxPrice): Promise<{ ticket: Ticket; headers: Record<string, string> }> {
+  async begin(body: string, cap?: MaxPrice, sealedMaxTokens?: number): Promise<{ ticket: Ticket; headers: Record<string, string> }> {
     const ch = await this.ready()
     const headers: Record<string, string> = { "x-offpeak-channel": ch.id, "x-offpeak-channel-auth": await this.proof(ch, body) }
     if (ch.outbox) headers["x-offpeak-voucher"] = encodeVoucher(ch.outbox)
     ch.inFlight += 1
-    return { ticket: { channel: ch, voucher: ch.outbox, cap }, headers }
+    return { ticket: { channel: ch, voucher: ch.outbox, cap, body, startedAt: nowSeconds(), sealedMaxTokens }, headers }
   }
 
-  /** Takes what a response reported. Any voucher waits until the record behind it checks out. */
+  /** Takes what a response reported. Any voucher waits until the record behind it checks out against this request. */
   async finish(ticket: Ticket, done: Finished) {
     const ch = ticket.channel
     await this.serial(async () => {
@@ -248,7 +256,7 @@ export class Channels {
       // The caller already has its answer. A voucher that fails here shows in `snapshot()`, and the credit limit stops further spend.
       try {
         if (done.voucherRefused) await this.keep(ch)
-        if (done.envelope) await this.count(ch, done.envelope, ticket.cap)
+        if (done.envelope) await this.count(ticket, done.envelope, done.output)
         if (done.owed !== undefined) ch.reported.push(done.owed)
         if (!this.auto) return
         await this.signLatest(ch)
@@ -293,7 +301,7 @@ export class Channels {
 
   /** Written before a voucher leaves, so a restart never signs the same sequence number twice. */
   private async keep(ch: Active, seq = ch.seq, cumulative = ch.signed) {
-    await this.config?.store?.save({ id: ch.id, seq, cumulative })
+    await this.config?.store?.save({ id: ch.id, seq, cumulative, counted: [...ch.counted].slice(-COUNTED_KEPT) })
   }
 
   private fresh(id: Hex, deposit: Micro, expiry: number, seq: bigint, owed: Micro): Active {
@@ -359,16 +367,23 @@ export class Channels {
     return channelAuthHeader(this.needSigner(), { channelId: ch.id, ts: nowSeconds(), body })
   }
 
-  /** A record counts once, and only if it is signed, adds up, names a registered host, and belongs to this payer and channel, under any cap on the request. */
-  private async count(ch: Active, envelope: UsageEnvelope, cap: MaxPrice | undefined) {
+  /**
+   * A record counts once, and only if it is signed, adds up, names a registered host, belongs to this payer and
+   * channel, stays under any cap on the request, and describes the request this ticket paid for: its prompt, the
+   * output that came back, no more output tokens than `max_tokens` allowed, and a time while it ran.
+   */
+  private async count({ channel: ch, cap, body, startedAt, sealedMaxTokens }: Ticket, envelope: UsageEnvelope, output: RecountOutput | undefined) {
     const { record } = envelope
     if (ch.counted.has(record.reqId)) {
       ch.refused = `Record ${record.reqId} was reported twice`
       return
     }
-    const report = await this.ctx.verify(envelope, { payer: this.needSigner().address })
-    if (!report.ok) {
-      ch.refused = `Usage record failed: ${report.reasons.join(", ")}`
+    const sealed = sealedMaxTokens !== undefined
+    const prompt = sealed ? undefined : (JSON.parse(body) as BuyerBody)
+    const report = await this.ctx.verify(envelope, { payer: this.needSigner().address, recount: prompt && { prompt, output: output ?? "" } })
+    const failed = report.reasons.filter((reason) => reason !== NOT_COUNTED)
+    if (failed.length > 0) {
+      ch.refused = `Usage record failed: ${failed.join(", ")}`
       return
     }
     if (!report.hostRegistered) {
@@ -383,7 +398,21 @@ export class Channels {
       ch.refused = `Record ${record.reqId} bills above your max price`
       return
     }
+    if (sealed && (!envelope.sealed || record.promptHash !== keccak256(body as Hex))) {
+      ch.refused = `Record ${record.reqId} does not describe the request you sent`
+      return
+    }
+    const allowed = sealedMaxTokens ?? outputLimit(askedTokens(prompt!))
+    if (record.tokensOut > allowed && !countsWithinTolerance(record.tokensOut, allowed)) {
+      ch.refused = `Record ${record.reqId} bills ${record.tokensOut} output tokens on a limit of ${allowed}`
+      return
+    }
+    if (record.ts < startedAt - RECORD_SKEW_S || record.ts > nowSeconds() + RECORD_SKEW_S) {
+      ch.refused = `Record ${record.reqId} is dated outside its request`
+      return
+    }
     ch.counted.add(record.reqId)
+    await this.keep(ch)
     ch.verified += record.hostCostMicro + record.feeMicro
   }
 

@@ -1,12 +1,12 @@
 import { hostRegistryAbi } from "@offpeak/abis"
-import { tokenizerFromFiles, type Micro, type TokenCounter, type UsageEnvelope } from "@offpeak/shared"
+import { tokenizerFromFiles, type Micro, type RecountOutput, type TokenCounter, type UsageEnvelope } from "@offpeak/shared"
 import OpenAI from "openai"
 import { bytesToHex, type Address, type PublicClient } from "viem"
 import { z } from "zod"
 import { Channels, type ChannelConfig, type ChannelSnapshot, type Finished, type Ticket } from "./channel.ts"
 import { AddressBook, OffpeakError, chainAccess, digitsSchema, errorFrom, microToUsd, toSigner, usdToMicro, type ClientContext, type Deployment, type WalletLike } from "./core.ts"
 import { fetchProof, type ProofReport } from "./proofs.ts"
-import { SealedClient, type SealedOptions, type SealedParams, type SealedResult, type SealedStream } from "./sealed/client.ts"
+import { SealedClient, addTool, type EngineChunk, type SealedOptions, type SealedParams, type SealedResult, type SealedStream, type ToolCall } from "./sealed/client.ts"
 import { HPKE_STREAM_CONTENT_TYPE } from "./sealed/hpke.ts"
 import { tapSealed } from "./sealed/stream.ts"
 import { SseParser, tapStream, type SseEvent } from "./sse.ts"
@@ -111,6 +111,16 @@ function eventJson(event: SseEvent): Record<string, unknown> | null {
   } catch {
     return null
   }
+}
+
+/** Folds a stream back into the output its record's hash covers. */
+function foldChunk(output: { text: string; toolCalls: ToolCall[]; finish: string | null }, event: SseEvent) {
+  if (event.event || event.data === "[DONE]") return
+  const choice = (eventJson(event) as EngineChunk | null)?.choices?.[0]
+  if (!choice) return
+  output.text += choice.delta?.content ?? ""
+  output.finish = choice.finish_reason ?? output.finish
+  for (const delta of choice.delta?.tool_calls ?? []) addTool(output.toolCalls, delta)
 }
 
 /** The cap on a request, wherever it was set, so the openai client's headers count too. */
@@ -413,7 +423,7 @@ export class Offpeak {
     // Sealed bytes are signed as hex, which hashes to the same bytes on both sides.
     const signed = init.body instanceof Uint8Array ? bytesToHex(init.body) : init.body
     if (typeof signed !== "string") throw new OffpeakError("bad_body", "Channel requests sign a text body")
-    const { ticket, headers: paying } = await this.channels.begin(signed, cap)
+    const { ticket, headers: paying } = await this.channels.begin(signed, cap, init.body instanceof Uint8Array ? Number(headers.get("x-offpeak-max-tokens")) : undefined)
     for (const [name, value] of Object.entries(paying)) headers.set(name, value)
     let res: Response
     try {
@@ -460,14 +470,16 @@ export class Offpeak {
     if (res.body && (res.headers.get("content-type") ?? "").includes("text/event-stream")) {
       let envelope: UsageEnvelope | undefined
       let owed: Micro | undefined
+      const output = { text: "", toolCalls: [] as ToolCall[], finish: null as string | null }
       const body = tapStream(res.body, {
         onEvent: (event) => {
+          foldChunk(output, event)
           if (event.event === USAGE_EVENT) envelope = optionalEnvelope(eventJson(event))
           if (event.event === CHANNEL_EVENT) owed = owedFrom(String(eventJson(event)?.owed ?? ""))
         },
         onEnd: async () => {
           this.remember(envelope)
-          await settle({ delivered: true, envelope, owed })
+          await settle({ delivered: true, envelope, output, owed })
         },
         hide: hideEvents ? (event) => event.event === USAGE_EVENT || event.event === CHANNEL_EVENT : undefined,
       })
@@ -476,10 +488,12 @@ export class Offpeak {
     const json = (await res
       .clone()
       .json()
-      .catch(() => null)) as { offpeak_usage?: unknown } | null
+      .catch(() => null)) as { offpeak_usage?: unknown; choices?: { message?: { content?: string | null; tool_calls?: unknown[] | null }; finish_reason?: string | null }[] } | null
     const envelope = optionalEnvelope(json?.offpeak_usage)
     this.remember(envelope)
-    await settle({ delivered: true, envelope, owed: owedFrom(res.headers.get("x-offpeak-channel-owed")) })
+    const choice = json?.choices?.[0]
+    const output: RecountOutput = { text: choice?.message?.content ?? "", toolCalls: choice?.message?.tool_calls ?? undefined, finish: choice?.finish_reason }
+    await settle({ delivered: true, envelope, output, owed: owedFrom(res.headers.get("x-offpeak-channel-owed")) })
     return res
   }
 }

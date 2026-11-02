@@ -60,11 +60,11 @@ const sealedParams = z.looseObject({ model: z.string().min(1), messages: z.array
 
 export type SealedResult = { id: string; text: string; toolCalls?: ToolCall[]; finishReason: string | null; envelope: UsageEnvelope; host: string; price: string | null }
 
-type ToolCall = { id: string; type: string; function: { name: string; arguments: string } }
+export type ToolCall = { id: string; type: string; function: { name: string; arguments: string } }
 type ToolDelta = { index?: number; id?: string; type?: string; function?: { name?: string; arguments?: string } }
-type EngineChunk = { id?: string; choices?: { delta?: { content?: string | null; tool_calls?: ToolDelta[] }; finish_reason?: string | null }[] }
+export type EngineChunk = { id?: string; choices?: { delta?: { content?: string | null; tool_calls?: ToolDelta[] }; finish_reason?: string | null }[] }
 
-const addTool = (calls: ToolCall[], delta: ToolDelta) => {
+export const addTool = (calls: ToolCall[], delta: ToolDelta) => {
   const call = (calls[delta.index ?? calls.length] ??= { id: "", type: "function", function: { name: "", arguments: "" } })
   if (delta.id) call.id = delta.id
   if (delta.type) call.type = delta.type

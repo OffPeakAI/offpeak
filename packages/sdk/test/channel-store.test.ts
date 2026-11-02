@@ -74,7 +74,7 @@ describe("a deposit across restarts", () => {
     const before = processStart(chain, fileChannelStore(path))
     await firstCall(before)
     const { id } = before.channels.snapshot()!
-    fileChannelStore(path).save({ id, seq: 9n, cumulative: 400n })
+    fileChannelStore(path).save({ id, seq: 9n, cumulative: 400n, counted: [] })
     const after = processStart(chain, fileChannelStore(path))
     await firstCall(after)
     expect(after.channels.snapshot()).toMatchObject({ id, seq: 9n, signed: 400n })
