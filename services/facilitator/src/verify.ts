@@ -7,6 +7,8 @@ const NETWORK = `eip155:${CHAIN_ID}`
 const MIN_DEADLINE_S = 30
 const MIN_VALID_S = 60
 const EIP1271_MAGIC = "0x1626ba7e"
+/** `exact` may pass the quote by this much. Excess comes back from the reserve, so it stays small. */
+const EXACT_MARGIN_BPS = 2_000n
 const permit2Abi = parseAbi(["function nonceBitmap(address owner, uint256 wordPos) view returns (uint256)"])
 const eip1271Abi = parseAbi(["function isValidSignature(bytes32 digest, bytes signature) view returns (bytes4)"])
 
@@ -126,7 +128,9 @@ function checkTerms(deps: VerifyDeps, body: VerifyBody, now: number): string | n
   if (!isAddressEqual(payload.spender, deps.escrow)) return "wrong_spender"
   const amount = BigInt(String(payment.scheme === "exact" ? w.amount : w.maxAmount))
   if (BigInt(payload.permitted.amount) !== amount) return "wrong_amount"
-  if (amount < BigInt(required.maxAmountRequired ?? required.maxAmount ?? 0)) return "amount_too_low"
+  const quoted = BigInt(required.maxAmountRequired ?? required.maxAmount ?? 0)
+  if (amount < quoted) return "amount_too_low"
+  if (payment.scheme === "exact" && amount > (quoted * (10_000n + EXACT_MARGIN_BPS)) / 10_000n) return "amount_too_high"
   if (payment.scheme === "upto" && amount < UPTO_MIN_MAX_MICRO) return "max_too_low"
   if (BigInt(payload.deadline) < BigInt(now + MIN_DEADLINE_S)) return "deadline"
   if (BigInt(String(w.validBefore)) < BigInt(now + MIN_VALID_S)) return "valid_before"
