@@ -1,3 +1,4 @@
+import type { UsageEnvelope } from "@offpeak/shared"
 import { keccak256, type Hex } from "viem"
 import { z } from "zod"
 import { OffpeakError } from "../core.ts"
@@ -110,6 +111,22 @@ export async function* openResponse(body: ReadableStream<Uint8Array>, secret: Ui
   if (trailer?.error) throw new OffpeakError(trailer.error.code ?? "stream_error", trailer.error.message ?? "Stream failed")
   if (!splitter.lastSeen || splitter.incomplete) throw new OffpeakError("sealed_truncated", "The stream ended before the host's last frame")
   done({ outputHash: keccak256(concatBytes(...cipher)), trailer })
+}
+
+/** Keeps a sealed request's channel ticket open until its reader has checked the record, so no voucher goes out on one that fails. */
+export class SealedGate {
+  private settle: ((checked: UsageEnvelope | undefined) => Promise<void>) | null = null
+
+  hold(settle: (checked: UsageEnvelope | undefined) => Promise<void>) {
+    this.settle = settle
+  }
+
+  /** `checked` is the record that passed every check, and nothing when one failed or the reader left early. */
+  async release(checked: UsageEnvelope | undefined) {
+    const { settle } = this
+    this.settle = null
+    await settle?.(checked)
+  }
 }
 
 /** Passes a sealed stream through and reports the router's closing frame, leaving decryption to the reader. */

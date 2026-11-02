@@ -4,14 +4,14 @@ import OpenAI from "openai"
 import { bytesToHex, type Address, type PublicClient } from "viem"
 import { z } from "zod"
 import { Channels, type ChannelConfig, type ChannelSnapshot, type Finished, type Ticket } from "./channel.ts"
-import { AddressBook, OffpeakError, chainAccess, digitsSchema, errorFrom, microToUsd, toSigner, usdToMicro, type ClientContext, type Deployment, type WalletLike } from "./core.ts"
+import { AddressBook, OffpeakError, chainAccess, digitsSchema, errorFrom, microToUsd, toSigner, type ClientContext, type Deployment, type WalletLike } from "./core.ts"
 import { fetchProof, type ProofReport } from "./proofs.ts"
 import { SealedClient, addTool, type EngineChunk, type SealedOptions, type SealedParams, type SealedResult, type SealedStream, type ToolCall } from "./sealed/client.ts"
 import { HPKE_STREAM_CONTENT_TYPE } from "./sealed/hpke.ts"
-import { tapSealed } from "./sealed/stream.ts"
+import { tapSealed, type SealedGate } from "./sealed/stream.ts"
 import { SseParser, tapStream, type SseEvent } from "./sse.ts"
 import { DEFAULT_UPTO_CAP_MICRO, X402, findUpto } from "./upto.ts"
-import { envelopeSchema, overMaxPrice, verifyUsage, type MaxPrice, type VerifyOptions, type VerifyReport } from "./verify.ts"
+import { assertWithinCap, capFrom, envelopeSchema, verifyUsage, type MaxPrice, type VerifyOptions, type VerifyReport } from "./verify.ts"
 
 const NO_KEY = "offpeak-no-key"
 const PAID_PATHS = ["/v1/chat/completions", "/v1/embeddings"]
@@ -123,17 +123,6 @@ function foldChunk(output: { text: string; toolCalls: ToolCall[]; finish: string
   for (const delta of choice.delta?.tool_calls ?? []) addTool(output.toolCalls, delta)
 }
 
-/** The cap on a request, wherever it was set, so the openai client's headers count too. */
-function capFrom(headers: Headers): MaxPrice | undefined {
-  const match = /^in=([\d.]+),out=([\d.]+)$/.exec(headers.get("x-offpeak-max-price") ?? "")
-  return match ? { inPerM: usdToMicro(match[1]!), outPerM: usdToMicro(match[2]!) } : undefined
-}
-
-/** The router promised this cap. A record above it is paid for, so the caller hears of it rather than a quiet answer. */
-function assertWithinCap(envelope: UsageEnvelope, cap: MaxPrice | undefined) {
-  if (cap && overMaxPrice(envelope.record, cap)) throw new OffpeakError("over_max_price", `Request ${envelope.record.reqId} bills above your max price. You can dispute it within 7 days.`, undefined, { reqId: envelope.record.reqId })
-}
-
 function offpeakHeaders(opts: ChatOptions) {
   const headers: Record<string, string> = {}
   if (opts.maxPrice) headers["x-offpeak-max-price"] = `in=${microToUsd(opts.maxPrice.inPerM)},out=${microToUsd(opts.maxPrice.outPerM)}`
@@ -241,7 +230,7 @@ export class Offpeak {
     }
     this.channels = new Channels(this.ctx, options.channel)
     this.x402 = new X402(this.ctx, uptoCap, options.onUpto)
-    this.sealed = new SealedClient(this.ctx, options.sealed, (url, init) => this.dispatch(url, init))
+    this.sealed = new SealedClient(this.ctx, options.sealed, (url, init, gate) => this.dispatch(url, init, false, gate))
     this.openai = new OpenAI({
       baseURL: `${baseURL}/v1`,
       apiKey: this.apiKey ?? NO_KEY,
@@ -261,9 +250,7 @@ export class Offpeak {
     chatOptions.parse(opts)
     if (opts.sealed) {
       if (opts.flex !== undefined) throw new OffpeakError("sealed_no_flex", "Night jobs cannot be sealed")
-      const sealed = await this.sealed.chat(body as SealedParams, { headers: offpeakHeaders(opts) })
-      if (!body.stream) assertWithinCap((sealed as SealedResult).envelope, opts.maxPrice)
-      return sealed
+      return this.sealed.chat(body as SealedParams, { headers: offpeakHeaders(opts) })
     }
     const res = await this.dispatch(`${this.ctx.baseURL}/v1/chat/completions`, {
       method: "POST",
@@ -399,7 +386,7 @@ export class Offpeak {
   }
 
   /** `hideEvents` drops Offpeak's own stream events, which an OpenAI client would hand callers as malformed chunks. */
-  private async dispatch(input: RequestInfo | URL, init: RequestInit = {}, hideEvents = false): Promise<Response> {
+  private async dispatch(input: RequestInfo | URL, init: RequestInit = {}, hideEvents = false, gate?: SealedGate): Promise<Response> {
     const url = input instanceof Request ? input.url : String(input)
     const headers = new Headers(init.headers ?? (input instanceof Request ? input.headers : undefined))
     headers.delete("authorization")
@@ -411,7 +398,7 @@ export class Offpeak {
     }
     const usesWindow = headers.has("x-offpeak-window")
     if (usesWindow && !this.apiKey) throw new OffpeakError("window_needs_key", "Windows are drawn with an API key")
-    if (!usesWindow && this.channels.inUse) return this.viaChannel(url, init, headers, hideEvents, capFrom(headers))
+    if (!usesWindow && this.channels.inUse) return this.viaChannel(url, init, headers, hideEvents, capFrom(headers), gate)
     if (this.apiKey) {
       headers.set("authorization", `Bearer ${this.apiKey}`)
       return this.follow(await this.ctx.fetch(url, { ...init, headers }), hideEvents)
@@ -419,7 +406,7 @@ export class Offpeak {
     return this.viaUpto(url, init, headers, hideEvents)
   }
 
-  private async viaChannel(url: string, init: RequestInit, headers: Headers, hideEvents: boolean, cap: MaxPrice | undefined) {
+  private async viaChannel(url: string, init: RequestInit, headers: Headers, hideEvents: boolean, cap: MaxPrice | undefined, gate: SealedGate | undefined) {
     // Sealed bytes are signed as hex, which hashes to the same bytes on both sides.
     const signed = init.body instanceof Uint8Array ? bytesToHex(init.body) : init.body
     if (typeof signed !== "string") throw new OffpeakError("bad_body", "Channel requests sign a text body")
@@ -432,7 +419,7 @@ export class Offpeak {
       await this.channels.finish(ticket, { delivered: false })
       throw err
     }
-    return this.follow(res, hideEvents, ticket)
+    return this.follow(res, hideEvents, ticket, gate)
   }
 
   /** The fallback path: a 402 names the payment, this client signs it, and the same request goes once more. */
@@ -452,18 +439,20 @@ export class Offpeak {
   }
 
   /** Reads the usage record and owed amount off a response, leaving the response itself to the caller. */
-  private async follow(res: Response, hideEvents: boolean, ticket?: Ticket) {
+  private async follow(res: Response, hideEvents: boolean, ticket?: Ticket, gate?: SealedGate) {
     const settle = (done: Finished) => (ticket ? this.channels.finish(ticket, done) : Promise.resolve())
     if (!res.ok) {
       const refused = res.status === 402 && (await errorFrom(res)).code === "bad_voucher"
       await settle({ delivered: false, voucherRefused: refused })
       return res
     }
-    if (res.body && (res.headers.get("content-type") ?? "").includes(HPKE_STREAM_CONTENT_TYPE)) {
+    if (res.body && (gate || (res.headers.get("content-type") ?? "").includes(HPKE_STREAM_CONTENT_TYPE))) {
       const body = tapSealed(res.body, async (trailer) => {
-        const envelope = optionalEnvelope(trailer?.usage)
-        this.remember(envelope)
-        await settle({ delivered: true, envelope, owed: owedFrom(trailer?.channelOwed) })
+        this.remember(optionalEnvelope(trailer?.usage))
+        const owed = owedFrom(trailer?.channelOwed)
+        // Only the reader can check a sealed record, and it can do that only once this stream has closed.
+        if (gate) gate.hold((checked) => settle({ delivered: true, envelope: checked, owed }))
+        else await settle({ delivered: true, owed })
       })
       return new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers })
     }

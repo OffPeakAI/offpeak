@@ -136,7 +136,7 @@ For each host, this client picks a nonce, asks for a fresh quote through the rou
 
 A stream that ends before the host's last frame throws `sealed_truncated`. A record that does not describe the bytes you sent and received, names another model, or fails its signatures throws `sealed_record_mismatch`.
 
-Token counts on a sealed record come from the attested host, since the router cannot read the request. The VM signs them with a key that never leaves it, and the router and this client both check that signature. A record that bills more than the VM signed for throws `sealed_counts_mismatch`. The router also checks ciphertext length against those counts and flags outliers. `verifyUsage` cannot recount a sealed record, and it does not see the VM's signature, which comes with the stream.
+Token counts on a sealed record come from the attested host, since the router cannot read the request. The VM signs them with a key that never leaves it, and the router and this client both check that signature. A record that bills more than the VM signed for throws `sealed_counts_mismatch`. The router also checks ciphertext length against those counts and flags outliers. A record above `maxPrice` throws `over_max_price`, on a stream too, when the stream ends. On a channel the voucher waits for all of these, so a sealed reply you do not read to the end, or one that fails any check, is not signed for. `verifyUsage` cannot recount a sealed record, and it does not see the VM's signature, which comes with the stream.
 
 ## Honest limits
 
