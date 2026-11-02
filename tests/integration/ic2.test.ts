@@ -325,15 +325,20 @@ describe("IC2: settlement from real router traffic", () => {
   }, 60_000)
 
   test("an upheld dispute is paid from the reserve into the payer's vault balance", async () => {
-    const amount = 3_000_000n
+    const billed = await db.query<{ req_id: string; cost: string }>(
+      `SELECT r.req_id, r.host_cost_micro + r.fee_micro AS cost FROM shared.usage_records r JOIN chain.settlements s ON s.hour = r.hour
+       WHERE r.payer = $1 AND r.status = 'final' AND r.req_id NOT IN (SELECT req_id FROM chain.settlement_rejects) LIMIT 1`,
+      [buyer],
+    )
+    const amount = BigInt(billed.rows[0]!.cost)
     await send(host, contract("MockUSDG"), MockUSDGAbi as never, "approve", [contract("OffpeakVault"), amount])
     await send(host, contract("OffpeakVault"), OffpeakVaultAbi as never, "fundReserve", [amount])
     await db.query("INSERT INTO shared.refunds (id, payer, amount, reason, req_ids) VALUES ($1,$2,$3,$4,$5)", [
-      "dispute-1",
+      "dispute:1",
       buyer,
       amount.toString(),
-      "metering",
-      [],
+      "dispute_upheld",
+      [billed.rows[0]!.req_id],
     ])
     await mineAt(hourStart(hourIndex(await chainTime()) + 1) + 60)
     await tick(ingest, ingestState)
@@ -341,7 +346,7 @@ describe("IC2: settlement from real router traffic", () => {
     for (const worker of workers) await refundPass(worker)
     await tick(ingest, ingestState)
     expect(await vaultBalance()).toBe(amount)
-    const row = await db.query<{ paid_hour: string | null }>("SELECT paid_hour FROM shared.refunds WHERE id = 'dispute-1'")
+    const row = await db.query<{ paid_hour: string | null }>("SELECT paid_hour FROM shared.refunds WHERE id = 'dispute:1'")
     expect(row.rows[0]!.paid_hour).not.toBeNull()
 
     for (const worker of workers) await refundPass(worker)
