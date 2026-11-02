@@ -20,6 +20,7 @@
   <a href="#what-is-in-it">What is in it</a> ·
   <a href="#calling-it">Calling it</a> ·
   <a href="#run-it-locally">Run it locally</a> ·
+  <a href="#deploy-it">Deploy it</a> ·
   <a href="#repository-map">Repository map</a> ·
   <a href="#limits">Limits</a> ·
   <a href="#license">License</a>
@@ -141,6 +142,61 @@ cp .env.example .env
 | `bun run lint:claims` | Checks user-facing copy against the product rules |
 
 `.env.example` holds placeholders only. Never commit real keys.
+
+## Deploy it
+
+Nothing is deployed yet, so these are the steps a launch will follow, not a record of one. The runbooks are the full version, and they win if this page disagrees.
+
+Start from a fresh clone, then build and test before anything else:
+
+```bash
+git clone --recurse-submodules https://github.com/OffPeakAI/offpeak.git
+cd offpeak
+bun install --frozen-lockfile --ignore-scripts
+bun run contracts:build
+bun run contracts:test
+```
+
+### The contracts
+
+The full steps are in [`docs/runbooks/deploy-mainnet.md`](docs/runbooks/deploy-mainnet.md). In short:
+
+1. Create the three Safes and one key per role, and set the treasury and ops wallets.
+2. Fill in `contracts/config/chains/4663.json`, and check the USDG address against the issuer's published list.
+3. Fund a fresh deployer key with a little ETH, then set `OFFPEAK_RPC_URL` and `DEPLOYER_KEY`.
+4. Rehearse on a fork. Neither command touches the real config or deployment files:
+
+```bash
+bun run contracts:fork
+bun run deploy:rehearse
+```
+
+5. Deploy, hand ownership to the timelock, and check the wiring. `VerifyWiring` sends nothing and reverts naming the first check that fails:
+
+```bash
+cd contracts
+forge script script/Deploy.s.sol --rpc-url "$OFFPEAK_RPC_URL" --private-key "$DEPLOYER_KEY" --broadcast
+forge script script/HandOffOwnership.s.sol --rpc-url "$OFFPEAK_RPC_URL" --private-key "$DEPLOYER_KEY" --broadcast
+forge script script/VerifyWiring.s.sol --rpc-url "$OFFPEAK_RPC_URL"
+```
+
+6. Discard the deployer key, commit `packages/abis/deployments/4663.json`, and fund the protocol reserve with `fundReserve`.
+
+P2 and P3 contracts each wait for their own external audit, and go through the timelock.
+
+### A host
+
+The full steps are in [`docs/runbooks/deploy-host.md`](docs/runbooks/deploy-host.md). A host needs a GPU machine with Docker and the NVIDIA runtime, and a TLS proxy of its own in front of the agent.
+
+1. Copy `deploy/host/host.example.yaml` to `/etc/offpeak/host.yaml` and fill in your operator and `https://` endpoint.
+2. Run `offpeak-host init`, which creates the data folders and writes the vLLM arguments. The CLI is `apps/host-agent/src/cli.ts`, so `bun run` it from a clone.
+3. Start vLLM and the agent with the env file `init` wrote:
+
+```bash
+docker compose -f deploy/host/compose.yaml --env-file /var/lib/offpeak/vllm-<model>.env up -d
+```
+
+4. Run `offpeak-host verify`, then `offpeak-host register --send` to post your bond, and `offpeak-host price-sheet set --file <sheet.json>` to publish your prices.
 
 ## Repository map
 
