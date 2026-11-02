@@ -290,6 +290,8 @@ describe("IC5", () => {
     await syncWindow(bad.id, buyer)
     const drawn = await drawCall(bad.id)
     await settleThrough(hourIndex(start + 3605))
+    // One minute of demand is under the floor of measured seconds, so the rest of the Window's goes on record here.
+    for (let minute = 2; minute < 12; minute++) await db.query("INSERT INTO shared.window_perf (window_id, ts, tokens_per_s, demanded) VALUES ($1, to_timestamp($2), 0, true)", [bad.id.toString(), start + minute * 60])
 
     await mineAt(Math.max(start + 2 * 3600 + 3600, (await chainTime()) + 1))
     await perfRound()

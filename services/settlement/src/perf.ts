@@ -9,6 +9,8 @@ const PERF_NONE = 0
 const PERF_DISPUTED = 2
 /** The router writes one sample a minute, so each demanded sample stands for 60 seconds. */
 const SAMPLE_S = 60
+/** A share of a few demanded minutes says nothing about a host, and one holder can make those. The auditor holds to the same floor. */
+const MIN_MEASURED_S = 600
 
 export type PerfDeps = {
   db: Db
@@ -22,7 +24,7 @@ export type PerfDeps = {
 
 type Sample = { minute: string; demanded: boolean; below: boolean }
 
-async function measure(db: Db, windowId: string, minTps: string) {
+export async function measure(db: Db, windowId: string, minTps: string) {
   const rows = await db.query<Sample>(
     `SELECT EXTRACT(EPOCH FROM ts)::bigint / $1 AS minute, demanded, (demanded AND tokens_per_s < $2) AS below
      FROM shared.window_perf WHERE window_id = $3 ORDER BY ts`,
@@ -36,10 +38,12 @@ async function measure(db: Db, windowId: string, minTps: string) {
       ),
     ),
   )
+  const measuredSeconds = rows.rows.filter((row) => row.demanded).length * SAMPLE_S
   return {
     windowId: BigInt(windowId),
-    measuredSeconds: rows.rows.filter((row) => row.demanded).length * SAMPLE_S,
-    belowMinSeconds: rows.rows.filter((row) => row.below).length * SAMPLE_S,
+    measuredSeconds,
+    // The contract fails a Window on the share alone, so under the floor nothing goes on record as below. The leaves keep what was seen.
+    belowMinSeconds: measuredSeconds < MIN_MEASURED_S ? 0 : rows.rows.filter((row) => row.below).length * SAMPLE_S,
     evidenceRoot: merkleRoot(leaves),
   }
 }
