@@ -56,6 +56,30 @@ export function readChannel(db: Db, channelId: string) {
   return read(db, channelId, false)
 }
 
+/** A voucher and an x402 payment share one key in `shared.agent_payments`, so each takes it under this lock. */
+const lockPaymentId = (tx: Db, paymentId: string) => tx.query("SELECT pg_advisory_xact_lock(hashtext($1))", [paymentId])
+
+/**
+ * Takes a payment id before anything is served. A buyer picks an x402 `reqId` and can compute a voucher's id,
+ * and a collision found at billing would come after the tokens had gone out. `false` means the id is taken.
+ */
+export async function claimPaymentId(db: Db, claim: { reqId: string; payer: string; amount: bigint; status: "submitted" | "upto"; validBefore: string; now: number }) {
+  return db.transaction(async (tx) => {
+    await lockPaymentId(tx, claim.reqId)
+    const taken = await tx.query("SELECT 1 FROM shared.agent_payments WHERE payment_id = $1", [claim.reqId])
+    if (taken.rows.length > 0) return false
+    const claimed = await tx.query("INSERT INTO serving.x402_requests (req_id, payer, max_amount, status, valid_before, created_at) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (req_id) DO NOTHING RETURNING req_id", [
+      claim.reqId,
+      claim.payer,
+      claim.amount.toString(),
+      claim.status,
+      claim.validBefore,
+      claim.now,
+    ])
+    return claimed.rows.length > 0
+  })
+}
+
 /**
  * Takes a voucher whose signature the caller has checked. A voucher the channel has moved past is
  * "stale", which a retrying client can send honestly. Anything but "ok" leaves the channel as it was.
@@ -68,6 +92,9 @@ export async function acceptVoucher(db: Db, channel: ChannelChain, channelId: He
     if (local.closeFinal !== null) return "closing" as const
     const boundary = await tx.query("SELECT 1 FROM serving.owed_boundaries WHERE channel_id = $1 AND cumulative = $2", [channelId, voucher.cumulative.toString()])
     if (boundary.rows.length === 0) return "bad_boundary" as const
+    const paymentId = channelPaymentId(channelId, voucher.seq)
+    await lockPaymentId(tx, paymentId)
+    if ((await tx.query("SELECT 1 FROM serving.x402_requests WHERE req_id = $1", [paymentId])).rows.length > 0) return "payment_id_taken" as const
     const paid = await tx.query<{ req_ids: string[] }>("DELETE FROM serving.owed_boundaries WHERE channel_id = $1 AND cumulative <= $2 RETURNING req_ids", [channelId, voucher.cumulative.toString()])
     await tx.query(
       `INSERT INTO shared.channel_state (channel_id, payer, latest_seq, cumulative, voucher_sig)
@@ -79,7 +106,7 @@ export async function acceptVoucher(db: Db, channel: ChannelChain, channelId: He
       `INSERT INTO shared.agent_payments (payment_id, kind, payer, amount_micro, req_ids, channel_id, voucher_seq, voucher_sig)
        VALUES ($1,'channel',$2,$3,$4,$5,$6,$7) ON CONFLICT (payment_id) DO NOTHING`,
       [
-        channelPaymentId(channelId, voucher.seq),
+        paymentId,
         channel.payer,
         (voucher.cumulative - local.cumulative).toString(),
         paid.rows.flatMap((row) => row.req_ids),

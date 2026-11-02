@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto"
 import { ZERO_BYTES32, channelAuthMessage, domain, hourIndex, voucherTypes, type BuyerChain, type ChannelChain, type Hex, type PaymentPayload } from "@offpeak/shared"
 import { keccak256, toBytes } from "viem"
-import { acceptVoucher, releaseChannel, reserveChannel } from "./channel-store.ts"
+import { acceptVoucher, claimPaymentId, releaseChannel, reserveChannel } from "./channel-store.ts"
 import { creditLimit } from "./channel.ts"
 import { paymentRequired } from "./x402.ts"
 import { admitWindow, pendingKey } from "./window.ts"
@@ -82,6 +82,7 @@ export async function applyVoucher(stack: Stack, ch: ChannelChain, channelId: He
   const accepted = await acceptVoucher(stack.db, ch, channelId, voucher, { contract: signed === "contract" })
   if (accepted === "bad_boundary") return oai(402, "Voucher is not on a reported boundary", "payment", "bad_voucher")
   if (accepted === "closing") return oai(409, "Channel is closing", "invalid_request", "channel_closing")
+  if (accepted === "payment_id_taken") return oai(409, "This sequence number's payment id is taken", "invalid_request", "payment_id_taken")
   return null
 }
 
@@ -157,7 +158,16 @@ export async function authorize(stack: Stack, payer: Payer, maxCostMicro: bigint
     if (!verified.isValid) return oai(402, verified.invalidReason ?? "invalid", "payment", "payment_required")
     const reqId = String(payer.payment.payload.witness.reqId).toLowerCase()
     if (!(await holdUnconfirmedSlot(stack, verified.payer as string, reqId))) return oai(429, "Too many payments from this wallet are waiting for the chain", "rate_limit", "unconfirmed_limit")
-    if (exact !== null) await noteExact(stack, reqId, verified.payer as string, exact, payer.payment)
+    // For `exact` this comes before the money can move, so a crash at any later point still leaves a row for the sweep to refund.
+    const claimed = await claimPaymentId(stack.db, {
+      reqId,
+      payer: verified.payer as string,
+      amount: exact ?? maxCostMicro,
+      status: exact !== null ? "submitted" : "upto",
+      validBefore: String(payer.payment.payload.witness.validBefore ?? 0),
+      now: stack.clock(),
+    })
+    if (!claimed) return oai(402, "This payment's reqId is taken", "payment", "payment_id_taken")
     void Promise.resolve(stack.facilitator.settle({ paymentPayload: payer.payment, mode: exact !== null ? "exact" : "authorize" }))
       .then((result) => {
         if ((result as { success?: boolean }).success === false) settleAuthorization(stack, reqId, "fail")
@@ -181,6 +191,7 @@ export async function release(stack: Stack, pay: PayHold) {
   if (pay.kind === "prepaid") await stack.ledger.release(pay.wallet, pay.holdId)
   if (pay.kind === "channel") await releaseChannel(stack.db, pay.reservationId)
   if (pay.kind === "window") await stack.counters.add(pay.pendingKey, -pay.reservedTokens, 3 * 86_400)
+  if (pay.kind === "upto") await stack.db.query("DELETE FROM serving.x402_requests WHERE req_id = $1 AND status = 'upto'", [pay.payRef])
   // The money may already be on chain. The sweep refunds it once the chain says so.
   if (pay.kind === "exact") await stack.db.query("UPDATE serving.x402_requests SET status = 'refund_due' WHERE req_id = $1 AND status = 'submitted'", [pay.payRef])
 }
@@ -202,17 +213,6 @@ async function holdUnconfirmedSlot(stack: Stack, wallet: string, reqId: string) 
 function witnessAmount(payment: PaymentPayload) {
   const amount = String(payment.payload.witness.amount ?? "")
   return /^\d{1,30}$/.test(amount) ? BigInt(amount) : null
-}
-
-/** Written before the money can move, so a crash at any later point still leaves a row for the sweep to refund. */
-async function noteExact(stack: Stack, reqId: string, payer: string, amount: bigint, payment: PaymentPayload) {
-  await stack.db.query("INSERT INTO serving.x402_requests (req_id, payer, max_amount, status, valid_before, created_at) VALUES ($1,$2,$3,'submitted',$4,$5) ON CONFLICT (req_id) DO NOTHING", [
-    reqId,
-    payer,
-    amount.toString(),
-    String(payment.payload.witness.validBefore ?? 0),
-    stack.clock(),
-  ])
 }
 
 export async function waitAuthorized(stack: Stack, reqId: string, timeoutMs: number): Promise<"ok" | "fail" | "timeout"> {
