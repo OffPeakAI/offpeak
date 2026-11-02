@@ -9,6 +9,9 @@ solc_version = "0.8.26"
 evm_version = "cancun"
 optimizer = true
 optimizer_runs = 20000
+# Foundry's defaults, written out so a new Foundry release cannot change the bytecode.
+bytecode_hash = "ipfs"
+cbor_metadata = true
 # Stubs keep named parameters so the ABIs are final. Drop 5667 and 2018 once A2-A9 replace them.
 ignored_error_codes = [5667, 2018]
 fs_permissions = [
