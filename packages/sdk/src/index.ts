@@ -4,7 +4,7 @@ export { fileChannelStore, type ChannelStore, type SavedChannel } from "./channe
 export { OffpeakError, localWallet, microToUsd, usdToMicro, type Deployment, type WalletLike } from "./core.ts"
 export { fetchProof, type ProofReport } from "./proofs.ts"
 export { DEFAULT_UPTO_CAP_MICRO, X402, findUpto, type UptoPayment, type UptoRequirement } from "./upto.ts"
-export { checkProof, envelopeSchema, verifyUsage, type Recount, type RecountReport, type VerifyOptions, type VerifyReport } from "./verify.ts"
+export { checkProof, envelopeSchema, verifyUsage, type MaxPrice, type Recount, type RecountReport, type VerifyOptions, type VerifyReport } from "./verify.ts"
 export * from "./sealed/hpke.ts"
 export { ACCEPTED_TCB, attestationRefOf, bindingsHash, checkTranscript, measurementSchema, parseQuote, reportDataFor, type Bindings, type Measurement, type Transcript } from "./sealed/attest.ts"
 export { SealedClient, SealedStream, type HostCheck, type SealedChatOptions, type SealedHost, type SealedOptions, type SealedParams, type SealedResult } from "./sealed/client.ts"

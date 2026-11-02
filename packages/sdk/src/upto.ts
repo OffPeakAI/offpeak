@@ -46,6 +46,7 @@ export class X402 {
   constructor(
     private ctx: ClientContext,
     private capMicro: Micro,
+    private onUpto?: (maxAmount: Micro) => void,
   ) {}
 
   /**
@@ -70,6 +71,7 @@ export class X402 {
     const { reqId, validBefore: until } = offer.extra
     const now = nowSeconds()
     if (until < now + MIN_VALID_S || until > now + MAX_VALID_S) throw new OffpeakError("bad_requirement", "Requirement's validBefore is out of range")
+    this.onUpto?.(maxAmount)
     const resourceHash = offer.extra.resourceHash ?? ZERO_BYTES32
     const validBefore = BigInt(until)
     const witness = { reqId, payee: offer.payTo, maxAmount, validBefore, resourceHash }

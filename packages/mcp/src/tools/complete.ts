@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { usdToMicro, type ChatResult, type Offpeak } from "@offpeak/sdk"
 import { serializeEnvelope } from "@offpeak/shared"
 import { z } from "zod"
+import { billedBy, type Budget } from "../budget.ts"
 import { maxPriceInput, tool, verification } from "./result.ts"
 
 export const chatMessage = z.object({
@@ -16,25 +17,26 @@ const input = {
   model: z.string().min(1).describe("Model id from /v1/models. Model ids describe compatibility only."),
   messages: z.array(chatMessage).min(1),
   max_tokens: z.number().int().positive().describe("Most output tokens to pay for."),
-  max_price: maxPriceInput.optional().describe("Most you will pay per 1M tokens, in USD, fee included. Above it the call fails with price_above_cap."),
+  max_price: maxPriceInput.optional().describe("Most you will pay per 1M tokens, in USD, fee included. Above it the call fails with price_above_cap. The server's own cap applies when this is missing or higher."),
   tools: z.array(z.record(z.string(), z.unknown())).optional(),
   response_format: z.object({ type: z.enum(["text", "json_object", "json_schema"]) }).loose().optional(),
 }
 
 type Input = z.output<z.ZodObject<typeof input>>
 
-export function registerComplete(server: McpServer, op: Offpeak) {
+export function registerComplete(server: McpServer, op: Offpeak, budget: Budget) {
   server.registerTool(
     "offpeak_complete",
     {
       description:
         "Run a chat completion on an open-weight model at the off-peak live price, with the signed usage record and its local verification, which recounts your tokens with the model's own tokenizer. " +
-        "Prices move: the live price at request start is what you pay, and max_price caps it. Open hosts and the router can read prompts.",
+        "Prices move: the live price at request start is what you pay, and max_price caps it. The server's limits per call and per day refuse with call_cap or day_cap. Open hosts and the router can read prompts.",
       inputSchema: input,
     },
     tool(async ({ max_price, ...body }: Input) => {
-      const maxPrice = max_price ? { inPerM: usdToMicro(max_price.in), outPerM: usdToMicro(max_price.out) } : undefined
-      const result = (await op.chat(body, { maxPrice })) as ChatResult
+      const maxPrice = budget.maxPrice(max_price && { inPerM: usdToMicro(max_price.in), outPerM: usdToMicro(max_price.out) })
+      const worst = budget.worstCase(JSON.stringify(body), body.max_tokens, maxPrice)
+      const result = await budget.spend(worst, () => op.chat(body, { maxPrice }) as Promise<ChatResult>, ({ envelope }) => billedBy(envelope.record))
       const channel = result.channel
       return {
         text: result.text,

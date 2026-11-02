@@ -13,6 +13,16 @@ MCP tools for Offpeak, over stdio or streamable HTTP. An agent can run a complet
 
 A tool that fails answers with `isError` and `{ error: { code, message } }`.
 
+## Spend limits
+
+An agent acts on whatever text it reads, so these limits are the operator's, and no tool call can raise them.
+
+- **`OFFPEAK_CALL_CAP_MICRO`**, 1 USDG by default, is the most one tool call can cost. It is also the most an `upto` may authorize. A call's cost is worked out before it runs: every input byte as a token, plus `max_tokens`, at the call's `max_price`. Above the limit the tool fails with `call_cap`, and `offpeak_schedule_job` counts the whole job, with 4096 tokens for a line that sets no `max_tokens`.
+- **`OFFPEAK_DAY_CAP_MICRO`**, 10 USDG by default, is the most these tools spend in a UTC day. Once the running total would pass it, tools fail with `day_cap` until the day ends. A call counts what its record bills, a job its `estimated_cost`, and an `upto` the whole amount it signs, since a capture can take all of it. A call that fails with no way to tell whether it was served counts at its worst case.
+- **`OFFPEAK_MAX_PRICE`**, `in=1,out=4` by default, is the `max_price` for a call that sets none, in the same units. A higher `max_price` from a call is lowered to it.
+
+The running total lives in this process, and a stdio client starts a server per session. Set `OFFPEAK_SPEND_FILE` to keep it across restarts, or each session starts the day at zero.
+
 ## Running it
 
 ```bash
@@ -65,6 +75,10 @@ These tools do not close a channel. Use `op.channels.close()` from `@offpeak/sdk
 | `OFFPEAK_CHANNEL_DEPOSIT` | no | µUSDG to deposit when opening one |
 | `OFFPEAK_CHANNEL_EXPIRY_S` | no | That channel's lifetime in seconds |
 | `OFFPEAK_CHANNEL_STATE_FILE` | with a deposit | Path this server keeps its channel in. With `OFFPEAK_CHANNEL_ID` it replaces `OFFPEAK_CHANNEL_SEQ` and `OFFPEAK_CHANNEL_CUMULATIVE` |
+| `OFFPEAK_CALL_CAP_MICRO` | no | Most one tool call can cost, in µUSDG. Default `1000000` |
+| `OFFPEAK_DAY_CAP_MICRO` | no | Most these tools spend in a UTC day, in µUSDG. Default `10000000` |
+| `OFFPEAK_MAX_PRICE` | no | Default and highest `max_price`, as `in=<usd>,out=<usd>`. Default `in=1,out=4` |
+| `OFFPEAK_SPEND_FILE` | to hold the day cap across restarts | Path this server keeps the day's total in |
 | `OFFPEAK_MCP_HOST` | no | HTTP bind address, default `127.0.0.1` |
 | `OFFPEAK_MCP_PORT` | no | HTTP port, default `8790` |
 | `OFFPEAK_MCP_TOKEN` | to leave this machine | Bearer token for HTTP, at least 32 characters |

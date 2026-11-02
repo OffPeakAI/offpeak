@@ -90,7 +90,7 @@ const { header } = await op.x402.payUpto(requirement, { maxAmount })
 // send it as the PAYMENT-SIGNATURE header
 ```
 
-The requirement comes over the network, so the client checks the token, payee, spender, Permit2 address and `validBefore` against the deployment before signing. It also refuses anything over `uptoCapMicro`, which defaults to 1 USDG.
+The requirement comes over the network, so the client checks the token, payee, spender, Permit2 address and `validBefore` against the deployment before signing. It also refuses anything over `uptoCapMicro`, which defaults to 1 USDG. `onUpto` is called with the amount just before signing, and throwing from it refuses the payment, so you can keep your own total.
 
 ## Checking usage
 

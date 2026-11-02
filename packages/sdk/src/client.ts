@@ -35,6 +35,8 @@ export type OffpeakOptions = {
   router?: string
   /** The most an `upto` payment may authorize. Defaults to 1 USDG. */
   uptoCapMicro?: Micro
+  /** Called with the amount before an `upto` is signed. Throw to refuse it. */
+  onUpto?: (maxAmount: Micro) => void
   sealed?: SealedOptions
   fetch?: typeof fetch
 }
@@ -228,7 +230,7 @@ export class Offpeak {
       verify: (env, opts) => this.verifyUsage(env, opts),
     }
     this.channels = new Channels(this.ctx, options.channel)
-    this.x402 = new X402(this.ctx, uptoCap)
+    this.x402 = new X402(this.ctx, uptoCap, options.onUpto)
     this.sealed = new SealedClient(this.ctx, options.sealed, (url, init) => this.dispatch(url, init))
     this.openai = new OpenAI({
       baseURL: `${baseURL}/v1`,
