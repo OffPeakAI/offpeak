@@ -12,8 +12,27 @@ const LAND_RETRY_MS = 200
 /** A voucher still unlanded this close to the end pages a person. It is the host's money. */
 const CLOSE_ALARM_S = 1800
 const NO_RISK_MARGIN_S = 7200
+/** Every job shares one worker, so a pass leaves room before the next one is due. */
+const PASS_BUDGET_MS = 45_000
+const BACKOFF_BASE_S = 300
+const BACKOFF_MAX_S = 3600
 
 type VoucherRow = { channel_id: string; latest_seq: string; cumulative: string; voucher_sig: string }
+type Pass = { now: number; deadline: number }
+
+/** Vouchers that failed to land, so one that never will stops costing every pass. A newer voucher starts clean. */
+const backoff = new Map<string, { seq: bigint; failures: number; until: number }>()
+
+function backedOff(channelId: string, seq: bigint, now: number) {
+  const held = backoff.get(channelId)
+  return held !== undefined && held.seq === seq && held.until > now
+}
+
+function holdBack(channelId: string, seq: bigint, now: number) {
+  const held = backoff.get(channelId)
+  const failures = held?.seq === seq ? held.failures + 1 : 1
+  backoff.set(channelId, { seq, failures, until: now + Math.min(BACKOFF_BASE_S * 2 ** (failures - 1), BACKOFF_MAX_S) })
+}
 
 const manager = (deps: KeeperDeps) => ({ address: deps.contracts.ChannelManager!, abi: ChannelManagerAbi })
 
@@ -28,9 +47,10 @@ async function alreadyLanded(deps: KeeperDeps, channelId: Hex, seq: bigint) {
   return view !== null && view.lastSeq >= seq
 }
 
-async function landVoucher(deps: KeeperDeps, row: VoucherRow) {
+async function landVoucher(deps: KeeperDeps, row: VoucherRow, pass: Pass, force = false) {
   const channelId = row.channel_id as Hex
   const voucher = { channelId, seq: BigInt(row.latest_seq), cumulative: BigInt(row.cumulative) }
+  if (!force && backedOff(channelId, voucher.seq, pass.now)) return false
   for (let attempt = 1; attempt <= LAND_ATTEMPTS; attempt++) {
     try {
       const { request } = await deps.reader.simulateContract({
@@ -40,15 +60,26 @@ async function landVoucher(deps: KeeperDeps, row: VoucherRow) {
         account: deps.account,
       })
       const receipt = await deps.reader.waitForTransactionReceipt({ hash: await deps.writer.writeContract(request) })
-      if (receipt.status === "success") return true
+      if (receipt.status === "success") {
+        backoff.delete(channelId)
+        return true
+      }
     } catch (err) {
       log("keepers", "voucher_retry", { channelId, attempt, error: String(err).slice(0, 160) })
     }
-    if (await alreadyLanded(deps, channelId, voucher.seq)) return true
-    await Bun.sleep(LAND_RETRY_MS * 2 ** (attempt - 1))
+    if (await alreadyLanded(deps, channelId, voucher.seq)) {
+      backoff.delete(channelId)
+      return true
+    }
+    const wait = LAND_RETRY_MS * 2 ** (attempt - 1)
+    if (performance.now() + wait > pass.deadline) break
+    await Bun.sleep(wait)
   }
+  holdBack(channelId, voucher.seq, pass.now)
   return false
 }
+
+const startPass = (now: number, budgetMs: number): Pass => ({ now, deadline: performance.now() + budgetMs })
 
 async function latestVoucher(deps: KeeperDeps, channelId: string) {
   const rows = await deps.db.query<VoucherRow>(
@@ -59,24 +90,31 @@ async function latestVoucher(deps: KeeperDeps, channelId: string) {
 }
 
 /** Moves each open channel's latest voucher on chain once enough is owed, or enough time has passed. */
-export async function runChannelClaim(deps: KeeperDeps) {
+export async function runChannelClaim(deps: KeeperDeps, budgetMs = PASS_BUDGET_MS) {
   const head = await deps.reader.getBlock({ blockTag: "latest" })
   const due = await deps.db.query<VoucherRow>(
     `SELECT c.channel_id, s.latest_seq, s.cumulative, s.voucher_sig
      FROM shared.channel_state s JOIN chain.channels c ON c.channel_id = lower(s.channel_id)
      WHERE c.status = $1 AND s.cumulative > c.claimed
-       AND (s.cumulative - c.claimed >= $2 OR GREATEST(c.last_claim_at, c.opened_at) + $3 <= $4)`,
+       AND (s.cumulative - c.claimed >= $2 OR GREATEST(c.last_claim_at, c.opened_at) + $3 <= $4)
+     ORDER BY s.cumulative - c.claimed DESC`,
     [STATUS_OPEN, CHANNEL_SETTLE_EVERY_MICRO, CHANNEL_SETTLE_EVERY_S, Number(head.timestamp)],
   )
+  const pass = startPass(Number(head.timestamp), budgetMs)
   const landed: string[] = []
   for (const row of due.rows) {
-    if (await landVoucher(deps, row)) landed.push(row.channel_id)
+    if (performance.now() >= pass.deadline) {
+      log("keepers", "pass_budget_spent", { job: "channel-claim", left: due.rows.length - due.rows.indexOf(row) })
+      break
+    }
+    if (await landVoucher(deps, row, pass)) landed.push(row.channel_id)
   }
   return landed
 }
 
 /** Reads closing state from the chain, since a push can arrive ahead of the indexer's confirmations. */
-async function watchClose(deps: KeeperDeps, channelId: Hex, now: number) {
+async function watchClose(deps: KeeperDeps, channelId: Hex, pass: Pass, pushed: boolean) {
+  const { now } = pass
   const view = await deps.reader.readContract({ ...manager(deps), functionName: "channelView", args: [channelId] })
   if (view.status !== STATUS_CLOSING) return NO_RISK_MARGIN_S
   const left = Number(view.challengeEndsAt) - now
@@ -87,7 +125,7 @@ async function watchClose(deps: KeeperDeps, channelId: Hex, now: number) {
     await send(deps, "finalizeClose", channelId)
     return NO_RISK_MARGIN_S
   }
-  if (!unlanded || (await landVoucher(deps, voucher))) return NO_RISK_MARGIN_S
+  if (!unlanded || (await landVoucher(deps, voucher, pass, pushed || left < CLOSE_ALARM_S))) return NO_RISK_MARGIN_S
   if (left < CLOSE_ALARM_S) log("keepers", "channel_close_alarm", { channelId, secondsLeft: left })
   return left
 }
@@ -105,14 +143,20 @@ async function readHead(deps: KeeperDeps) {
   }
 }
 
-export async function runCloseWatch(deps: KeeperDeps, only?: Hex) {
+export async function runCloseWatch(deps: KeeperDeps, only?: Hex, budgetMs = PASS_BUDGET_MS) {
   const head = await readHead(deps)
-  const closing = await deps.db.query<{ channel_id: Hex }>("SELECT channel_id FROM chain.channels WHERE status = $1", [STATUS_CLOSING])
+  const closing = await deps.db.query<{ channel_id: Hex }>("SELECT channel_id FROM chain.channels WHERE status = $1 ORDER BY challenge_ends_at", [STATUS_CLOSING])
   const ids = only ? [only] : closing.rows.map((row) => row.channel_id)
+  // A push is one channel's race, so it gets every attempt. The clock's sweep stays inside its budget.
+  const pass = startPass(Number(head.timestamp), only ? Infinity : budgetMs)
   let margin = NO_RISK_MARGIN_S
   for (const id of ids) {
+    if (performance.now() >= pass.deadline) {
+      log("keepers", "pass_budget_spent", { job: "channel-close-watch", left: ids.length - ids.indexOf(id) })
+      break
+    }
     try {
-      margin = Math.min(margin, await watchClose(deps, id, Number(head.timestamp)))
+      margin = Math.min(margin, await watchClose(deps, id, pass, only !== undefined))
     } catch (err) {
       log("keepers", "close_watch_failed", { channelId: id, error: String(err).slice(0, 200) })
     }
@@ -122,17 +166,22 @@ export async function runCloseWatch(deps: KeeperDeps, only?: Hex) {
 }
 
 /** Closes channels past their expiry, landing the latest voucher first so the host is paid. */
-export async function runChannelExpiry(deps: KeeperDeps) {
+export async function runChannelExpiry(deps: KeeperDeps, budgetMs = PASS_BUDGET_MS) {
   const head = await deps.reader.getBlock({ blockTag: "latest" })
   const expired = await deps.db.query<{ channel_id: Hex; claimed: string }>(
     "SELECT channel_id, claimed FROM chain.channels WHERE status = $1 AND expiry <= $2",
     [STATUS_OPEN, Number(head.timestamp)],
   )
+  const pass = startPass(Number(head.timestamp), budgetMs)
   const closed: string[] = []
   for (const row of expired.rows) {
+    if (performance.now() >= pass.deadline) {
+      log("keepers", "pass_budget_spent", { job: "channel-expiry", left: expired.rows.length - expired.rows.indexOf(row) })
+      break
+    }
     try {
       const voucher = await latestVoucher(deps, row.channel_id)
-      if (voucher && BigInt(voucher.cumulative) > BigInt(row.claimed)) await landVoucher(deps, voucher)
+      if (voucher && BigInt(voucher.cumulative) > BigInt(row.claimed)) await landVoucher(deps, voucher, pass)
       await send(deps, "requestClose", row.channel_id)
       closed.push(row.channel_id)
     } catch (err) {

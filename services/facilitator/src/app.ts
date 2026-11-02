@@ -1,4 +1,4 @@
-import type { Db, Metrics } from "@offpeak/common"
+import { bearerMatches, type Db, type Metrics } from "@offpeak/common"
 import { Hono } from "hono"
 import type { Hex } from "viem"
 import type { CaptureQueue } from "./capture.ts"
@@ -19,7 +19,7 @@ export type FacilitatorDeps = {
 export function facilitatorApp(deps: FacilitatorDeps) {
   const app = new Hono()
   const cache = new ReadCache(deps.verify.reader)
-  const authorized = (header: string | undefined) => header === `Bearer ${deps.internalToken}`
+  const authorized = (header: string | undefined) => bearerMatches(header, deps.internalToken)
 
   app.get("/x402/supported", (c) =>
     c.json({ kinds: ["channel", "upto", "exact"].map((scheme) => ({ scheme, network: NETWORK })) }),
