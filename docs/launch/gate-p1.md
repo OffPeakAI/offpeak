@@ -8,14 +8,14 @@ P1 launches as a capped public beta (500 USDG per buyer) once every gate below p
 | Reserve | A + B | Pass | `Reserve` invariants, including UTC midnight. `tests/integration/live-router.test.ts` runs the router as a real process against the contracts: a lowered cap refuses the next request, and a withdraw-all stops new holds |
 | Settlement | A | Pass | `Settlement` invariants, and `tests/integration/settlement-72h.test.ts`: three signers, 72 hours, no disagreements |
 | Pricing | B | Pass, mock engine and fixture tokenizer | Billed at the live price at request start, the floor rule enforced on every sheet the router takes, nonce and weekly limit included, and caps never exceeded. `apps/host-agent/test/router-wire.test.ts` signs real-tokenizer counts through the real agent. Rerun on real vLLM |
-| Swap detection | B + A | Court passes, statistics open | `AuditCourt` invariants hold no full slash without a panel Confirm. Left: real calibration on two GPU classes, and the auditor filing challenges |
+| Swap detection | B + A | Court passes, statistics open | `AuditCourt` invariants hold no full slash without a panel Confirm. Left: real calibration on two GPU classes, which swap filings wait for |
 | Beta cap | A | Ready | `VerifyWiring` checks it. Run it on mainnet after deploying |
 | Claims | B | Lint passes | Competitor figures must be rechecked the week of launch |
 
 ## Blocking launch
 
 1. **The launch models.** The host agent proxies vLLM, and the router counts with each model's pinned tokenizer and refuses to boot on mainnet without one. Only a test tokenizer is pinned so far. Each launch model needs its manifest in `OFFPEAK_MODELS_FILE`, and the 1,000-prompt count check against real vLLM has not run.
-2. **The auditor files nothing yet.** Challenges need the evidence format in `packages/shared/src/evidence.ts`.
+2. **Swap filings need calibration.** The auditor can file challenges, in the evidence format in `packages/shared/src/evidence.ts`. Outside local it refuses a swap filing with `not_calibrated` until a real hardware report for that model passes its gates and matches the published baseline.
 3. **Real GPU calibration.** Swap detection has only run on simulated scores.
 4. **Mainnet roles.** Three Safes and the operational keys, listed in `docs/runbooks/deploy-mainnet.md`.
 5. **The deploy itself,** followed by `VerifyWiring`.
