@@ -14,14 +14,17 @@ contract VerifyWiring is ChainConfig {
         Core memory d = _readCore();
         string memory json = vm.readFile(_deploymentPath());
         _verify(d, c, _readTimelock(), json.readAddress(".deployer"));
-        console2.log("wiring verified: peers, signers, beta cap, token hooks off, timelock in charge");
+        _verifyCoreCode(d, _readTimelock());
+        console2.log("wiring verified: peers, signers, beta cap, token hooks off, timelock in charge, code matches the build");
         if (json.readAddress(".contracts.X402Escrow") != address(0)) {
             _verifyPayments(d, _readPayments(), c);
-            console2.log("payments verified: escrow and channels wired to the vault");
+            _verifyPaymentsCode(_readPayments());
+            console2.log("payments verified: escrow and channels wired to the vault, code matches the build");
         }
         if (json.readAddress(".contracts.WindowMarket") != address(0)) {
             _verifyMarkets(d, _readMarkets(), c, _readTimelock());
-            console2.log("markets verified: Windows and token hooks wired, timelock owns both");
+            _verifyMarketsCode(_readMarkets());
+            console2.log("markets verified: Windows and token hooks wired, timelock owns both, code matches the build");
         }
     }
 }

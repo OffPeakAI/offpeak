@@ -15,6 +15,7 @@ fs_permissions = [
   { access = "read", path = "../packages/shared/fixtures" },
   { access = "read", path = "test/fixtures" },
   { access = "read", path = "config" },
+  { access = "read", path = "out" },
   { access = "read-write", path = "../packages/abis/deployments" },
 ]
 remappings = [

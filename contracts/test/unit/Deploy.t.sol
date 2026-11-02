@@ -6,12 +6,13 @@ import {Test} from "forge-std/Test.sol";
 import {DeployCore} from "../../script/DeployCore.sol";
 import {MockOFPK} from "../../src/mocks/MockOFPK.sol";
 import {MockUSDG} from "../../src/mocks/MockUSDG.sol";
-import {DeployHarness, MockSafe} from "../helpers/DeployHarness.sol";
+import {CodeCheckHarness, DeployHarness, MockSafe} from "../helpers/DeployHarness.sol";
 
 contract DeployTest is Test {
     address internal constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
 
     DeployHarness internal harness;
+    CodeCheckHarness internal codeCheck;
     MockUSDG internal usdg;
     DeployCore.Config internal c;
     address internal panelOwner = makeAddr("reviewer");
@@ -21,6 +22,7 @@ contract DeployTest is Test {
         vm.chainId(4663);
         vm.etch(PERMIT2, vm.parseBytes(vm.trim(vm.readFile("test/fixtures/permit2.bin"))));
         harness = new DeployHarness();
+        codeCheck = new CodeCheckHarness();
         usdg = new MockUSDG();
         address[] memory owners = new address[](1);
         owners[0] = panelOwner;
@@ -119,6 +121,66 @@ contract DeployTest is Test {
         TimelockController wrong = new TimelockController(0, new address[](0), new address[](0), address(this));
         vm.expectRevert(abi.encodeWithSelector(DeployCore.WiringMismatch.selector, "owner is the timelock"));
         harness.verify(d, c, wrong);
+    }
+
+    function test_verificationCoversEveryImmutableAddress() public {
+        (DeployCore.Core memory d, TimelockController timelock) = _deployed();
+        address[6] memory targets = [
+            address(d.registry), address(d.registry), address(d.splitter), address(d.splitter), address(d.court), address(d.court)
+        ];
+        string[6] memory getters = ["usdg()", "ofpk()", "usdg()", "registry()", "usdg()", "treasury()"];
+        string[6] memory checks =
+            ["registry.usdg", "registry.ofpk", "splitter.usdg", "splitter.registry", "court.usdg", "court.treasury"];
+        for (uint256 i; i < targets.length; ++i) {
+            vm.mockCall(targets[i], abi.encodeWithSignature(getters[i]), abi.encode(address(0xBAD)));
+            vm.expectRevert(abi.encodeWithSelector(DeployCore.WiringMismatch.selector, checks[i]));
+            harness.verify(d, c, timelock);
+            vm.clearMockedCalls();
+        }
+    }
+
+    function test_everyDeployedContractMatchesItsBuild() public {
+        (DeployCore.Core memory d, TimelockController timelock) = _deployed();
+        codeCheck.verifyCoreCode(d, timelock);
+        codeCheck.verifyPaymentsCode(harness.deployPayments(c, d));
+        codeCheck.verifyMarketsCode(harness.deployMarkets(c, d, address(timelock)));
+    }
+
+    function test_theCodeCheckFailsOnOneChangedByte() public {
+        (DeployCore.Core memory d,) = _deployed();
+        bytes memory code = address(d.vault).code;
+        code[100] = ~code[100];
+        vm.etch(address(d.vault), code);
+        vm.expectPartialRevert(DeployCore.CodeMismatch.selector);
+        codeCheck.verifyCode("OffpeakVault", address(d.vault));
+    }
+
+    function test_theCodeCheckFailsOnTheWrongContract() public {
+        (DeployCore.Core memory d,) = _deployed();
+        vm.expectPartialRevert(DeployCore.CodeMismatch.selector);
+        codeCheck.verifyCode("OffpeakVault", address(d.ledger));
+    }
+
+    function test_theCodeCheckFailsOnAnEmptyAddress() public {
+        vm.expectPartialRevert(DeployCore.CodeMismatch.selector);
+        codeCheck.verifyCode("OffpeakVault", address(0xDEAD));
+    }
+
+    /// The trailer holds the source hash, so a comment change alters it and nothing else.
+    function test_theCodeCheckIgnoresMetadata() public {
+        (DeployCore.Core memory d,) = _deployed();
+        bytes memory code = address(d.vault).code;
+        code[code.length - 10] = ~code[code.length - 10];
+        vm.etch(address(d.vault), code);
+        codeCheck.verifyCode("OffpeakVault", address(d.vault));
+    }
+
+    function test_theCodeCheckIgnoresImmutableValues() public {
+        (DeployCore.Core memory first,) = _deployed();
+        c.relay = makeAddr("second-relay");
+        c.capturer = makeAddr("second-capturer");
+        DeployCore.Payments memory p = harness.deployPayments(c, first);
+        codeCheck.verifyPaymentsCode(p);
     }
 
     function test_preflightRejectsTheWrongChain() public {

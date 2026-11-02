@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {TimelockController} from "@openzeppelin/contracts/governance/TimelockController.sol";
+import {ChainConfig} from "../../script/ChainConfig.sol";
 import {DeployCore} from "../../script/DeployCore.sol";
 
 /// @notice Stands in for the deployer key, so tests run the same code the scripts do.
@@ -48,6 +49,25 @@ contract DeployHarness is DeployCore {
 
     function probe(address usdg) external view returns (bool, bool) {
         return _probeUsdg(usdg);
+    }
+}
+
+/// @notice The code check reads build output through cheatcodes, so it sits apart from the deployer stand-in.
+contract CodeCheckHarness is ChainConfig {
+    function verifyCode(string memory name, address deployed) external view {
+        _verifyCode(name, deployed);
+    }
+
+    function verifyCoreCode(Core memory d, TimelockController timelock) external view {
+        _verifyCoreCode(d, timelock);
+    }
+
+    function verifyPaymentsCode(Payments memory p) external view {
+        _verifyPaymentsCode(p);
+    }
+
+    function verifyMarketsCode(Markets memory m) external view {
+        _verifyMarketsCode(m);
     }
 }
 
