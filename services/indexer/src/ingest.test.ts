@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test"
-import { applySchemas, openDatabase, type Db } from "@offpeak/common"
+import { OffpeakVaultAbi } from "@offpeak/abis"
+import { applySchemas, openDatabase, storeSignature, type Db } from "@offpeak/common"
+import { emptyTotals, totalsHashOf } from "@offpeak/shared"
+import { concat, encodeFunctionData, type Hex, type LocalAccount } from "viem"
+import { roleAccount } from "../../../packages/shared/src/test-keys.ts"
+import { batchHashOf } from "../../settlement/src/build.ts"
 import { newIngestState, tick, type IngestDeps } from "./ingest.ts"
 import { FakeChain, TEST_CONTRACTS, eventLog, testHash } from "./test-chain.ts"
 
@@ -133,5 +138,112 @@ describe("the chain schema upgrade", () => {
     await applySchemas(db, { shared: false })
     const types = await db.query<{ data_type: string }>("SELECT data_type FROM information_schema.columns WHERE table_schema = 'chain' AND column_name IN ('sample_count', 'max_tps')")
     expect(types.rows.map((r) => r.data_type)).toEqual(["bigint", "bigint"])
+  })
+})
+
+describe("the outcome of a landed settlement", () => {
+  const signers = [roleAccount("settlerA"), roleAccount("settlerB"), roleAccount("settlerC")].sort((a, b) => (a.address.toLowerCase() < b.address.toLowerCase() ? -1 : 1))
+  const [lowest, middle, highest] = [signers[0]!, signers[1]!, signers[2]!]
+  const HOUR = 500
+  const PAYMENT = testHash("payment-p")
+  const ROOT = testHash("root")
+  const REFUND = { id: "agent-excess:forged", payer: CHALLENGER, amount: "5000000000", reason: "excluded_record", reqIds: [] }
+
+  const landedBatch = () => ({
+    chainId: 4663n,
+    vault: TEST_CONTRACTS.OffpeakVault,
+    hour: BigInt(HOUR),
+    root: ROOT,
+    totalsHash: totalsHashOf(emptyTotals()),
+    debits: [],
+    credits: [],
+    windowDraws: [],
+    fees: 0n,
+    agentPoolDraw: 0n,
+    reserveDraw: 0n,
+    agentPaymentsHash: testHash("payments"),
+  })
+  const outcome = (payments: Record<string, unknown>) => ({ b: { root: ROOT, totalsHash: totalsHashOf(emptyTotals()) }, t: {}, rejects: [], payments })
+  const drawn = outcome({ drawn: [PAYMENT], writtenOff: [] })
+
+  async function scenario(rows: (db: Db, hash: Hex) => Promise<void>, pair = [lowest, middle]) {
+    const chain = new FakeChain()
+    const db = await openDatabase("pglite://memory")
+    await db.query("INSERT INTO shared.agent_payments (payment_id, kind, payer, amount_micro, req_ids, collected_tx, collected_hour) VALUES ($1,'upto',$2,1000,'{}',$3,$4)", [PAYMENT, BUYER, testHash("c"), HOUR])
+    const b = landedBatch()
+    const hash = batchHashOf(b as never)
+    await rows(db, hash)
+    const ordered = [...pair].sort((x, y) => (x.address.toLowerCase() < y.address.toLowerCase() ? -1 : 1))
+    const sigs = await Promise.all(ordered.map((a) => a.sign({ hash })))
+    const log = eventLog("OffpeakVault", "Settled", { hour: BigInt(HOUR), root: ROOT, totalsHash: b.totalsHash, debited: 0n, credited: 0n, fees: 0n }, 2n, 0)
+    chain.transactions.set(log.transactionHash as string, {
+      to: TEST_CONTRACTS.OffpeakVault,
+      input: encodeFunctionData({ abi: OffpeakVaultAbi, functionName: "settle", args: [b as never, emptyTotals() as never, concat(sigs)] }),
+    })
+    chain.add(log)
+    const deps: IngestDeps = { db, reader: chain.reader, contracts: TEST_CONTRACTS, confirmations: 1, publish: () => {} }
+    const state = newIngestState()
+    await tick(deps, state)
+    const drawnHour = async () => (await db.query<{ drawn_hour: string | null }>("SELECT drawn_hour FROM shared.agent_payments")).rows[0]!.drawn_hour
+    return { chain, db, deps, state, drawnHour, refunds: async () => (await db.query("SELECT 1 FROM shared.refunds")).rows.length }
+  }
+
+  const honest = (signer: LocalAccount, hash: Hex, db: Db, batch: unknown = drawn) => signer.sign!({ hash }).then((sig) => storeSignature(db, "settle", HOUR, signer.address, hash, sig, batch))
+  const stale = testHash("stale batch")
+
+  test("two agreeing rows apply", async () => {
+    const { drawnHour } = await scenario(async (db, hash) => {
+      await honest(lowest, hash, db)
+      await honest(middle, hash, db)
+    })
+    expect(Number(await drawnHour())).toBe(HOUR)
+  })
+
+  test("a stale row with the same root and totals is not what applies", async () => {
+    const { drawnHour } = await scenario(async (db, hash) => {
+      await honest(lowest, stale, db, outcome({ drawn: [], writtenOff: [] }))
+      await honest(middle, hash, db)
+      await honest(highest, hash, db)
+    }, [middle, highest])
+    expect(Number(await drawnHour())).toBe(HOUR)
+  })
+
+  test("a forged row for the landed hash is ignored", async () => {
+    const { drawnHour, refunds } = await scenario(async (db, hash) => {
+      await storeSignature(db, "settle", HOUR, lowest.address, hash, "0x00", outcome({ drawn: [], writtenOff: [], refunds: [REFUND] }))
+      await honest(middle, hash, db)
+    })
+    expect(Number(await drawnHour())).toBe(HOUR)
+    expect(await refunds()).toBe(0)
+  })
+
+  test("a row from a signer the vault did not accept is ignored", async () => {
+    const { drawnHour, refunds } = await scenario(async (db, hash) => {
+      await honest(highest, hash, db, outcome({ drawn: [], writtenOff: [], refunds: [REFUND] }))
+    })
+    expect(await drawnHour()).toBeNull()
+    expect(await refunds()).toBe(0)
+  })
+
+  test("one signer re-signing after the landing leaves the other's row to stand", async () => {
+    const { drawnHour } = await scenario(async (db, hash) => {
+      await honest(lowest, stale, db, outcome({ drawn: [], writtenOff: [] }))
+      await honest(middle, hash, db)
+    })
+    expect(Number(await drawnHour())).toBe(HOUR)
+  })
+
+  test("replay after a fork applies the same outcome with no calldata read", async () => {
+    const { chain, deps, state, drawnHour } = await scenario(async (db, hash) => {
+      await honest(lowest, hash, db)
+      await honest(middle, hash, db)
+    })
+    chain.transactions.clear()
+    chain.add(eventLog("OffpeakVault", "Deposited", { buyer: BUYER, amount: 1n, balance: 1n }, 3n, 0))
+    await tick(deps, state)
+    chain.fork = "other"
+    chain.forkFrom = 3n
+    await tick(deps, state)
+    expect(Number(await drawnHour())).toBe(HOUR)
   })
 })

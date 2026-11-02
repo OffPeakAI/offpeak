@@ -1,6 +1,7 @@
 import { OffpeakVaultAbi, abis } from "@offpeak/abis"
 import { log, type Db, type Metrics } from "@offpeak/common"
-import { BlockNotFoundError, decodeEventLog, type Abi, type Address, type Log, type PublicClient } from "viem"
+import { domain, settleTypes } from "@offpeak/shared"
+import { BlockNotFoundError, decodeEventLog, decodeFunctionData, hashTypedData, isAddressEqual, recoverAddress, slice, type Abi, type Address, type Hex, type Log, type PublicClient } from "viem"
 import { applyEvent, type ChainEvent } from "./apply/index.ts"
 
 const CURSOR = "main"
@@ -78,6 +79,18 @@ async function blockTimes(reader: PublicClient, logs: Log[]) {
   return times
 }
 
+/** The batch a `settle` call landed and the two signers the vault accepted for it, read from its calldata. */
+async function landedBatch(deps: IngestDeps, txHash: Hex) {
+  const sent = await deps.reader.getTransaction({ hash: txHash })
+  if (!sent.to || !isAddressEqual(sent.to, deps.contracts.OffpeakVault!)) return null
+  const call = decodeFunctionData({ abi: OffpeakVaultAbi, data: sent.input })
+  if (call.functionName !== "settle") return null
+  const [batch, , thresholdSig] = call.args
+  const hash = hashTypedData({ domain: domain("OffpeakSettlement", batch.vault, Number(batch.chainId)), types: settleTypes, primaryType: "SettleBatch", message: batch })
+  const signers = await Promise.all([slice(thresholdSig, 0, 65), slice(thresholdSig, 65, 130)].map((signature) => recoverAddress({ hash, signature })))
+  return { batchHash: hash, signers }
+}
+
 /** Moves unmatched collections onto their payment rows, which may be written after the claim lands. */
 async function reconcileCollections(tx: Db) {
   await tx.query(
@@ -120,11 +133,17 @@ async function applyRange(deps: IngestDeps, from: bigint, to: bigint) {
   const logs = await deps.reader.getLogs({ address: Object.values(deps.contracts), fromBlock: from, toBlock: to })
   const times = await blockTimes(deps.reader, logs)
   const tip = await deps.reader.getBlock({ blockNumber: to })
+  // Kept in the event's args, so replay needs no RPC and rebuilds the same outcome.
+  const decodedLogs: [Log, Omit<ChainEvent, "blockTs">][] = []
+  for (const log of logs) {
+    const decoded = decode(log, names)
+    if (!decoded) continue
+    const landed = decoded.contract === "OffpeakVault" && decoded.event === "Settled" ? await landedBatch(deps, log.transactionHash!) : null
+    decodedLogs.push([log, landed ? { ...decoded, args: { ...decoded.args, ...landed } } : decoded])
+  }
   const events: ChainEvent[] = []
   await deps.db.transaction(async (tx) => {
-    for (const log of logs) {
-      const decoded = decode(log, names)
-      if (!decoded) continue
+    for (const [log, decoded] of decodedLogs) {
       const event = { ...decoded, blockTs: times.get(log.blockNumber!)! }
       const inserted = await tx.query<{ tx_hash: string }>(
         `INSERT INTO chain.events (tx_hash, log_index, block_number, block_hash, block_ts, contract, event, args, processed)

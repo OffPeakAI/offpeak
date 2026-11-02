@@ -34,6 +34,7 @@ export class FakeChain {
   failNextBlockReads = 0
   fork = "main"
   forkFrom = 0n
+  transactions = new Map<string, { to: Address; input: Hex }>()
 
   reader = {
     getBlockNumber: async () => this.head,
@@ -47,6 +48,7 @@ export class FakeChain {
     },
     getLogs: async ({ fromBlock, toBlock }: { fromBlock: bigint; toBlock: bigint }) =>
       this.logs.filter((l) => (l.blockNumber as bigint) >= fromBlock && (l.blockNumber as bigint) <= toBlock),
+    getTransaction: async ({ hash }: { hash: string }) => this.transactions.get(hash) ?? { to: TEST_CONTRACTS.HostRegistry, input: "0x" },
     readContract: async () => 4n,
   } as unknown as PublicClient
 
