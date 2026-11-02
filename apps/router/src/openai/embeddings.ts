@@ -22,12 +22,15 @@ import { signRouterBody } from "../../../host-agent/src/proxy.ts"
 import { oai } from "../http.ts"
 import { authorize, paymentRequiredResponse, release, waitAuthorized } from "../pay/authorize.ts"
 import { flushCapture } from "../pay/captures.ts"
+import { MAX_HOST_REPLY_BYTES, boundedText } from "../routing/dispatch.ts"
 import { selectHost, type HostCandidate } from "../routing/select.ts"
 import { candidates, hostPrice } from "./chat.ts"
 import { commitRecord, flagMetering } from "./commit.ts"
 
 const BODY_LIMIT = 4 * 1024 * 1024
 const MAX_INPUTS = 2048
+/** Well past one vector of the widest models as JSON floats, so a full batch still fits. */
+const MAX_REPLY_BYTES_PER_INPUT = 64 * 1024
 
 const embeddingsBody = z.object({
   model: z.string().min(1).optional(),
@@ -67,6 +70,15 @@ async function serveOne(stack: Stack, routes: Route[], pay: PayHold, reqId: Hex,
     if (!refused) stack.load.noteResult(route.target.host, false)
   }
   return { ok: false as const, refused }
+}
+
+/** A host writes its own reply, so only what these inputs can need is read. `null` means the reply cannot be used. */
+async function readReply(res: Response, inputs: number) {
+  try {
+    return JSON.parse(await boundedText(res, Math.max(MAX_HOST_REPLY_BYTES, inputs * MAX_REPLY_BYTES_PER_INPUT))) as { data?: unknown } | null
+  } catch {
+    return null
+  }
 }
 
 /** Embeddings are billed on input tokens only. Known cost, so `exact` is a valid agent path. */
@@ -125,7 +137,12 @@ export async function serveEmbeddings(stack: Stack, req: Request, ip = "unknown"
     await release(stack, pay)
     return served.refused ? oai(400, "The host refused this request", "invalid_request", "host_refused") : oai(503, "Host failed", "engine", "no_capacity")
   }
-  const reply = (await served.res.json()) as { data?: unknown }
+  const reply = await readReply(served.res, inputs.length)
+  if (!reply) {
+    stack.load.noteResult(served.route.target.host, false)
+    await release(stack, pay)
+    return oai(503, "Host failed", "engine", "no_capacity")
+  }
   if (!(await settled())) return unpaid()
   const { route } = served
   const host = route.target.host.toLowerCase()

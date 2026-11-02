@@ -9,7 +9,7 @@ type ToolDelta = { index?: number; id?: string; type?: string; function?: { name
 export type Assembled = { text: string; toolCalls: { id: string; type: string; function: { name: string; arguments: string } }[]; finish: string | null }
 
 /** Well past the longest reply `MAX_OUTPUT_TOKENS` allows, framing included. */
-const MAX_HOST_REPLY_BYTES = 8 * 1024 * 1024
+export const MAX_HOST_REPLY_BYTES = 8 * 1024 * 1024
 /** OpenAI takes at most 128 tools. */
 const MAX_TOOL_CALLS = 128
 

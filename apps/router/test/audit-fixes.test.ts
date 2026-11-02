@@ -289,6 +289,33 @@ describe("host replies", () => {
     expect(sent).toBeLessThanOrEqual(10 << 20)
   })
 
+  test("an embeddings reply past its limit fails fast, frees the hold and counts against the host", async () => {
+    const booted = await bootStack()
+    const inner = booted.stack.hosts.request
+    const chunk = new Uint8Array(1 << 20).fill(32)
+    let sent = 0
+    booted.stack.hosts = {
+      request: async (host, endpoint, path, init) => {
+        if (path !== "/offpeak/v1/embeddings") return inner(host, endpoint, path, init)
+        return new Response(
+          new ReadableStream({
+            pull(controller) {
+              if (sent >= 64 << 20) return controller.close()
+              sent += chunk.length
+              controller.enqueue(chunk)
+            },
+          }),
+        )
+      },
+    }
+    const res = await booted.app.request("/v1/embeddings", { method: "POST", headers: { authorization: `Bearer ${booted.key.token}`, "content-type": "application/json" }, body: JSON.stringify({ model: "ofm-embed", input: "x" }) })
+    expect(res.status).toBe(503)
+    expect(sent).toBeLessThanOrEqual(10 << 20)
+    expect(await booted.stack.ledger.committed(booted.buyer, 0n)).toBe(0n)
+    expect(booted.stack.load.errorRate(booted.host)).toBe(1)
+    expect((await records(booted)).rows.length).toBe(0)
+  })
+
   test("a sign reply past its limit is not parsed", async () => {
     await expect(boundedText(new Response("x".repeat(1024)), 16)).rejects.toThrow("too large")
     expect(await boundedText(new Response("short"), 16)).toBe("short")
