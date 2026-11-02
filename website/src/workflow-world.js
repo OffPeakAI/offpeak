@@ -272,3 +272,21 @@
     reduce.addEventListener('change',()=>{world.dataset.paused=String(paused||reduce.matches);measureProgress();render(true);wake();});
     mobile.addEventListener('change',()=>{measureProgress();render(true);wake();});
     compact.addEventListener('change',()=>{measureProgress();render(true);wake();});
+
+    setDistrict(0); measureProgress(); render(true);
+    world.dataset.paused=String(reduce.matches);
+    // The full original gallery remains available if setup ever fails before this point.
+    fallback.hidden=true;fallback.setAttribute('aria-hidden','true');fallback.style.display='none';
+    section.dataset.workflowWorld='ready';mounted=true;
+    window.OffpeakWorkflowWorld={selectDistrict:select,setPaused,getState:()=>({active,paused,progress,visible,workflows:18})};
+  }
+
+  function start() {
+    try { mount(); } catch(error) { console.warn('Workflow world could not start; original gallery retained.',error); }
+    if (!mounted) {
+      const observer=new MutationObserver(()=>{try{mount();}catch(_){/* Keep the original gallery. */}if(mounted)observer.disconnect();});
+      observer.observe(document.body,{childList:true,subtree:true});
+    }
+  }
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',start,{once:true});else start();
+})();
