@@ -1,6 +1,8 @@
-import { Hono } from "hono"
+import { Hono, type Context, type Next } from "hono"
+import { bodyLimit } from "hono/body-limit"
 import { HOUR_CLOSE_GRACE_S, hourEnd } from "@offpeak/shared"
 import { trpcServer } from "@hono/trpc-server"
+import { ipLimit } from "./auth/limits.ts"
 import { createNonce, sessionWallet, verifyLogin } from "./auth/siwe.ts"
 import { applyVoucher } from "./pay/authorize.ts"
 import { auth, issueKey, serveChat, type Stack } from "./pipeline.ts"
@@ -14,26 +16,36 @@ import { serveUsageList, usageRecord } from "./offpeak/usage.ts"
 import { windowBoard, windowCalldata } from "./offpeak/windows.ts"
 import { openDispute } from "./offpeak/disputes.ts"
 import { serviceStatus } from "./offpeak/status.ts"
-import { channelView, closeChannel } from "./offpeak/channels.ts"
+import { closeChannel, payerChannelView } from "./offpeak/channels.ts"
 import { sealedHostsView } from "./routing/attest.ts"
-import { channelId, voucherBody } from "./pay/schemas.ts"
-import { registerCalldata, rememberHost } from "./hosts-api/register.ts"
+import { channelId, signature, voucherBody, wallet } from "./pay/schemas.ts"
+import { registerBody, registerCalldata, rememberHost } from "./hosts-api/register.ts"
 import { acceptPriceSheet } from "./hosts-api/price-sheet.ts"
 import { hostPayouts } from "./hosts-api/payouts.ts"
 import { auditResponse } from "./hosts-api/audit-response.ts"
 import { closeHour } from "./metering/hourclose.ts"
 import { appRouter } from "./trpc/router.ts"
-import { featureOff, sameSecret } from "./http.ts"
+import { clientIp, featureOff, sameSecret } from "./http.ts"
 import { mountWeb } from "./web.ts"
 import { calibrationReport } from "../../auditor/src/calibrate.ts"
 import { serveCanary } from "./audit/canary.ts"
 import { z } from "zod"
 
 const modelQuery = z.string().min(1).max(128).optional()
+const nonceBody = z.object({ wallet })
+const loginBody = z.object({ message: z.string().max(4096), signature })
+/** Routes anyone can reach and that write to the database, per address per minute. */
+const NONCES_PER_MINUTE = 30n
+const LOGINS_PER_MINUTE = 30n
+const REGISTERS_PER_MINUTE = 10n
+const OPEN_BODY_BYTES = 32 * 1024
 
 export function createApp(stack: Stack) {
   const app = new Hono()
   const internal = (authorization: string | undefined) => Boolean(stack.internalToken) && sameSecret(authorization, `Bearer ${stack.internalToken}`)
+  const ipOf = (c: Context) => clientIp(c.req.raw, c.env, stack.proxyHops ?? 0)
+  const perIp = (scope: string, limit: bigint) => async (c: Context, next: Next) => (await ipLimit(stack, ipOf(c), scope, limit)) ?? next()
+  const openBody = bodyLimit({ maxSize: OPEN_BODY_BYTES, onError: (c) => c.json({ error: { message: "Body too large", type: "invalid_request", code: "body_too_large" } }, 413) })
   app.onError((err, c) => {
     console.error(JSON.stringify({ service: "router", event: "request_failed", path: c.req.path, error: String(err) }))
     return c.json({ error: { message: "Service unavailable", type: "server_error", code: "unavailable" } }, 503)
@@ -48,8 +60,8 @@ export function createApp(stack: Stack) {
     const body = `{"context_length":${model.contextLength},"tokenizer":${publishedTokenizer(digest) ?? "null"}}`
     return c.body(body, 200, { "content-type": "application/json", "cache-control": "public, max-age=86400" })
   })
-  app.post("/v1/chat/completions", (c) => serveChat(stack, c.req.raw))
-  app.post("/v1/embeddings", (c) => serveEmbeddings(stack, c.req.raw))
+  app.post("/v1/chat/completions", (c) => serveChat(stack, c.req.raw, undefined, ipOf(c)))
+  app.post("/v1/embeddings", (c) => serveEmbeddings(stack, c.req.raw, ipOf(c)))
   app.post("/v1/files", (c) => serveUploadFile(stack, c.req.raw))
   app.get("/v1/files/:id/content", (c) => serveFileContent(stack, c.req.raw, c.req.param("id")))
   app.post("/v1/batches", (c) => serveCreateBatch(stack, c.req.raw))
@@ -121,10 +133,14 @@ export function createApp(stack: Stack) {
     if (!id.success) return c.json({ error: { message: "Not found", type: "invalid_request", code: "not_found" } }, 404)
     return closeChannel(stack, id.data, await c.req.json().catch(() => null))
   })
-  app.post("/v1/auth/nonce", async (c) => c.json(await createNonce(stack, String((await c.req.json()).wallet ?? ""))))
-  app.post("/v1/auth/login", async (c) => {
-    const body = await c.req.json<{ message: string; signature: `0x${string}` }>()
-    const login = await verifyLogin(stack, body.message, body.signature)
+  app.post("/v1/auth/nonce", perIp("nonce", NONCES_PER_MINUTE), openBody, async (c) => {
+    const body = nonceBody.safeParse(await c.req.json().catch(() => null))
+    if (!body.success) return c.json({ error: { message: "Wallet cannot be read", type: "invalid_request", code: "bad_wallet" } }, 400)
+    return c.json(await createNonce(stack, body.data.wallet))
+  })
+  app.post("/v1/auth/login", perIp("login", LOGINS_PER_MINUTE), openBody, async (c) => {
+    const body = loginBody.safeParse(await c.req.json().catch(() => null))
+    const login = body.success ? await verifyLogin(stack, body.data.message, body.data.signature) : { ok: false as const }
     return login.ok ? c.json({ session: login.session, wallet: login.wallet }) : c.json({ error: { message: "Login failed", type: "auth", code: "bad_login" } }, 401)
   })
   app.post("/v1/keys", async (c) => {
@@ -132,16 +148,13 @@ export function createApp(stack: Stack) {
     if (!wallet) return c.json({ error: { message: "Sign in first", type: "auth", code: "no_session" } }, 401)
     return c.json(await issueKey(stack, wallet))
   })
-  app.get("/v1/channels/:id", async (c) => {
-    const row = await channelView(stack, c.req.param("id"))
-    if (!row) return c.json({ error: { message: "Not found", type: "invalid_request", code: "not_found" } }, 404)
-    return c.json(row)
-  })
-  app.post("/v1/hosts/register", async (c) => {
-    const body = await c.req.json()
-    const remembered = await rememberHost(stack, body)
+  app.get("/v1/channels/:id", (c) => payerChannelView(stack, c.req.param("id"), c.req.header("x-offpeak-channel-auth")))
+  app.post("/v1/hosts/register", perIp("register", REGISTERS_PER_MINUTE), openBody, async (c) => {
+    const body = registerBody.safeParse(await c.req.json().catch(() => null))
+    if (!body.success) return c.json({ error: { message: "Registration cannot be read", type: "invalid_request", code: "bad_registration" } }, 400)
+    const remembered = await rememberHost(stack, body.data)
     if ("error" in remembered) return c.json({ error: { message: "Operator signature is invalid", type: "auth", code: remembered.error } }, 401)
-    return c.json({ ...registerCalldata(stack.registry as `0x${string}`, body), ...remembered })
+    return c.json({ ...registerCalldata(stack.registry as `0x${string}`, body.data), ...remembered })
   })
   app.post("/v1/hosts/price-sheet", async (c) => {
     const result = await acceptPriceSheet(stack, await c.req.json().catch(() => null))

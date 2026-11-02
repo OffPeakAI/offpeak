@@ -1,10 +1,13 @@
-import { domain, hourIndex, leafFor, recordToMessage, serializeEnvelope, serializeRecord, signTyped, usageTypes, type Hex, type UsageRecord } from "@offpeak/shared"
+import { bothCountsOk, domain, hourIndex, leafFor, recordToMessage, recoverUsageSigner, serializeEnvelope, serializeRecord, signTyped, usageTypes, type Hex, type UsageRecord } from "@offpeak/shared"
 import type { PayHold, Payer, Stack } from "../context.ts"
 import { queueCapture } from "../pay/captures.ts"
 import { noteChannel } from "../pay/channel-store.ts"
+import { boundedText } from "../routing/dispatch.ts"
 import { captureTx } from "../store.ts"
 
 const SIGN_TIMEOUT_MS = 10_000
+/** A signature and two counts. */
+const MAX_SIGN_REPLY_BYTES = 16 * 1024
 
 export type Commit = {
   stack: Stack
@@ -21,14 +24,24 @@ export type Commit = {
   sealed?: boolean
 }
 
-export async function flagMetering(stack: Stack, reqId: string, host: string, counts: unknown, hostCounts: unknown, reason: string) {
-  await stack.db.query(`INSERT INTO serving.metering_flags (req_id, host, router_counts, host_counts, reason) VALUES ($1,$2,$3::jsonb,$4::jsonb,$5) ON CONFLICT (req_id) DO NOTHING`, [
-    reqId,
-    host,
-    JSON.stringify(counts),
-    JSON.stringify(hostCounts),
-    reason,
-  ])
+/** Flags that say nothing against the host. A request has one row, so a flag that does takes the row over. */
+const ROUTER_SIDE_REASONS = ["over_hold", "bill_failed", "night_jobs_off"]
+
+export async function flagMetering(stack: Pick<Stack, "db">, reqId: string, host: string, counts: unknown, hostCounts: unknown, reason: string) {
+  await stack.db.query(
+    `INSERT INTO serving.metering_flags (req_id, host, router_counts, host_counts, reason) VALUES ($1,$2,$3::jsonb,$4::jsonb,$5)
+     ON CONFLICT (req_id) DO UPDATE SET router_counts = EXCLUDED.router_counts, host_counts = EXCLUDED.host_counts, reason = EXCLUDED.reason, created_at = now()
+     WHERE serving.metering_flags.reason = ANY($6::text[]) AND NOT EXCLUDED.reason = ANY($6::text[])`,
+    [reqId, host, JSON.stringify(counts), JSON.stringify(hostCounts), reason, ROUTER_SIDE_REASONS],
+  )
+}
+
+/** The host's own rule for what it signs: a cut stream may bill less output than it produced, never more. */
+function countsAgree(record: UsageRecord, hostCounts: { tokensIn?: unknown; tokensOut?: unknown } | undefined, partial: boolean | undefined) {
+  const { tokensIn, tokensOut } = hostCounts ?? {}
+  if (typeof tokensIn !== "number" || typeof tokensOut !== "number") return true
+  if (partial) return bothCountsOk(record.tokensIn, 0, tokensIn, 0) && record.tokensOut <= tokensOut
+  return bothCountsOk(record.tokensIn, record.tokensOut, tokensIn, tokensOut)
 }
 
 /** Signs a record, gets the host's signature, and takes payment in the one transaction that stores it. */
@@ -48,8 +61,11 @@ export async function commitRecord(commit: Commit) {
     body: JSON.stringify({ record: serializeRecord(record), routerSig, partial }),
     signal: AbortSignal.timeout(SIGN_TIMEOUT_MS),
   })
-  const signBody = (await signed.json()) as { hostSig: Hex; hostCounts: { tokensIn: number; tokensOut: number }; reason?: string }
+  const signBody = JSON.parse(await boundedText(signed, MAX_SIGN_REPLY_BYTES)) as { hostSig: Hex; hostCounts: { tokensIn: number; tokensOut: number }; reason?: string }
   if (!signed.ok) return { refused: signBody.reason ?? "sign_refused", hostCounts: signBody.hostCounts ?? {} }
+  // Settlement drops a record the host did not sign, so one stored here would be billed and never debited.
+  const signer = await recoverUsageSigner(recordToMessage(record), signBody.hostSig, stack.usageLedger).catch(() => "")
+  if (signer.toLowerCase() !== record.host.toLowerCase()) return { refused: "bad_host_sig", hostCounts: signBody.hostCounts ?? {} }
   const envelope = serializeEnvelope({
     v: 1,
     record,
@@ -62,6 +78,7 @@ export async function commitRecord(commit: Commit) {
   })
   const hour = hourIndex(ts)
   const actual = record.hostCostMicro + record.feeMicro
+  const disagrees = !countsAgree(record, signBody.hostCounts, partial)
   let channelOwed: bigint | undefined
   await captureTx(
     stack.db,
@@ -109,6 +126,8 @@ export async function commitRecord(commit: Commit) {
       hostCounts: signBody.hostCounts,
     },
     async (tx) => {
+      // Signed over counts the host's own figures do not support, which is the record a metering challenge can prove.
+      if (disagrees) await flagMetering({ db: tx }, reqId, host, { tokensIn: record.tokensIn, tokensOut: record.tokensOut }, signBody.hostCounts, "counts")
       if (pay.kind === "prepaid") await queueCapture(tx, { reqId, kind: "prepaid", wallet: pay.wallet, holdId: pay.holdId, hour, amount: actual })
       if (pay.kind === "upto") {
         await tx.query(`INSERT INTO shared.agent_payments (payment_id, kind, payer, amount_micro, req_ids) VALUES ($1,'upto',$2,$3,$4)`, [pay.payRef, pay.wallet, actual.toString(), [reqId]])

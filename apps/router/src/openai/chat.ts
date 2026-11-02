@@ -34,6 +34,7 @@ import { intakeFlex } from "./batches.ts"
 import { commitRecord, flagMetering } from "./commit.ts"
 import type { ModelEntry, PayHold, Payer, Stack } from "../context.ts"
 import { auth } from "../auth/keys.ts"
+import { beforeCounting } from "../auth/limits.ts"
 import { nextCheaper } from "../offpeak/forecast.ts"
 import { authorize, paymentRequiredResponse, release, resolveWindow, waitAuthorized } from "../pay/authorize.ts"
 import { flushCapture } from "../pay/captures.ts"
@@ -244,6 +245,12 @@ function offpeakEvent(name: string, reqId: Hex, modelName: string, created: numb
 
 const requestLimitMs = () => (MAX_REQUEST_S - BILLING_MARGIN_S) * 1000
 
+/** A reply that ran to its end served the request even with nothing in it, since a buyer's `stop` can cut it to nothing. */
+function closeFlow(ctx: Ctx, failed: boolean) {
+  if (failed) ctx.flow?.end()
+  else ctx.flow?.drop()
+}
+
 /** Counts a Window's output as it passes, so a long stream lands in the minutes it actually ran. */
 function meterWindow(ctx: Ctx, event: HostEvent, piece: string) {
   if (ctx.flow && (piece || event.choices?.[0]?.delta?.tool_calls)) ctx.flow.tokens(countText(ctx.tokenizer, piece) || 1)
@@ -304,8 +311,7 @@ function streamResponse(ctx: Ctx, opened: Opened, priced: Priced, entered: numbe
         }
         clearTimeout(limit)
         // A buyer who walks away before a token says nothing about the host.
-        if (cancelled) ctx.flow?.drop()
-        else ctx.flow?.end()
+        closeFlow(ctx, cut && !cancelled)
         stack.load.leave(opened.host, ctx.model.digest)
         // A reply under the budget still needs its authorization before it can bill.
         if (pay.kind === "upto" && !gated && !failure) await gate()
@@ -343,17 +349,17 @@ function streamResponse(ctx: Ctx, opened: Opened, priced: Priced, entered: numbe
 async function jsonResponse(ctx: Ctx, opened: Opened, priced: Priced, headers: Record<string, string>) {
   const { stack, reqId, started, modelName, pay } = ctx
   const output = emptyAssembly()
-  meterWindow(ctx, opened.first, absorb(output, opened.first))
   const limit = setTimeout(() => opened.abort(), requestLimitMs())
   let cut = false
   try {
+    meterWindow(ctx, opened.first, absorb(output, opened.first))
     for await (const event of opened.events) meterWindow(ctx, event, absorb(output, event))
   } catch {
     cut = true
     output.finish = "length"
   }
   clearTimeout(limit)
-  ctx.flow?.end()
+  closeFlow(ctx, cut)
   stack.load.leave(opened.host, ctx.model.digest)
   if (pay.kind === "upto" && (await waitAuthorized(stack, pay.payRef, stack.preconfirmTimeoutMs)) !== "ok") {
     await release(stack, pay).catch(() => undefined)
@@ -404,7 +410,7 @@ function parseFlex(header: string | null) {
   return parsed.success ? Math.floor(Date.parse(parsed.data) / 1000) : null
 }
 
-export async function serveChat(stack: Stack, req: Request, night?: NightLine): Promise<Response> {
+export async function serveChat(stack: Stack, req: Request, night?: NightLine, ip = "unknown"): Promise<Response> {
   const entered = performance.now()
   const started = stack.clock()
   if (isSealed(req)) return serveSealed(stack, req)
@@ -429,6 +435,8 @@ export async function serveChat(stack: Stack, req: Request, night?: NightLine): 
   if (!model) return oai(404, "Unknown model", "invalid_request", "model_not_found")
   if (!unpaid && (authed as Payer).mode === 2) return oai(400, "exact is for fixed-cost calls such as embeddings", "invalid_request", "exact_not_allowed")
   if (!messagesOk(body.messages)) return oai(400, "Messages need text content", "invalid_request", "bad_messages")
+  const refused = await beforeCounting(stack, unpaid ? null : (authed as Payer), raw, ip)
+  if (refused) return refused
   const tokensIn = Buffer.byteLength(raw) + 64
   if (!tokenLimits.safeParse(body).success) return oai(400, "max_tokens must be a positive integer", "invalid_request", "bad_max_tokens")
   const asked = askedTokens(body) as number | null | undefined
@@ -462,7 +470,7 @@ export async function serveChat(stack: Stack, req: Request, night?: NightLine): 
   }
   if (flexDeadline !== undefined && (payer.mode === 1 || payer.mode === 2 || payer.mode === 3)) return oai(400, "Night jobs are prepaid", "invalid_request", "prepaid_only")
   const flow = payer.mode === 4 ? stack.windowPerf.begin(payer.windowId) : undefined
-  /** A holder who was turned away is still demand, and it goes on record. */
+  /** A holder the host failed is demand, and it goes on record. */
   const endFlow = async () => {
     flow?.end()
     if (payer.mode === 4) await noteWindowMinute(stack, payer.windowId).catch(() => undefined)
@@ -471,26 +479,27 @@ export async function serveChat(stack: Stack, req: Request, night?: NightLine): 
   // With no cap, the deadline alone says this can wait. With one, a price under it is served now.
   const scheduled = flex && !cap ? await intakeFlex(stack, flex.payer, modelName, flex.body, flex.deadline) : null
   if (scheduled) return scheduled
+  // Until a host is asked, a refusal says nothing about the Window's host, and a holder's own load can cause one.
   const route = await chooseRoute(stack, { cap, model, modelName, payer, feeBps, started, tokensIn, maxTokens, locked: night?.lockedPrice, unattended: Boolean(night || flex), flex }).catch(async (err) => {
-    await endFlow()
+    flow?.drop()
     await dropWindow()
     throw err
   })
   if (route instanceof Response) {
-    await endFlow()
+    flow?.drop()
     await dropWindow()
     return route
   }
   const pay = await authorize(stack, payer, route.quote, raw, windowRun, night?.fromHold).catch(async (err) => {
-    await endFlow()
+    flow?.drop()
     await dropWindow()
     throw err
   })
   if (pay instanceof Response) {
-    await endFlow()
+    flow?.drop()
     return pay
   }
-  const opened = await openHost(stack, route.ranked, payload, await headerP)
+  const opened = await openHost(stack, route.ranked, payload, await headerP, inputTokens)
   if (opened.ok) stack.hostWaitMs?.push(opened.ttftMs)
   if (!opened.ok) {
     const refused = opened.error === "refused"

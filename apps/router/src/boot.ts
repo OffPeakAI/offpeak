@@ -6,6 +6,7 @@ import { privateKeyToAccount } from "viem/accounts"
 import { z } from "zod"
 import { createApp } from "./app.ts"
 import { LiveChain } from "./chainview/live.ts"
+import { sweepSessions } from "./auth/siwe.ts"
 import { subscribePushes, watchChain } from "./chainview/push.ts"
 import { deployedFlags, type ModelEntry, type Stack } from "./context.ts"
 import { assertKeySeparation } from "./env.ts"
@@ -23,7 +24,7 @@ import { LoadMeter } from "./pricing/load.ts"
 import { loadSheets } from "./pricing/sheets.ts"
 import { writeHostStats } from "./pricing/stats.ts"
 import { AttestBook, readAttestConfig, sweepAttestations } from "./routing/attest.ts"
-import { loadEndpoints, probeHosts } from "./routing/probes.ts"
+import { hostFetch, loadEndpoints, probeHosts } from "./routing/probes.ts"
 import { openDb } from "./store.ts"
 
 const PROBE_EVERY_MS = 10_000
@@ -84,7 +85,7 @@ export async function bootRouter(source: NodeJS.ProcessEnv = process.env) {
     hosts: {
       request: (_host, endpoint, path, init) => {
         if (!endpoint) throw new Error("host has no endpoint")
-        return fetch(`${endpoint}${path}`, init)
+        return hostFetch(env.OFFPEAK_ENV === "mainnet", endpoint, path, init)
       },
     },
     models,
@@ -119,6 +120,7 @@ export async function bootRouter(source: NodeJS.ProcessEnv = process.env) {
     attest: new AttestBook(readAttestConfig(env, env.OFFPEAK_ENV === "mainnet")),
     internalToken: env.OFFPEAK_INTERNAL_TOKEN,
     production: env.OFFPEAK_ENV === "mainnet",
+    proxyHops: Number(source.OFFPEAK_PROXY_HOPS ?? 0),
     siweDomain: new URL(env.OFFPEAK_PUBLIC_BASE_URL).host,
   }
   await rebuildSpend(db, redis, hourIndex(stack.clock()) - 48)
@@ -146,6 +148,7 @@ export async function bootRouter(source: NodeJS.ProcessEnv = process.env) {
   const stats = guarded("host_stats", () => writeHostStats(stack))
   const retain = guarded("retention", async () => {
     await sweepFiles(stack)
+    await sweepSessions(stack)
     await trimLoad(stack)
   })
   const heal = guarded("spend_rebuild", () => rebuildSpend(db, redis, hourIndex(stack.clock()) - 48))

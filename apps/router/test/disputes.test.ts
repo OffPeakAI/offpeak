@@ -110,15 +110,29 @@ describe("disputes", () => {
     expect(result.checks[0]!.reasons).toContain("price_above_sheet")
   })
 
-  test("a record whose signatures do not hold comes back in full", async () => {
+  test("a record whose signatures do not hold is never debited, so nothing comes back", async () => {
     const booted = await bootStack()
-    const { reqId, record } = await served(booted)
+    const { reqId } = await served(booted)
     await booted.stack.db.exec("ALTER TABLE shared.usage_records DISABLE TRIGGER USER")
     await booted.stack.db.query("UPDATE shared.usage_records SET router_sig = host_sig")
     await booted.stack.db.exec("ALTER TABLE shared.usage_records ENABLE TRIGGER USER")
     const result = await dispute(booted, { req_ids: [reqId], reason: "forged" })
-    expect(result.outcome).toBe("upheld")
-    expect(BigInt(result.refund_micro)).toBe(BigInt(record.hostCostMicro) + BigInt(record.feeMicro))
+    expect(result.outcome).toBe("rejected")
+    expect(result.checks[0]!.reasons).toEqual(["bad_signature"])
+    expect((await refunds(booted)).rows.length).toBe(0)
+  })
+
+  test("a record settlement left out of a settled hour is never debited, so nothing comes back", async () => {
+    const booted = await bootStack()
+    const { reqId, output } = await served(booted)
+    await resignedOverbill(booted, reqId, 5_000)
+    const [{ hour }] = (await booted.stack.db.query<{ hour: string }>("SELECT hour FROM shared.usage_records")).rows as [{ hour: string }]
+    await booted.stack.db.query("INSERT INTO shared.usage_hours (hour, records, root, totals, totals_hash, router_close_sig, settle_tx) VALUES ($1,1,'0x','{}','0x','0x','0xfeed')", [hour])
+    const result = await dispute(booted, { req_ids: [reqId], reason: "too many tokens", material: { prompt: request, output } })
+    expect(result.outcome).toBe("rejected")
+    expect(result.checks[0]!.reasons).toEqual(["settlement_rejected"])
+    await booted.stack.db.query("UPDATE shared.usage_records SET settled_hour_tx = '0xfeed'")
+    expect((await dispute(booted, { req_ids: [reqId], reason: "kept", material: { prompt: request, output } })).outcome).toBe("upheld")
   })
 
   test("a record is refunded at most once, however often it is disputed", async () => {

@@ -1,5 +1,8 @@
 import { CHANNEL_CHALLENGE_S, CHANNEL_CREDIT_CAP_MICRO, CHANNEL_CREDIT_DEPOSIT_BPS } from "@offpeak/shared"
 
+/** One wallet's unsigned credit across all its channels, so that opening more channels adds none. */
+export const PAYER_CREDIT_CAP_MICRO = CHANNEL_CREDIT_CAP_MICRO
+
 export function creditLimit(deposit: bigint): bigint {
   const pct = (deposit * BigInt(CHANNEL_CREDIT_DEPOSIT_BPS)) / 10_000n
   return pct < CHANNEL_CREDIT_CAP_MICRO ? pct : CHANNEL_CREDIT_CAP_MICRO
@@ -16,6 +19,8 @@ export type ChannelAdmitInput = {
   newMax: bigint
   /** Vouchers from a contract wallet that are not on chain yet. Its answer can change before they land. */
   unlanded?: bigint
+  /** Served and held across all the payer's channels, this one included. */
+  payerUnvouchered?: bigint
 }
 
 export function admitChannel(input: ChannelAdmitInput): { ok: true; limit: bigint } | { ok: false; error: string } {
@@ -24,6 +29,7 @@ export function admitChannel(input: ChannelAdmitInput): { ok: true; limit: bigin
   if (input.expiry <= input.now + CHANNEL_CHALLENGE_S) return { ok: false, error: "channel_near_expiry" }
   const limit = creditLimit(input.deposit)
   if (input.unvouchered + (input.unlanded ?? 0n) + input.newMax > limit) return { ok: false, error: "credit_limit" }
+  if ((input.payerUnvouchered ?? 0n) + input.newMax > PAYER_CREDIT_CAP_MICRO) return { ok: false, error: "credit_limit" }
   if (input.voucherCumulative + input.unvouchered + input.newMax > input.deposit) return { ok: false, error: "deposit_exhausted" }
   return { ok: true, limit }
 }

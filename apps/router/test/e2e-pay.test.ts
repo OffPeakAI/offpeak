@@ -19,6 +19,8 @@ describe("channel vouchers", () => {
   test("one thousand calls accept a voucher each time", async () => {
     const { app, key, stack, buyer, indexer } = await bootStack()
     await stack.db.query("UPDATE serving.api_keys SET rpm_limit = 5000")
+    // The test clock stands still, so every call lands in one second of load.
+    for (const host of indexer.hosts.values()) for (const model of host.models) model.maxTps = 1_000_000
     const channelId = keccak256(toBytes("chan-e2e"))
     indexer.channels.set(channelId, {
       payer: buyer as Hex,

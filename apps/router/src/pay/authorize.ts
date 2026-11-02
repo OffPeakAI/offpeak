@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto"
-import { ZERO_BYTES32, channelAuthMessage, domain, hourIndex, voucherTypes, type BuyerChain, type ChannelChain, type Hex, type PaymentPayload } from "@offpeak/shared"
+import { ZERO_BYTES32, ceilDiv, channelAuthMessage, domain, hourIndex, voucherTypes, type BuyerChain, type ChannelChain, type Hex, type PaymentPayload } from "@offpeak/shared"
 import { keccak256, toBytes } from "viem"
-import { acceptVoucher, releaseChannel, reserveChannel } from "./channel-store.ts"
+import { acceptVoucher, claimPaymentId, releaseChannel, reserveChannel } from "./channel-store.ts"
 import { creditLimit } from "./channel.ts"
 import { paymentRequired } from "./x402.ts"
 import { admitWindow, pendingKey } from "./window.ts"
@@ -17,6 +17,9 @@ const MAX_UNCONFIRMED = 8n
 /** Past the longest a request waits for the chain, so a router that dies gives its slots back. */
 const UNCONFIRMED_TTL_S = 60
 const WINDOW_LOOKBACK_HOURS = 48
+/** A falling price can leave `exact` a little above the quote between a 402 and its retry. Settlement refunds any excess from the reserve. */
+const EXACT_MARGIN_BPS = 11_000n
+const EXACT_MARGIN_MIN_MICRO = 100n
 const WINDOW_REFUSED: Record<string, string> = {
   window_exhausted: "Window is exhausted",
   window_not_active: "Window is not active",
@@ -82,11 +85,12 @@ export async function applyVoucher(stack: Stack, ch: ChannelChain, channelId: He
   const accepted = await acceptVoucher(stack.db, ch, channelId, voucher, { contract: signed === "contract" })
   if (accepted === "bad_boundary") return oai(402, "Voucher is not on a reported boundary", "payment", "bad_voucher")
   if (accepted === "closing") return oai(409, "Channel is closing", "invalid_request", "channel_closing")
+  if (accepted === "payment_id_taken") return oai(409, "This sequence number's payment id is taken", "invalid_request", "payment_id_taken")
   return null
 }
 
 /** A channel id is public, so every request proves the payer sent it. */
-async function channelProof(stack: Stack, ch: ChannelChain, channelId: Hex, proof: { ts: number; nonce: string; sig: Hex } | undefined, rawBody: string): Promise<SigVerdict> {
+export async function channelProof(stack: Stack, ch: ChannelChain, channelId: Hex, proof: { ts: number; nonce: string; sig: Hex } | undefined, rawBody: string): Promise<SigVerdict> {
   if (!proof || Math.abs(stack.clock() - proof.ts) > CHANNEL_PROOF_WINDOW_S) return "bad"
   const message = channelAuthMessage({ channelId, ts: proof.ts, nonce: proof.nonce, bodyHash: keccak256(toBytes(rawBody)) })
   const signed = await verifyPersonal(stack, ch.payer, message, proof.sig)
@@ -94,6 +98,17 @@ async function channelProof(stack: Stack, ch: ChannelChain, channelId: Hex, proo
   // Keyed on the message, since a signature can have two valid forms and a wallet may reuse its bytes.
   const used = await stack.counters.add(`offpeak:proof:${keccak256(toBytes(message))}`, 1n, CHANNEL_PROOF_WINDOW_S * 3)
   return used === 1n ? signed : "bad"
+}
+
+/** Checks a channel request's proof once, as early as its route can. A `Response` means it was refused. */
+export async function proveChannel(stack: Stack, payer: Extract<Payer, { mode: 3 }>, rawBody: string) {
+  const ch = await stack.indexer.channel(payer.channelId)
+  if (!ch) return oai(402, "Unknown channel", "payment", "payment_required")
+  const proved = await channelProof(stack, ch, payer.channelId, payer.proof, rawBody)
+  if (proved === "unavailable") return unverified()
+  if (proved === "bad") return oai(401, "Channel request is not signed by the payer", "auth", "bad_channel_auth")
+  payer.proved = proved
+  return null
 }
 
 /** The buyer's chain state as admission reads it, with any pending lower cap already applied. */
@@ -134,22 +149,21 @@ export async function authorize(stack: Stack, payer: Payer, maxCostMicro: bigint
     return { kind: "prepaid", holdId, wallet: payer.wallet, max: maxCostMicro, payRef: ZERO_BYTES32 }
   }
   if (payer.mode === 3) {
+    const refused = payer.proved ? null : await proveChannel(stack, payer, rawBody)
+    if (refused) return refused
     const ch = await stack.indexer.channel(payer.channelId)
     if (!ch) return oai(402, "Unknown channel", "payment", "payment_required")
-    const proved = await channelProof(stack, ch, payer.channelId, payer.proof, rawBody)
-    if (proved === "unavailable") return unverified()
-    if (proved === "bad") return oai(401, "Channel request is not signed by the payer", "auth", "bad_channel_auth")
     if (payer.voucher) {
-      const refused = await applyVoucher(stack, ch, payer.channelId, payer.voucher)
-      if (refused) return refused
+      const voucherRefused = await applyVoucher(stack, ch, payer.channelId, payer.voucher)
+      if (voucherRefused) return voucherRefused
     }
-    const decision = await reserveChannel(stack.db, ch, payer.channelId, maxCostMicro, stack.clock(), { contractPayer: proved === "contract" })
+    const decision = await reserveChannel(stack.db, ch, payer.channelId, maxCostMicro, stack.clock(), { contractPayer: payer.proved === "contract" })
     if (!decision.ok) return oai(402, decision.error, "payment", decision.error)
     return { kind: "channel", channelId: payer.channelId, reservationId: decision.reservationId, wallet: ch.payer as Hex, max: maxCostMicro, payRef: payer.channelId }
   }
   if (payer.mode !== 4) {
     const exact = payer.mode === 2 ? witnessAmount(payer.payment) : null
-    if (payer.mode === 2 && (exact === null || exact < maxCostMicro)) return paymentRequiredResponse(stack, maxCostMicro, true)
+    if (payer.mode === 2 && (exact === null || exact < maxCostMicro || exact > exactCeiling(maxCostMicro))) return paymentRequiredResponse(stack, maxCostMicro, true)
     const verified = await stack.facilitator.verify({
       paymentPayload: payer.payment,
       paymentRequirements: { payTo: stack.vault, asset: stack.usdg, maxAmountRequired: maxCostMicro.toString() },
@@ -157,7 +171,16 @@ export async function authorize(stack: Stack, payer: Payer, maxCostMicro: bigint
     if (!verified.isValid) return oai(402, verified.invalidReason ?? "invalid", "payment", "payment_required")
     const reqId = String(payer.payment.payload.witness.reqId).toLowerCase()
     if (!(await holdUnconfirmedSlot(stack, verified.payer as string, reqId))) return oai(429, "Too many payments from this wallet are waiting for the chain", "rate_limit", "unconfirmed_limit")
-    if (exact !== null) await noteExact(stack, reqId, verified.payer as string, exact, payer.payment)
+    // For `exact` this comes before the money can move, so a crash at any later point still leaves a row for the sweep to refund.
+    const claimed = await claimPaymentId(stack.db, {
+      reqId,
+      payer: verified.payer as string,
+      amount: exact ?? maxCostMicro,
+      status: exact !== null ? "submitted" : "upto",
+      validBefore: String(payer.payment.payload.witness.validBefore ?? 0),
+      now: stack.clock(),
+    })
+    if (!claimed) return oai(402, "This payment's reqId is taken", "payment", "payment_id_taken")
     void Promise.resolve(stack.facilitator.settle({ paymentPayload: payer.payment, mode: exact !== null ? "exact" : "authorize" }))
       .then((result) => {
         if ((result as { success?: boolean }).success === false) settleAuthorization(stack, reqId, "fail")
@@ -181,6 +204,7 @@ export async function release(stack: Stack, pay: PayHold) {
   if (pay.kind === "prepaid") await stack.ledger.release(pay.wallet, pay.holdId)
   if (pay.kind === "channel") await releaseChannel(stack.db, pay.reservationId)
   if (pay.kind === "window") await stack.counters.add(pay.pendingKey, -pay.reservedTokens, 3 * 86_400)
+  if (pay.kind === "upto") await stack.db.query("DELETE FROM serving.x402_requests WHERE req_id = $1 AND status = 'upto'", [pay.payRef])
   // The money may already be on chain. The sweep refunds it once the chain says so.
   if (pay.kind === "exact") await stack.db.query("UPDATE serving.x402_requests SET status = 'refund_due' WHERE req_id = $1 AND status = 'submitted'", [pay.payRef])
 }
@@ -199,20 +223,14 @@ async function holdUnconfirmedSlot(stack: Stack, wallet: string, reqId: string) 
   return true
 }
 
+function exactCeiling(quote: bigint) {
+  const scaled = ceilDiv(quote * EXACT_MARGIN_BPS, 10_000n)
+  return scaled > quote + EXACT_MARGIN_MIN_MICRO ? scaled : quote + EXACT_MARGIN_MIN_MICRO
+}
+
 function witnessAmount(payment: PaymentPayload) {
   const amount = String(payment.payload.witness.amount ?? "")
   return /^\d{1,30}$/.test(amount) ? BigInt(amount) : null
-}
-
-/** Written before the money can move, so a crash at any later point still leaves a row for the sweep to refund. */
-async function noteExact(stack: Stack, reqId: string, payer: string, amount: bigint, payment: PaymentPayload) {
-  await stack.db.query("INSERT INTO serving.x402_requests (req_id, payer, max_amount, status, valid_before, created_at) VALUES ($1,$2,$3,'submitted',$4,$5) ON CONFLICT (req_id) DO NOTHING", [
-    reqId,
-    payer,
-    amount.toString(),
-    String(payment.payload.witness.validBefore ?? 0),
-    stack.clock(),
-  ])
 }
 
 export async function waitAuthorized(stack: Stack, reqId: string, timeoutMs: number): Promise<"ok" | "fail" | "timeout"> {

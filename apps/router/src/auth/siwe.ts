@@ -27,6 +27,11 @@ export async function verifyLogin(stack: Stack, message: string, signature: `0x$
   return { ok: true as const, session, wallet }
 }
 
+/** Nonces nobody spent and sessions past their time. */
+export async function sweepSessions(stack: Stack) {
+  await stack.db.query("DELETE FROM serving.siwe_sessions WHERE expires_at <= to_timestamp($1)", [stack.clock()])
+}
+
 export async function sessionWallet(stack: Stack, authorization: string | undefined) {
   const session = authorization?.startsWith("Bearer sess_") ? authorization.slice("Bearer ".length) : null
   if (!session) return null

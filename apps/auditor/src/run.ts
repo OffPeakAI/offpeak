@@ -27,11 +27,17 @@ const METERING_MIN_FLAGS = 20
 const METERING_MIN_HOURS = 6
 const METERING_SHARE = 0.05
 const METERING_SAMPLE = 400
-/** Reasons that point at the host. `over_hold` and `bill_failed` come from the router's own side, and `night_jobs_off` from a job it should not have sent. */
-const METERING_REASONS = ["counts", "digest", "sign_refused"]
+/**
+ * Reasons that point at the host. `over_hold` and `bill_failed` come from the router's own side, and `night_jobs_off`
+ * from a job it should not have sent. A refusal leaves no record, so it has nothing to prove against a root and stays
+ * an alert for a person. Only `dispute_upheld`, and a `counts` flag on a signed record, can reach a filing.
+ */
+const METERING_REASONS = ["counts", "digest", "sign_refused", "bad_host_sig", "dispute_upheld"]
 
 const WINDOW_FAILURE_SHARE = 0.2
 const SAMPLE_S = 60
+/** A share of a few demanded minutes says nothing about a host, and one holder can make those. */
+const WINDOW_MIN_MEASURED_S = 600
 const THROUGHPUT_LOOKBACK_BLOCKS = 200_000n
 const LOG_PAGE = 5_000n
 
@@ -400,7 +406,7 @@ export async function runThroughput(deps: AuditDeps) {
       const belowSeconds = Number(perf.rows[0]!.below) * SAMPLE_S
       const measuredSeconds = Number(perf.rows[0]!.measured) * SAMPLE_S
       const thresholdSeconds = WINDOW_FAILURE_SHARE * measuredSeconds
-      if (measuredSeconds === 0 || belowSeconds <= thresholdSeconds) continue
+      if (measuredSeconds < WINDOW_MIN_MEASURED_S || belowSeconds <= thresholdSeconds) continue
       const draws = await deps.db.query<{ req_id: string }>("SELECT req_id FROM shared.usage_records WHERE window_id = $1 AND status = 'final' ORDER BY req_id", [id.toString()])
       const proved = await proveSamples(deps, draws.rows.map((row) => row.req_id))
       const bundle = {

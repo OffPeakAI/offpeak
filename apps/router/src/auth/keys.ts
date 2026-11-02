@@ -63,7 +63,7 @@ function parseVoucher(raw: string) {
   }
 }
 
-function parseProof(raw: string | null) {
+export function parseProof(raw: string | null) {
   if (!raw) return undefined
   try {
     return channelProof.safeParse(JSON.parse(Buffer.from(raw, "base64url").toString("utf8"))).data
