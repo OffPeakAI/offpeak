@@ -76,7 +76,7 @@ The 402 for chat quotes the request's real maximum cost: input bytes as an upper
 
 A wallet can have 8 x402 payments waiting for the chain at once. One more is `429 unconfirmed_limit`, and a slot frees when the chain answers. A stream's pre-confirmation budget counts the input's cost as well as the output's.
 
-`GET /v1/channels/:id` gives `{ deposit, claimed, cumulative, owed, latestSeq, status, expiry, closing }`. `cumulative` is the latest accepted voucher. `owed` adds what has been served but not vouchered.
+`GET /v1/channels/:id` needs the payer's `X-Offpeak-Channel-Auth` proof over an empty body, and gives `{ deposit, claimed, cumulative, owed, latestSeq, status, expiry, closing }`. `cumulative` is the latest accepted voucher. `owed` adds what has been served but not vouchered.
 
 `POST /v1/channels/:id/voucher` takes `{ seq, cumulative, sig }`.
 

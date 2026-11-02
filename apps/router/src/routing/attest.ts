@@ -16,6 +16,7 @@ import {
 } from "../../../../packages/sdk/src/sealed/attest.ts"
 import type { Stack } from "../context.ts"
 import { oai } from "../http.ts"
+import { signRouterBody } from "../../../host-agent/src/proxy.ts"
 
 export type AttestationTranscript = {
   host: string
@@ -82,8 +83,10 @@ export async function attestHost(stack: Stack, book: AttestBook, host: RegistryH
   if (!host.endpoint) return { reasons: ["no_endpoint"] }
   const owner = host.operator.toLowerCase() as Hex
   const nonce = `0x${randomBytes(32).toString("hex")}` as Hex
+  // The router's own signature keeps its sweep out of the public rate limit.
+  const signed = await signRouterBody(stack.router, { reqId: nonce, ts: stack.clock(), payload: nonce })
   const reply = await stack.hosts
-    .request(owner, host.endpoint, `/offpeak/v1/attest?nonce=${nonce}`, { signal: AbortSignal.timeout(ATTEST_TIMEOUT_MS) })
+    .request(owner, host.endpoint, `/offpeak/v1/attest?nonce=${nonce}`, { headers: { "x-offpeak-req": signed }, signal: AbortSignal.timeout(ATTEST_TIMEOUT_MS) })
     .then(async (res) => (res.ok ? attestReplySchema.parse(await res.json()) : null))
     .catch(() => null)
   if (!reply) return { reasons: ["no_attestation"] }

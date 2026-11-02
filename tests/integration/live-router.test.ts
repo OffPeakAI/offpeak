@@ -282,7 +282,8 @@ describe.skipIf(!hasPostgres)("the router as a real process", () => {
       await res.text()
       return res.status === 200 && Boolean(res.headers.get("x-offpeak-channel-owed"))
     })
-    const owed = BigInt((await (await fetch(`${ROUTER_URL}/v1/channels/${id}`)).json() as { owed: string }).owed)
+    const proof = await channelAuthHeader(agent, { channelId: id, ts: Math.floor(Date.now() / 1000), body: "" })
+    const owed = BigInt((await (await fetch(`${ROUTER_URL}/v1/channels/${id}`, { headers: { "x-offpeak-channel-auth": proof } })).json() as { owed: string }).owed)
     expect(owed).toBeGreaterThan(0n)
 
     router.kill()

@@ -3,6 +3,11 @@ import { channelAuthHeader, type UsageEnvelope } from "@offpeak/shared"
 import { addChannel, ask, bootRouter, buyerAccount, chainView, channelRow, client, costOf, inProcess, until } from "./support.ts"
 import { OffpeakError, type ChatResult, type ChatStream } from "../src/index.ts"
 
+const payerView = async (booted: Awaited<ReturnType<typeof bootRouter>>, id: string) => {
+  const proof = await channelAuthHeader(buyerAccount, { channelId: id, ts: booted.stack.clock(), body: "" })
+  return (await booted.app.request(`/v1/channels/${id}`, { headers: { "x-offpeak-channel-auth": proof } })).json()
+}
+
 const USDG = 1_000_000n
 const chatPath = "/v1/chat/completions"
 
@@ -69,7 +74,7 @@ describe("channel flow against the router", () => {
     const payments = await booted.stack.db.query<{ amount_micro: string }>("SELECT amount_micro FROM shared.agent_payments WHERE kind = 'channel'")
     expect(payments.rows.length).toBe(60)
     expect(payments.rows.reduce((sum, row) => sum + BigInt(row.amount_micro), 0n)).toBe(spent)
-    const view = await (await booted.app.request(`/v1/channels/${id}`)).json()
+    const view = await payerView(booted, id)
     expect(view.owed).toBe(spent.toString())
   })
 
@@ -228,8 +233,7 @@ describe("payer proof on every request", () => {
     const op = client(booted)
     await expect(op.channels.attach(id)).rejects.toMatchObject({ code: "not_your_channel" })
     const bare = client(booted, { publicClient: { readContract: async () => ({ ...booted.indexer.channels.get(id)!, payer: buyerAccount.address }) } as never })
-    await bare.channels.attach(id)
-    await expect(bare.chat(ask("not mine"))).rejects.toMatchObject({ code: "bad_channel_auth", status: 401 })
+    await expect(bare.channels.attach(id)).rejects.toMatchObject({ code: "bad_channel_auth", status: 401 })
     expect(await channelRow(booted, id)).toBeNull()
   })
 })
@@ -563,7 +567,7 @@ describe("the client does not sign on the router's word", () => {
     const stream = (await op.chat({ ...ask("longform please", 300), stream: true })) as ChatStream
     for await (const _ of stream) break
     await until(async () => {
-      const view = await (await booted.app.request(`/v1/channels/${id}`)).json()
+      const view = await payerView(booted, id)
       return BigInt(view.owed) > 0n
     }, "the partial bill")
     const next = (await op.chat(ask("after the stop"))) as ChatResult

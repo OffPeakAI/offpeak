@@ -347,7 +347,8 @@ export class Channels {
   }
 
   private async read(id: Hex) {
-    const res = await this.ctx.fetch(`${this.ctx.baseURL}/v1/channels/${id}`)
+    const proof = await channelAuthHeader(this.needSigner(), { channelId: id, ts: nowSeconds(), body: "" })
+    const res = await this.ctx.fetch(`${this.ctx.baseURL}/v1/channels/${id}`, { headers: { "x-offpeak-channel-auth": proof } })
     if (res.status === 404) return null
     if (!res.ok) throw await errorFrom(res)
     return channelView.parse(await res.json())
