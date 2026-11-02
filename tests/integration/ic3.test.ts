@@ -195,6 +195,7 @@ beforeAll(async () => {
     writer: wallet(account as never),
     account: account as never,
     rulers: rulerAccounts.map((r) => r.address),
+    auditor,
   }))
   keeper = { db, reader, writer: wallet(keeperAccount as never), account: keeperAccount, contracts: chain.contracts, metrics }
 
@@ -305,7 +306,8 @@ describe("IC3: a swap host from flag to slash", () => {
   let swapId = 0
 
   test("a flagged host with a second signal is ruled a swap, frozen and not yet slashed", async () => {
-    swapId = await fileChallenge(bundleFrom(weekWhere(0.25, true), true))
+    // A root counts once, so this run's evidence is its own.
+    swapId = await fileChallenge({ ...bundleFrom(weekWhere(0.25, true), true), attachments: { run: "swap" } } as EvidenceBundle)
     await send(host, contract("AuditCourt"), AuditCourtAbi, "respond", [BigInt(swapId), keccak256(toBytes("response"))])
     await ruleAll()
 

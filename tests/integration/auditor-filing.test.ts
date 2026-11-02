@@ -169,7 +169,7 @@ beforeAll(async () => {
   const shared = { db, reader, contracts: chain.contracts, chainId: 4663 }
   const wallet = (account: never) => createWalletClient({ account, transport: http(chain.rpcUrl), chain: null }) as never
   workers = settlerAccounts.map((account) => ({ ...shared, writer: wallet(account as never), account: account as never, routerAddress: roleAccount("router").address, settlers: settlerAccounts.map((s) => s.address), metrics }))
-  rulers = rulerAccounts.map((account) => ({ ...shared, writer: wallet(account as never), account: account as never, rulers: rulerAccounts.map((r) => r.address) }))
+  rulers = rulerAccounts.map((account) => ({ ...shared, writer: wallet(account as never), account: account as never, rulers: rulerAccounts.map((r) => r.address), auditor: auditorAccount.address }))
 
   const registeredAt = await chainTime()
   hour = hourIndex(registeredAt)

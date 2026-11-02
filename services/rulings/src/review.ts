@@ -2,7 +2,7 @@ import { AuditCourtAbi, HostRegistryAbi, UsageLedgerAbi } from "@offpeak/abis"
 import { agreedSignatures, log, readSignatures, storeSignature, type Db } from "@offpeak/common"
 import { domain, rulingTypes, type EvidenceBundle } from "@offpeak/shared"
 import { hashTypedData, keccak256, toBytes, type Address, type Hex, type LocalAccount, type PublicClient, type WalletClient } from "viem"
-import { OUTCOME_BREACH, OUTCOME_SWAP, decideRuling, type ChallengeFacts } from "./decide.ts"
+import { OUTCOME_BREACH, OUTCOME_SWAP, decideRuling, dismiss, type ChallengeFacts } from "./decide.ts"
 import { buildRefundTree, spendWithHost, storeRefundTree } from "./refund-tree.ts"
 
 const HOST_RESPONSE_S = 86_400
@@ -14,12 +14,14 @@ export type RulingDeps = {
   account: LocalAccount
   contracts: Record<string, Address>
   rulers: Address[]
+  auditor: Address
   chainId: number
 }
 
 export type ChallengeRow = {
   id: string
   host: string
+  challenger: string
   kind: number
   samples_root: string | null
   sample_count: number | null
@@ -78,10 +80,22 @@ export async function refundTreeFor(deps: Pick<RulingDeps, "db" | "reader" | "co
   return buildRefundTree(spend, (view.bondUsdg * BigInt(slashBps)) / 10_000n)
 }
 
+/**
+ * A root counts once: for the auditor's first filing of it, which also fixes its kind. Roots are public,
+ * so a copy proves nothing, and a stranger's filing cannot use up the auditor's.
+ */
+async function evidenceMisuse(deps: RulingDeps, row: ChallengeRow) {
+  const auditor = deps.auditor.toLowerCase()
+  if (row.challenger !== auditor) return "evidence_wrong_filer"
+  const first = await deps.db.query<{ id: string }>("SELECT min(id) AS id FROM chain.challenges WHERE samples_root = $1 AND challenger = $2", [row.samples_root, auditor])
+  return Number(first.rows[0]!.id) === Number(row.id) ? null : "evidence_reused"
+}
+
 async function signRuling(deps: RulingDeps, row: ChallengeRow) {
   const bundle = await loadBundle(deps.db, row.samples_root)
-  const proven = bundle ? await leavesProven(deps, bundle) : false
-  const decision = decideRuling(bundle, factsOf(row), proven)
+  const misuse = bundle ? await evidenceMisuse(deps, row) : null
+  const proven = bundle && !misuse ? await leavesProven(deps, bundle) : false
+  const decision = misuse ? dismiss(misuse) : decideRuling(bundle, factsOf(row), proven)
 
   let refundRoot = `0x${"00".repeat(32)}` as Hex
   if (bundle && decision.outcome === OUTCOME_BREACH) {

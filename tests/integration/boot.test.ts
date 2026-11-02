@@ -88,6 +88,7 @@ describe("service entry points", () => {
         OFFPEAK_RULING_INDEX: "1",
         OFFPEAK_RULING_KEY: publicKey(7),
         OFFPEAK_RULER_ADDRESSES: rulers.map((r) => r.address).join(","),
+        OFFPEAK_AUDITOR_ADDRESS: `0x${"19".repeat(20)}`,
       },
       '"event":"tick"',
     )
