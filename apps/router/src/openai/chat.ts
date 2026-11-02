@@ -27,7 +27,7 @@ import { countChat, countOutput, tokenizerFor } from "../metering/tokenize.ts"
 import { parseMaxPrice, priceAboveCap } from "../pay/quote.ts"
 import { preconfirmReached } from "../pay/x402.ts"
 import { livePrice, loadFactorBps } from "../pricing/live.ts"
-import { selectHost, type HostCandidate } from "../routing/select.ts"
+import { hostFailing, selectHost, type HostCandidate } from "../routing/select.ts"
 import { signRouterBody } from "../../../host-agent/src/proxy.ts"
 import { assertJsonOutput } from "./json-mode.ts"
 import { intakeFlex } from "./batches.ts"
@@ -100,6 +100,13 @@ async function buildCandidates(stack: Stack, model: Hex, now: number, feeBps: nu
     })
   }
   return out
+}
+
+/** A Window's host that has gone, or is down or erroring, failed its holder. Its load can be the holder's own. */
+export async function windowHostFailing(stack: Stack, windowId: bigint, model: Hex, now: number) {
+  const host = (await stack.indexer.window(windowId.toString()))?.host.toLowerCase()
+  const row = (await candidates(stack, model, now, 0)).find((h) => h.host.toLowerCase() === host)
+  return !row || row.status !== "Active" || hostFailing(row)
 }
 
 export function hostPrice(stack: Stack, candidate: HostCandidate, model: Hex, now: number, locked?: PriceLock) {
@@ -479,14 +486,15 @@ export async function serveChat(stack: Stack, req: Request, night?: NightLine, i
   // With no cap, the deadline alone says this can wait. With one, a price under it is served now.
   const scheduled = flex && !cap ? await intakeFlex(stack, flex.payer, modelName, flex.body, flex.deadline) : null
   if (scheduled) return scheduled
-  // Until a host is asked, a refusal says nothing about the Window's host, and a holder's own load can cause one.
+  // An error here is the router's, so it says nothing about the Window's host.
   const route = await chooseRoute(stack, { cap, model, modelName, payer, feeBps, started, tokensIn, maxTokens, locked: night?.lockedPrice, unattended: Boolean(night || flex), flex }).catch(async (err) => {
     flow?.drop()
     await dropWindow()
     throw err
   })
   if (route instanceof Response) {
-    flow?.drop()
+    if (payer.mode === 4 && (await windowHostFailing(stack, payer.windowId, model.digest, started).catch(() => false))) await endFlow()
+    else flow?.drop()
     await dropWindow()
     return route
   }
@@ -503,8 +511,7 @@ export async function serveChat(stack: Stack, req: Request, night?: NightLine, i
   if (opened.ok) stack.hostWaitMs?.push(opened.ttftMs)
   if (!opened.ok) {
     const refused = opened.error === "refused"
-    // A host that turned this request down was not asked to serve anything, so no demand goes on record.
-    if (refused) flow?.drop()
+    if (refused && holderRefused(opened.status, body)) flow?.drop()
     else await endFlow()
     await release(stack, pay)
     return refused ? oai(400, "The host refused this request", "invalid_request", "host_refused") : oai(503, "Host failed before the first token", "engine", "no_capacity")
@@ -515,6 +522,20 @@ export async function serveChat(stack: Stack, req: Request, night?: NightLine, i
   const shown = payer.mode === 4 ? { in: 0n, out: 0n } : { in: buyerUnitPrice(servedPrice.price.in, feeBps), out: buyerUnitPrice(servedPrice.price.out, feeBps) }
   const headers = { "x-offpeak-price": `in=${shown.in},out=${shown.out}`, "x-offpeak-host": opened.host }
   return body.stream ? streamResponse(ctx, opened, servedPrice, entered, headers) : jsonResponse(ctx, opened, servedPrice, headers)
+}
+
+/** The statuses that can mean a body was at fault. Any other 4xx is about the host, whatever was asked. */
+const BODY_REFUSED = new Set([400, 413, 422])
+/** What the router has checked or replaced by now. The rest reaches the engine unread, and a buyer can make it refuse those. */
+const CHECKED_FIELDS = new Set(["model", "messages", "max_tokens", "max_completion_tokens", "stream", "stream_options"])
+const CHECKED_ROLES = new Set(["system", "user", "assistant"])
+
+const checkedMessage = (message: ChatMessage) => CHECKED_ROLES.has(message.role) && message.content != null && Object.keys(message).every((key) => key === "role" || key === "content")
+
+/** A host's 4xx is the holder's only when the request held something the router could not vouch for. */
+function holderRefused(status: number | undefined, body: Record<string, any>) {
+  if (status === undefined || !BODY_REFUSED.has(status)) return false
+  return !Object.keys(body).every((key) => CHECKED_FIELDS.has(key)) || !(body.messages as ChatMessage[]).every(checkedMessage)
 }
 
 const CHAT_ROLES = new Set(["system", "developer", "user", "assistant", "tool", "function"])
@@ -585,7 +606,8 @@ async function chooseRoute(stack: Stack, input: RouteInput) {
   const { cap, model, modelName, payer, feeBps, started, tokensIn, maxTokens, locked, unattended, flex } = input
   const chosen = await candidates(stack, model.digest, started, feeBps)
   const windowHost = payer?.mode === 4 ? (await stack.indexer.window(payer.windowId.toString()))?.host.toLowerCase() : undefined
-  const selected = selectHost(chosen, { sealed: false, windowHost, canary: false, interactive: !unattended })
+  // A holder has no other host, so the first token gate would only hide what this one does when asked.
+  const selected = selectHost(chosen, { sealed: false, windowHost, canary: false, interactive: !unattended && !windowHost })
   const open = payer?.mode === 4 ? selected : outsideWindows(stack, selected, model.digest)
   const healthy = locked ? open.filter((h) => takesNightJobs(stack, h, model.digest) && aboveFloor(stack, h, model.digest, started, locked)) : open
   if (healthy.length === 0) return oai(503, "No healthy host", "capacity", "no_capacity", { next_forecast_hour: hourIndex(started) + 1 })

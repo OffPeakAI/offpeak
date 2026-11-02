@@ -212,15 +212,37 @@ describe("host health", () => {
 })
 
 describe("Window demand", () => {
-  test("a request the host refuses leaves no demanded minute, and gives its tokens back", async () => {
+  test("a request the router checked and the host refuses leaves a demanded minute, and gives its tokens back", async () => {
     const booted = await bootStack()
     holdWindow(booted)
     refusing(booted, 400)
-    const res = await chat(booted, chatBody("forged"), prepaid(booted, { "x-offpeak-window": WINDOW }))
+    const res = await chat(booted, chatBody("plain"), prepaid(booted, { "x-offpeak-window": WINDOW }))
     expect(res.status).toBe(400)
     expect(await pending(booted)).toBe(0n)
     await sweepPast(booted)
-    expect(await demandedMinutes(booted)).toBe(0)
+    expect(await demandedMinutes(booted)).toBe(1)
+    expect(booted.stack.load.errorRate(booted.host)).toBe(0)
+  })
+
+  test("a request the engine can refuse for what a holder put in it leaves no demanded minute", async () => {
+    for (const body of [chatBody("forged", { temperature: 99 }), chatBody("forged", { n: 0 }), JSON.stringify({ model: "ofm-8b", messages: [{ role: "assistant", content: "x", tool_calls: [{}] }], max_tokens: 8 }), JSON.stringify({ model: "ofm-8b", messages: [{ role: "tool", content: "x" }], max_tokens: 8 })]) {
+      const booted = await bootStack()
+      holdWindow(booted)
+      refusing(booted, 400)
+      expect((await chat(booted, body, prepaid(booted, { "x-offpeak-window": WINDOW }))).status).toBe(400)
+      expect(await pending(booted)).toBe(0n)
+      await sweepPast(booted)
+      expect(await demandedMinutes(booted)).toBe(0)
+    }
+  })
+
+  test("a refusal that cannot be about the body counts, whatever the body held", async () => {
+    const booted = await bootStack()
+    holdWindow(booted)
+    refusing(booted, 404)
+    expect((await chat(booted, chatBody("real", { temperature: 0.5 }), prepaid(booted, { "x-offpeak-window": WINDOW }))).status).toBe(400)
+    await sweepPast(booted)
+    expect(await demandedMinutes(booted)).toBe(1)
   })
 
   test("a host that fails a holder still leaves one", async () => {

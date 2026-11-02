@@ -126,14 +126,69 @@ describe("shared.window_perf", () => {
     expect(row.tokens_per_s).toBe(0)
   })
 
-  test("a refusal before any host is asked leaves no demand", async () => {
+  /** Asks every minute of an outage, then reads the Window the way settlement and the contract do. */
+  async function outage(booted: Booted, minutes: number, minTps: number) {
+    for (let i = 0; i < minutes; i++) {
+      expect((await draw(booted, "anyone")).status).toBe(503)
+      booted.stack.setClock(booted.stack.clock() + MINUTE)
+    }
+    const rows = (await samples(booted)).rows.filter((row) => row.demanded)
+    const below = rows.filter((row) => row.tokens_per_s < minTps).length
+    return { measured: rows.length, below, failed: below * 10_000 > 2_000 * rows.length }
+  }
+
+  test("a Window host that is down shows demand and no throughput", async () => {
     const booted = await bootStack()
     holdWindow(booted)
     booted.stack.probesOk.clear()
     booted.stack.candidateCache.clear()
     expect((await draw(booted, "anyone")).status).toBe(503)
+    expect((await samples(booted)).rows.filter((row) => row.demanded).length).toBe(1)
     await sweepAfter(booted, 2)
-    expect((await samples(booted)).rows.every((row) => !row.demanded)).toBe(true)
+    const row = (await samples(booted)).rows.find((r) => r.demanded)!
+    expect(row.tokens_per_s).toBe(0)
+  })
+
+  test("thirty minutes of a host down fails the Window", async () => {
+    const booted = await bootStack()
+    holdWindow(booted, 100)
+    booted.stack.probesOk.clear()
+    booted.stack.candidateCache.clear()
+    expect(await outage(booted, 30, 100)).toEqual({ measured: 30, below: 30, failed: true })
+  })
+
+  test("a good start does not hide an outage, once the errors unroute the host", async () => {
+    const booted = await bootStack()
+    holdWindow(booted, 1)
+    for (let i = 0; i < 10; i++) {
+      expect((await draw(booted, "good")).status).toBe(200)
+      booted.stack.setClock(booted.stack.clock() + MINUTE)
+    }
+    const real = booted.hostApps.get(booted.host)!
+    booted.hostApps.set(booted.host, { request: (path: string, init: RequestInit) => (path === "/offpeak/v1/chat/completions" ? new Response("boom", { status: 500 }) : real.request(path, init)) } as never)
+    const seen = await outage(booted, 30, 1)
+    expect(booted.stack.load.errorRate(booted.host)).toBeGreaterThanOrEqual(0.05)
+    expect(seen).toEqual({ measured: 40, below: 30, failed: true })
+  })
+
+  test("a Window host that has left the market fails its holders too", async () => {
+    const booted = await bootStack()
+    holdWindow(booted)
+    booted.stack.sheets.length = 0
+    booted.stack.candidateCache.clear()
+    expect((await draw(booted, "anyone")).status).toBe(503)
+    expect((await samples(booted)).rows.filter((row) => row.demanded).length).toBe(1)
+  })
+
+  test("a host slow to first tokens is still asked, so what it serves is what goes on record", async () => {
+    const booted = await bootStack()
+    holdWindow(booted)
+    for (let i = 0; i < 20; i++) booted.stack.load.noteTtft(booted.host, 2_000)
+    booted.stack.candidateCache.clear()
+    expect((await draw(booted, "anyone")).status).toBe(200)
+    const rows = (await samples(booted)).rows.filter((row) => row.demanded)
+    expect(rows.length).toBe(1)
+    expect(rows[0]!.tokens_per_s).toBeGreaterThan(0)
   })
 
   test("a holder's load that unroutes the host leaves no demand", async () => {

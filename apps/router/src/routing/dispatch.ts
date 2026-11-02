@@ -103,9 +103,11 @@ export type Opened = {
 /**
  * Opens a stream on the best host, failing over once before any token has reached the client. Only a 5xx, a
  * timeout or a broken stream counts against a host: a 4xx answers this request, and a buyer can ask for those.
+ * `status` is that 4xx, for a caller to say whose it was.
  */
-export async function openHost(stack: Stack, ranked: HostCandidate[], payload: string, signedHeader: string, promptTokens: number): Promise<Opened | { ok: false; error: string }> {
+export async function openHost(stack: Stack, ranked: HostCandidate[], payload: string, signedHeader: string, promptTokens: number): Promise<Opened | { ok: false; error: string; status?: number }> {
   let last = "down"
+  let status: number | undefined
   for (const host of ranked.slice(0, 2)) {
     const control = new AbortController()
     const started = performance.now()
@@ -121,6 +123,7 @@ export async function openHost(stack: Stack, ranked: HostCandidate[], payload: s
         clearTimeout(timer)
         control.abort()
         last = "refused"
+        status = res.status
         continue
       }
       if (!res.ok) throw new Error(`host status ${res.status}`)
@@ -139,5 +142,5 @@ export async function openHost(stack: Stack, ranked: HostCandidate[], payload: s
       last = control.signal.aborted && String(err).includes("abort") ? "slow" : "error"
     }
   }
-  return { ok: false, error: last }
+  return { ok: false, error: last, status }
 }

@@ -18,7 +18,7 @@ import { parseMaxPrice, priceAboveCap } from "../pay/quote.ts"
 import { noteWindowMinute, type PerfFlow } from "../pay/window-perf.ts"
 import { relayAttest, verifiedHost } from "../routing/attest.ts"
 import { selectHost, type HostCandidate } from "../routing/select.ts"
-import { candidates, hostPrice } from "./chat.ts"
+import { candidates, hostPrice, windowHostFailing } from "./chat.ts"
 import { commitRecord, flagMetering } from "./commit.ts"
 
 const MAX_TOKENS_LIMIT = 4096
@@ -320,7 +320,7 @@ async function chooseHost(stack: Stack, input: { model: ModelEntry; hostAddr: He
   const rows = (await candidates(stack, model.digest, started, feeBps)).filter((row) => row.host.toLowerCase() === hostAddr).map((row) => ({ ...row, sealedOk: true }))
   // A Window keeps its share of the host. Everyone else is served from what is left.
   const open = holder ? rows : rows.filter((row) => row.util < 1 - (stack.windowShares.get(`${hostAddr}:${model.digest}`) ?? 0))
-  return selectHost(open, { sealed: true, windowHost, canary: false, interactive: true })[0] ?? null
+  return selectHost(open, { sealed: true, windowHost, canary: false, interactive: !holder })[0] ?? null
 }
 
 /**
@@ -370,7 +370,6 @@ export async function serveSealed(stack: Stack, req: Request): Promise<Response>
     flow?.end()
     if (payer.mode === 4) await noteWindowMinute(stack, payer.windowId).catch(() => undefined)
   }
-  // Until a host is asked, a refusal says nothing about the Window's host.
   const refuse = async (res: Response) => {
     flow?.drop()
     await dropWindow()
@@ -378,7 +377,11 @@ export async function serveSealed(stack: Stack, req: Request): Promise<Response>
   }
   const host = await chooseHost(stack, { model, hostAddr, started, feeBps, windowHost, holder: payer.mode === 4 })
   const countsSigner = verifiedHost(stack, hostAddr)?.transcript.bindings.countsSigner
-  if (!host || !countsSigner) return refuse(oai(503, "That host is not available for sealed requests", "capacity", "sealed_host_unavailable", { next_forecast_hour: hourIndex(started) + 1 }))
+  if (!host || !countsSigner) {
+    // A holder names the host here, so only the Window's own can have failed them.
+    if (payer.mode === 4 && hostAddr === windowHost && (await windowHostFailing(stack, payer.windowId, model.digest, started).catch(() => false))) await endFlow()
+    return refuse(oai(503, "That host is not available for sealed requests", "capacity", "sealed_host_unavailable", { next_forecast_hour: hourIndex(started) + 1 }))
+  }
   const priced = hostPrice(stack, host, model.digest, started)
   if (!priced) return refuse(oai(503, "No price", "capacity", "no_capacity"))
   const capped = payer.mode === 4 ? undefined : cap

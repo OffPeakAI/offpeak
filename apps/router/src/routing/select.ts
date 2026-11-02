@@ -22,6 +22,9 @@ export function routingWeight(bondUsdg: bigint, bonusBps: number): bigint {
   return (bondUsdg * BigInt(10_000 + bonusBps)) / 10_000n
 }
 
+/** Down or erroring, which only a host can be. Load and slow first tokens can be a buyer's doing. */
+export const hostFailing = (h: HostCandidate) => !h.healthy || h.errorRate >= 0.05
+
 export function selectHost(
   all: HostCandidate[],
   opts: { sealed: boolean; windowHost?: string; canary?: boolean; maxPriceIn?: bigint; maxPriceOut?: bigint; interactive?: boolean },
@@ -34,8 +37,7 @@ export function selectHost(
     return true
   })
   rows = rows.filter((h) => {
-    if (!h.healthy) return false
-    if (h.errorRate >= 0.05) return false
+    if (hostFailing(h)) return false
     if (h.util >= 0.95) return false
     if (opts.interactive !== false && h.ttftP95Ms >= 1500) return false
     return true

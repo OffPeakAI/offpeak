@@ -612,6 +612,22 @@ describe("other payers", () => {
     expect(booted.stack.windowPerf.sofar(7n)).toBeNull()
   })
 
+  test("a Window's host that is down is demand, and a host the holder named instead is not", async () => {
+    const booted = await rig()
+    holdWindow(booted)
+    booted.stack.probesOk.clear()
+    booted.stack.candidateCache.clear()
+    const res = await post(booted, (await sealedBytes(booted)).bytes, { headers: { "x-offpeak-window": "7" } })
+    expect(res.status).toBe(503)
+    expect(booted.stack.windowPerf.sofar(7n)?.demanded).toBe(true)
+    const other = await rig()
+    holdWindow(other)
+    const row = other.indexer.windows.get("7")! as { host: Hex }
+    row.host = `0x${"ab".repeat(20)}`
+    await post(other, (await sealedBytes(other)).bytes, { headers: { "x-offpeak-window": "7" } })
+    expect(other.stack.windowPerf.sofar(7n)).toBeNull()
+  })
+
   test("a Window with too little left falls back or refuses as an open request does", async () => {
     const booted = await rig()
     holdWindow(booted)
