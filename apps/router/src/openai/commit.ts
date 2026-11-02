@@ -1,4 +1,4 @@
-import { domain, hourIndex, leafFor, recordToMessage, serializeEnvelope, serializeRecord, signTyped, usageTypes, type Hex, type UsageRecord } from "@offpeak/shared"
+import { domain, hourIndex, leafFor, recordToMessage, recoverUsageSigner, serializeEnvelope, serializeRecord, signTyped, usageTypes, type Hex, type UsageRecord } from "@offpeak/shared"
 import type { PayHold, Payer, Stack } from "../context.ts"
 import { queueCapture } from "../pay/captures.ts"
 import { noteChannel } from "../pay/channel-store.ts"
@@ -50,6 +50,9 @@ export async function commitRecord(commit: Commit) {
   })
   const signBody = (await signed.json()) as { hostSig: Hex; hostCounts: { tokensIn: number; tokensOut: number }; reason?: string }
   if (!signed.ok) return { refused: signBody.reason ?? "sign_refused", hostCounts: signBody.hostCounts ?? {} }
+  // Settlement drops a record the host did not sign, so one stored here would be billed and never debited.
+  const signer = await recoverUsageSigner(recordToMessage(record), signBody.hostSig, stack.usageLedger).catch(() => "")
+  if (signer.toLowerCase() !== record.host.toLowerCase()) return { refused: "bad_host_sig", hostCounts: signBody.hostCounts ?? {} }
   const envelope = serializeEnvelope({
     v: 1,
     record,

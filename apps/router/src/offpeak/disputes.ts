@@ -48,6 +48,9 @@ type UsageRow = {
   host_sig: string
   sealed: boolean
   status: string
+  settled_hour_tx: string | null
+  /** The hour's settlement, which marks every record it kept with `settled_hour_tx`. */
+  settle_tx: string | null
 }
 
 export type DisputeCheck = { req_id: string; upheld: boolean; refund_micro: string; reasons: string[] }
@@ -130,10 +133,20 @@ async function checkRecord(stack: Stack, row: UsageRow, material: Material | und
     reasons.push("nothing_billed")
     return done(0n)
   }
+  // Settlement left these out, so the buyer was never debited and there is nothing to give back.
+  if (row.settle_tx && !row.settled_hour_tx) {
+    reasons.push("settlement_rejected")
+    return done(0n)
+  }
+  if (!(await signaturesHold(stack, row))) {
+    reasons.push("bad_signature")
+    return done(0n)
+  }
   const ceiling = await ceilingPrice(stack, row)
-  if (!(await signaturesHold(stack, row))) reasons.push("bad_signature")
-  if (!ceiling) reasons.push("sheet_mismatch")
-  if (reasons.length > 0) return done(billed)
+  if (!ceiling) {
+    reasons.push("sheet_mismatch")
+    return done(billed)
+  }
   let tokensIn = row.tokens_in
   let tokensOut = row.tokens_out
   if (!material) reasons.push("no_material")
@@ -147,8 +160,8 @@ async function checkRecord(stack: Stack, row: UsageRow, material: Material | und
       if (tokensIn !== row.tokens_in || tokensOut !== row.tokens_out) reasons.push("tokens_overcounted")
     }
   }
-  const priceIn = min(BigInt(row.price_in), ceiling!.in)
-  const priceOut = min(BigInt(row.price_out), ceiling!.out)
+  const priceIn = min(BigInt(row.price_in), ceiling.in)
+  const priceOut = min(BigInt(row.price_out), ceiling.out)
   if (priceIn !== BigInt(row.price_in) || priceOut !== BigInt(row.price_out)) reasons.push("price_above_sheet")
   const fair = quoteCost({ tokensIn, tokensOut, priceIn, priceOut, feeBps: row.fee_bps }).totalMicro
   if (fair < billed && !reasons.includes("tokens_overcounted") && !reasons.includes("price_above_sheet")) reasons.push("cost_mismatch")
@@ -166,7 +179,7 @@ export async function openDispute(stack: Stack, wallet: string, raw: unknown) {
   if (!body.success) return { error: "bad_dispute" as const }
   const reqIds = [...new Set(body.data.req_ids)]
   const now = stack.clock()
-  const rows = await stack.db.query<UsageRow>("SELECT * FROM shared.usage_records WHERE req_id = ANY($1) AND payer = $2", [reqIds, wallet])
+  const rows = await stack.db.query<UsageRow>("SELECT r.*, h.settle_tx FROM shared.usage_records r LEFT JOIN shared.usage_hours h ON h.hour = r.hour WHERE r.req_id = ANY($1) AND r.payer = $2", [reqIds, wallet])
   if (rows.rows.length !== reqIds.length) return { error: "unknown_request" as const }
   if (rows.rows.some((row) => now - Number(row.ts) > DISPUTE_WINDOW_S)) return { error: "dispute_window" as const }
   const id = `dsp_${randomBytes(12).toString("hex")}`
