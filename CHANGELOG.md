@@ -20,7 +20,6 @@ Plain-language notes on what changed. Offpeak is pre-launch, so nothing here is 
 - The root `package.json` now names the Bun version in `packageManager` and `engines`.
 - `foundry.toml` now states `bytecode_hash` and `cbor_metadata`, at their existing defaults. The bytecode is unchanged.
 - `viem` is pinned exactly in every package outside the frontend.
-- `zod` is overridden to 4.6.7, past a published advisory. This also moves the wallet libraries behind the dashboard from zod 3 to zod 4.
 
 ### Fixed
 

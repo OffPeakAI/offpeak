@@ -62,8 +62,7 @@
     "typescript": "^5.9.0"
   },
   "overrides": {
-    "ws": "8.21.0",
-    "zod": "4.6.7"
+    "ws": "8.21.0"
   },
   "trustedDependencies": [
     "bufferutil",
