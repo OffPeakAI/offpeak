@@ -61,7 +61,8 @@ async function billedAndSettled(deps: RefundDeps, row: RefundRow, counted: Set<s
   )
   if (billed.rows.length !== reqIds.length || billed.rows.some((r) => r.payer.toLowerCase() !== row.payer.toLowerCase())) return false
   if (BigInt(row.amount) > billed.rows.reduce((sum, r) => sum + BigInt(r.cost), 0n)) return false
-  const paid = await deps.db.query("SELECT 1 FROM shared.refunds WHERE paid_hour IS NOT NULL AND req_ids && $1::text[]", [reqIds])
+  // An excess refund names every record of its payment and repays money the records never cost, so it blocks nothing here.
+  const paid = await deps.db.query("SELECT 1 FROM shared.refunds WHERE paid_hour IS NOT NULL AND reason IN ('dispute_upheld', 'night_line_lost') AND req_ids && $1::text[]", [reqIds])
   if (paid.rows.length > 0 || reqIds.some((id) => counted.has(id))) return false
   for (const id of reqIds) counted.add(id)
   return true

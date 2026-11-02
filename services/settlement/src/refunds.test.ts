@@ -153,6 +153,25 @@ describe("refund rows need facts behind them", () => {
       expect((await round(db)).sent.length).toBe(0)
     })
 
+    test("a paid excess refund on the same payment does not use up its records", async () => {
+      const db = await openDatabase("pglite://memory")
+      const one = await settledRecord(db, 1)
+      const two = await settledRecord(db, 2)
+      await refundRow(db, "agent-excess:p", BUYER, 7n, "excluded_record", [one.reqId, two.reqId])
+      await db.query("UPDATE shared.refunds SET paid_hour = 1")
+      await refundRow(db, "dispute:1", BUYER, one.cost, "dispute_upheld", [one.reqId])
+      expect((await round(db)).paid.map((r) => r.amount)).toEqual([one.cost])
+    })
+
+    test("a record a lost line repaid does not pay again as a dispute", async () => {
+      const db = await openDatabase("pglite://memory")
+      const { reqId, cost } = await settledRecord(db, 1)
+      await refundRow(db, `night-line:${reqId}`, BUYER, cost, "night_line_lost", [reqId])
+      await db.query("UPDATE shared.refunds SET paid_hour = 1")
+      await refundRow(db, "dispute:1", BUYER, cost, "dispute_upheld", [reqId])
+      expect((await round(db)).sent.length).toBe(0)
+    })
+
     test("a forged row cannot use up a record", async () => {
       const db = await openDatabase("pglite://memory")
       const { reqId, cost } = await settledRecord(db, 1)
@@ -193,6 +212,14 @@ describe("refund rows need facts behind them", () => {
       const db = await openDatabase("pglite://memory")
       await row(db, 5n * USDG)
       expect((await round(db)).sent.length).toBe(0)
+    })
+
+    test("a paid refund naming the same request does not stop it", async () => {
+      const db = await openDatabase("pglite://memory")
+      await refundRow(db, "agent-excess:p", BUYER, 7n, "excluded_record", [REQ])
+      await db.query("UPDATE shared.refunds SET paid_hour = 1")
+      await row(db, 5n * USDG)
+      expect((await round(db, taken)).paid.map((r) => r.amount)).toEqual([5n * USDG])
     })
 
     test("a request that was served does not", async () => {
