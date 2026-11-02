@@ -32,6 +32,8 @@ const METERING_REASONS = ["counts", "digest", "sign_refused"]
 
 const WINDOW_FAILURE_SHARE = 0.2
 const SAMPLE_S = 60
+/** A share of a few demanded minutes says nothing about a host, and one holder can make those. */
+const WINDOW_MIN_MEASURED_S = 600
 const THROUGHPUT_LOOKBACK_BLOCKS = 200_000n
 const LOG_PAGE = 5_000n
 
@@ -400,7 +402,7 @@ export async function runThroughput(deps: AuditDeps) {
       const belowSeconds = Number(perf.rows[0]!.below) * SAMPLE_S
       const measuredSeconds = Number(perf.rows[0]!.measured) * SAMPLE_S
       const thresholdSeconds = WINDOW_FAILURE_SHARE * measuredSeconds
-      if (measuredSeconds === 0 || belowSeconds <= thresholdSeconds) continue
+      if (measuredSeconds < WINDOW_MIN_MEASURED_S || belowSeconds <= thresholdSeconds) continue
       const draws = await deps.db.query<{ req_id: string }>("SELECT req_id FROM shared.usage_records WHERE window_id = $1 AND status = 'final' ORDER BY req_id", [id.toString()])
       const proved = await proveSamples(deps, draws.rows.map((row) => row.req_id))
       const bundle = {

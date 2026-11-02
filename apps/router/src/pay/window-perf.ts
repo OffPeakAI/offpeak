@@ -12,8 +12,8 @@ export type MinuteSample = { windowId: bigint; minute: number; tokens: number; b
 
 /**
  * One holder request. Its time counts from its first token, since a short reply says nothing about throughput
- * before that. It becomes demand on a token or at `end`. `drop` is for a request the host never had to serve,
- * which leaves nothing on record, so a holder cannot manufacture minutes of zero throughput.
+ * before that. It becomes demand on a token or at `end`, which is for a host that was asked and failed. `drop` is
+ * for everything else, which leaves nothing on record, so a holder cannot manufacture minutes of zero throughput.
  */
 export type PerfFlow = { tokens(count: number): void; end(): void; drop(): void }
 

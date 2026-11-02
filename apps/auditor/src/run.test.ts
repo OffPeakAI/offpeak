@@ -407,6 +407,10 @@ describe("throughput", () => {
     expect(await runThroughput(await disputed({ below: 10, good: 90 }))).toEqual([])
   })
 
+  test("a Window with too few demanded minutes is left alone, whatever their share", async () => {
+    expect(await runThroughput(await disputed({ below: 3, good: 1 }))).toEqual([])
+  })
+
   test("a dispute of a Window that did fail goes towards filing", async () => {
     const d = await disputed({ below: 30, good: 70 })
     ;(d.reader as unknown as { readContract: (args: { functionName: string }) => Promise<unknown> }).readContract = async ({ functionName }) => (functionName === "windowView" ? { host: HOST, modelDigest: MODEL, minTps: 100, t1: BigInt(NOW + 3_600) } : 0n)

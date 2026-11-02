@@ -370,8 +370,9 @@ export async function serveSealed(stack: Stack, req: Request): Promise<Response>
     flow?.end()
     if (payer.mode === 4) await noteWindowMinute(stack, payer.windowId).catch(() => undefined)
   }
+  // Until a host is asked, a refusal says nothing about the Window's host.
   const refuse = async (res: Response) => {
-    await endFlow()
+    flow?.drop()
     await dropWindow()
     return res
   }
@@ -394,12 +395,12 @@ export async function serveSealed(stack: Stack, req: Request): Promise<Response>
   const maxCost = quoteCost({ tokensIn, tokensOut: maxTokens, priceIn: priced.price.in, priceOut: priced.price.out, feeBps }).totalMicro
   // A channel proof signs a text body, and hex of the ciphertext hashes back to the same bytes on both sides.
   const pay = await authorize(stack, payer, maxCost, bytesToHex(bytes), windowRun).catch(async (err) => {
-    await endFlow()
+    flow?.drop()
     await dropWindow()
     throw err
   })
   if (pay instanceof Response) {
-    await endFlow()
+    flow?.drop()
     return pay
   }
   const promptHash = keccak256(bytes)

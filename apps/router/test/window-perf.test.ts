@@ -117,12 +117,71 @@ describe("shared.window_perf", () => {
     expect(seconds.rows.every((row) => Number(row.second) === 0)).toBe(true)
   })
 
-  test("a host that serves nothing to a holder shows demand and no throughput", async () => {
+  test("a host asked that serves nothing to a holder shows demand and no throughput", async () => {
+    const booted = await bootStack({ failHost: true })
+    holdWindow(booted)
+    expect((await draw(booted, "anyone")).status).toBe(503)
+    await sweepAfter(booted, 2)
+    const row = (await samples(booted)).rows.find((r) => r.demanded)!
+    expect(row.tokens_per_s).toBe(0)
+  })
+
+  test("a refusal before any host is asked leaves no demand", async () => {
     const booted = await bootStack()
     holdWindow(booted)
     booted.stack.probesOk.clear()
     booted.stack.candidateCache.clear()
     expect((await draw(booted, "anyone")).status).toBe(503)
+    await sweepAfter(booted, 2)
+    expect((await samples(booted)).rows.every((row) => !row.demanded)).toBe(true)
+  })
+
+  test("a holder's load that unroutes the host leaves no demand", async () => {
+    const booted = await bootStack()
+    holdWindow(booted)
+    booted.stack.load.util = () => 1
+    booted.stack.candidateCache.clear()
+    expect((await draw(booted, "anyone")).status).toBe(503)
+    await sweepAfter(booted, 2)
+    expect((await samples(booted)).rows.every((row) => !row.demanded)).toBe(true)
+  })
+
+  /** Answers with nothing but a `stop`, the way an engine does when a buyer's stop string matches at once. */
+  function replyEmpty(booted: Booted) {
+    const real = booted.hostApps.get(booted.host)!
+    const empty = 'data: {"choices":[{"delta":{"role":"assistant","content":""},"finish_reason":null}]}\n\ndata: {"choices":[{"delta":{"content":""},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+    booted.hostApps.set(booted.host, {
+      request: async (path: string, init: RequestInit) => {
+        const res = await real.request(path, init)
+        return path === "/offpeak/v1/chat/completions" ? new Response(empty, { headers: { "content-type": "text/event-stream" } }) : res
+      },
+    } as never)
+  }
+
+  test("a reply that finished empty is no failure of the host, streamed or not", async () => {
+    for (const stream of [false, true]) {
+      const booted = await bootStack()
+      holdWindow(booted)
+      replyEmpty(booted)
+      const res = await draw(booted, "anyone", stream)
+      await res.text()
+      await sweepAfter(booted, 2)
+      expect((await samples(booted)).rows.every((row) => !row.demanded)).toBe(true)
+    }
+  })
+
+  test("a reply that broke before its first token is one", async () => {
+    const booted = await bootStack()
+    holdWindow(booted)
+    const real = booted.hostApps.get(booted.host)!
+    const broken = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'))
+        controller.error(new Error("host died"))
+      },
+    })
+    booted.hostApps.set(booted.host, { request: (path: string, init: RequestInit) => (path === "/offpeak/v1/chat/completions" ? new Response(broken, { headers: { "content-type": "text/event-stream" } }) : real.request(path, init)) } as never)
+    await (await draw(booted, "anyone")).text()
     await sweepAfter(booted, 2)
     const row = (await samples(booted)).rows.find((r) => r.demanded)!
     expect(row.tokens_per_s).toBe(0)
