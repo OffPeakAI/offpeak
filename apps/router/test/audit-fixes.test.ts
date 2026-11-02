@@ -699,3 +699,48 @@ describe("metering flags", () => {
     expect(await flags(booted)).toEqual(["dispute_upheld"])
   })
 })
+
+describe("an exact payment's amount", () => {
+  async function pay(booted: Booted, amount: bigint) {
+    return embedded(booted, await exactHeader(booted, keccak256(toBytes(`exact-${amount}`)), amount))
+  }
+
+  test("far above the quote is sent back to the quote, with nothing taken", async () => {
+    const booted = await bootStack()
+    booted.facilitator.delayMs = 1
+    const res = await pay(booted, 100_000_000n)
+    expect(res.status).toBe(402)
+    expect(await errorCode(res)).toBe("payment_required")
+    expect((await booted.stack.db.query("SELECT 1 FROM serving.x402_requests")).rows.length).toBe(0)
+    expect(booted.facilitator.captured.length).toBe(0)
+  })
+
+  test("just past the margin is refused, and the margin itself is not", async () => {
+    const booted = await bootStack()
+    booted.facilitator.delayMs = 1
+    booted.stack.sheets[0]!.baseIn = booted.stack.sheets[0]!.baseIn.map((value) => value * 10_000n)
+    booted.stack.candidateCache.clear()
+    const quote = await embedQuote(booted)
+    expect(quote).toBeGreaterThan(1_000n)
+    const top = (quote * 11_000n + 9_999n) / 10_000n
+    expect((await pay(booted, top + 1n)).status).toBe(402)
+    expect((await pay(booted, top)).status).toBe(200)
+  })
+
+  test("a tiny quote keeps a small fixed margin", async () => {
+    const booted = await bootStack()
+    booted.facilitator.delayMs = 1
+    const quote = await embedQuote(booted)
+    expect(quote).toBeLessThan(100n)
+    expect((await pay(booted, quote + 101n)).status).toBe(402)
+    expect((await pay(booted, quote + 100n)).status).toBe(200)
+  })
+
+  test("the quote itself is served, and less than it is not", async () => {
+    const booted = await bootStack()
+    booted.facilitator.delayMs = 1
+    const quote = await embedQuote(booted)
+    expect((await pay(booted, quote)).status).toBe(200)
+    expect((await pay(booted, quote - 1n)).status).toBe(402)
+  })
+})

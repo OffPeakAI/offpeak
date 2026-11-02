@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto"
-import { ZERO_BYTES32, channelAuthMessage, domain, hourIndex, voucherTypes, type BuyerChain, type ChannelChain, type Hex, type PaymentPayload } from "@offpeak/shared"
+import { ZERO_BYTES32, ceilDiv, channelAuthMessage, domain, hourIndex, voucherTypes, type BuyerChain, type ChannelChain, type Hex, type PaymentPayload } from "@offpeak/shared"
 import { keccak256, toBytes } from "viem"
 import { acceptVoucher, claimPaymentId, releaseChannel, reserveChannel } from "./channel-store.ts"
 import { creditLimit } from "./channel.ts"
@@ -17,6 +17,9 @@ const MAX_UNCONFIRMED = 8n
 /** Past the longest a request waits for the chain, so a router that dies gives its slots back. */
 const UNCONFIRMED_TTL_S = 60
 const WINDOW_LOOKBACK_HOURS = 48
+/** A falling price can leave `exact` a little above the quote between a 402 and its retry. Settlement refunds any excess from the reserve. */
+const EXACT_MARGIN_BPS = 11_000n
+const EXACT_MARGIN_MIN_MICRO = 100n
 const WINDOW_REFUSED: Record<string, string> = {
   window_exhausted: "Window is exhausted",
   window_not_active: "Window is not active",
@@ -160,7 +163,7 @@ export async function authorize(stack: Stack, payer: Payer, maxCostMicro: bigint
   }
   if (payer.mode !== 4) {
     const exact = payer.mode === 2 ? witnessAmount(payer.payment) : null
-    if (payer.mode === 2 && (exact === null || exact < maxCostMicro)) return paymentRequiredResponse(stack, maxCostMicro, true)
+    if (payer.mode === 2 && (exact === null || exact < maxCostMicro || exact > exactCeiling(maxCostMicro))) return paymentRequiredResponse(stack, maxCostMicro, true)
     const verified = await stack.facilitator.verify({
       paymentPayload: payer.payment,
       paymentRequirements: { payTo: stack.vault, asset: stack.usdg, maxAmountRequired: maxCostMicro.toString() },
@@ -218,6 +221,11 @@ async function holdUnconfirmedSlot(stack: Stack, wallet: string, reqId: string) 
     .then(free)
     .catch((err) => console.error(JSON.stringify({ service: "router", event: "unconfirmed_slot_failed", reqId, error: String(err) })))
   return true
+}
+
+function exactCeiling(quote: bigint) {
+  const scaled = ceilDiv(quote * EXACT_MARGIN_BPS, 10_000n)
+  return scaled > quote + EXACT_MARGIN_MIN_MICRO ? scaled : quote + EXACT_MARGIN_MIN_MICRO
 }
 
 function witnessAmount(payment: PaymentPayload) {
