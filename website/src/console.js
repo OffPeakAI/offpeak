@@ -113,3 +113,104 @@
       inclusion_proof: null
     };
   }
+
+  function downloadReceipt(id) {
+    const request = requests.find(item => item.id === id && item.status === 'Completed');
+    if (!request) { toast('Complete a demo request first.'); return; }
+    const blob = new Blob([JSON.stringify(receiptFor(request), null, 2) + '\n'], {type:'application/json'});
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url; anchor.download = `${request.id}-illustrative-receipt.json`;
+    document.body.appendChild(anchor); anchor.click(); anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    toast('Illustrative receipt downloaded. No signature or chain proof is included.');
+  }
+
+  function renderHistory() {
+    $('requests-empty').hidden = requests.length > 0;
+    $('requests-table').innerHTML = requests.slice().reverse().map(request => `<tr><td>${escape(request.id)}<small>${escape(new Date(request.createdAt).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}))}</small></td><td>${escape(samples[request.task].label)}</td><td><span class="neutral-status ${request.status === 'Completed' ? 'completed' : ''}">${escape(request.status)}</span></td><td>${request.status === 'Completed' ? `1,000 in / ${request.output} out` : '—'}<small>Fixed demo metering</small></td><td>${request.status === 'Completed' ? money(request.charge) : '—'}<small>MOCK</small></td><td>${request.status === 'Completed' ? `<button class="table-action" data-download="${escape(request.id)}">Download ${uiIcon('arrowDown')}</button>` : 'Pending'}</td></tr>`).join('');
+    const completed = requests.filter(request => request.status === 'Completed').reverse();
+    $('receipts-empty').hidden = completed.length > 0;
+    $('receipts-list').innerHTML = completed.map(request => `<article class="receipt-row"><div class="receipt-row-head"><div><h2>${escape(request.id)}</h2><p>${escape(samples[request.task].label)} · Example record · Not signed or anchored</p></div><button class="button button-outline" data-download="${escape(request.id)}">Download JSON ${uiIcon('arrowDown')}</button></div><div class="receipt-summary"><span>Demo charge<strong>${money(request.charge)} MOCK</strong></span><span>Returned to balance<strong>${money(request.cap-request.charge)} MOCK</strong></span><span>Proof status<strong>Not published · simulation</strong></span></div><details class="receipt-details"><summary>Inspect receipt fields</summary><pre>${escape(JSON.stringify(receiptFor(request),null,2))}</pre></details></article>`).join('');
+    renderBalance();
+  }
+
+  async function runRequest() {
+    if (running || !quote || quote.expiresAt <= Date.now()) { tickQuote(); return; }
+    if (quote.prompt !== $('prompt-input').value || quote.maxOutput !== Number($('output-limit').value)) { invalidateQuote(); return; }
+    if (available < quote.cap) return;
+    const accepted = {...quote};
+    const currentGeneration = generation;
+    const request = {id:`demo-${String(requests.length+1).padStart(4,'0')}`, task:accepted.task, createdAt:new Date().toISOString(), status:'Reserved', cap:accepted.cap, output:Math.min(model.outputTokens,accepted.maxOutput), charge:0};
+    requests.push(request);
+    running = true;
+    available -= request.cap; reserved += request.cap;
+    lockComposer(true); renderHistory();
+    $('quote-state').textContent = 'Maximum reserved';
+    $('quote-timer').textContent = 'Accepted';
+    $('quote-disclaimer').textContent = 'The demo quote is locked for this simulated request.';
+    $('result-panel').hidden = false;
+    $('result-footer').hidden = true;
+    $('result-heading').textContent = 'Your request is on its way.';
+    $('result-status').textContent = 'Reserved';
+    $('result-status').className = 'neutral-status';
+    $('result-output').textContent = `${money(request.cap)} MOCK reserved from your demo balance.\nNo real model, wallet, or payment is connected.`;
+    $('stage-reserved').className = 'done'; $('stage-running').className = ''; $('stage-completed').className = '';
+    announce('Demo maximum reserved. Simulating a model request.');
+    const pause = milliseconds => new Promise(resolve => setTimeout(resolve,milliseconds));
+    await pause(750);
+    if (currentGeneration !== generation) return;
+    request.status = 'Running'; renderHistory();
+    $('stage-running').className = 'done';
+    $('result-status').textContent = 'Running';
+    $('result-output').textContent = 'Simulating a response to your selected sample task…\nYour prompt stays in this browser.';
+    await pause(1100);
+    if (currentGeneration !== generation) return;
+    request.charge = Math.ceil((model.inputTokens * model.inputRate + request.output * model.outputRate) / 1000000);
+    request.status = 'Completed';
+    reserved -= request.cap; available += request.cap-request.charge;
+    running = false; quote = null; lockComposer(false); renderHistory();
+    $('quote-state').textContent = 'Request completed';
+    $('quote-state').className = 'neutral-status completed';
+    $('quote-timer').textContent = 'Settled';
+    $('quote-disclaimer').textContent = 'Demo charge settled. Create a fresh quote to run another sample.';
+    $('stage-completed').className = 'done';
+    $('result-heading').textContent = 'A response. A clear record.';
+    $('result-status').textContent = 'Completed · demo';
+    $('result-status').className = 'neutral-status completed';
+    $('result-output').textContent = samples[request.task].output;
+    $('result-charged').textContent = `${money(request.charge)} MOCK`;
+    $('result-released').textContent = `${money(request.cap-request.charge)} MOCK`;
+    $('result-footer').hidden = false;
+    $('download-latest').dataset.request = request.id;
+    announce(`Demo request complete. Charged ${money(request.charge)} MOCK. Released ${money(request.cap-request.charge)} MOCK. Example receipt ready.`);
+    toast('Demo request complete. Your example receipt is ready.');
+  }
+
+  function reset() {
+    generation++;
+    available = 1000000; reserved = 0; quote = null; requests = []; running = false;
+    $('sample-task').value = 'classify'; $('output-limit').value = '500'; $('prompt-input').value = samples.classify.prompt;
+    lockComposer(false); invalidateQuote(); renderHistory();
+    $('result-panel').hidden = true;
+    navigate('overview'); toast('Demo reset. Your sample balance is 1.000000 MOCK.');
+  }
+
+  document.querySelectorAll('[data-view]').forEach(button => button.addEventListener('click', () => navigate(button.dataset.view)));
+  document.querySelectorAll('[data-start-request]').forEach(button => button.addEventListener('click', () => {navigate('overview'); $('prompt-input').focus();}));
+  $('try-example').addEventListener('click', () => {navigate('overview'); $('prompt-input').focus();});
+  $('new-request').addEventListener('click', () => {navigate('overview'); $('prompt-input').focus();});
+  $('sample-task').addEventListener('change', () => { $('prompt-input').value = samples[$('sample-task').value].prompt; invalidateQuote('Sample changed — create a fresh quote.'); });
+  $('prompt-input').addEventListener('input', () => invalidateQuote());
+  $('output-limit').addEventListener('change', () => invalidateQuote('Output limit changed — create a fresh quote.'));
+  $('create-quote').addEventListener('click', createQuote);
+  $('run-request').addEventListener('click', runRequest);
+  $('reset-demo').addEventListener('click', reset);
+  $('reset-demo-mobile').addEventListener('click', reset);
+  $('download-latest').addEventListener('click', () => downloadReceipt($('download-latest').dataset.request));
+  document.addEventListener('click', event => { const button = event.target.closest('[data-download]'); if (button) downloadReceipt(button.dataset.download); });
+  window.addEventListener('hashchange', () => navigate(location.hash.slice(1)));
+  setInterval(tickQuote, 250);
+  renderHistory();
+  navigate(location.hash.slice(1) || 'overview');
+})();
