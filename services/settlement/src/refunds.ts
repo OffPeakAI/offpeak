@@ -38,14 +38,14 @@ async function inLandedBatch(deps: RefundDeps, row: RefundRow) {
   return (await agreedSignatures(signed.rows, deps.settlers)) !== null
 }
 
-/** An unserved `exact` gets back what the escrow took from this payer, unless a payment row says it was served. */
+/** An unserved `exact` gets back what the escrow took from this payer, unless a payment row says it was served or its money already joined fees. */
 async function exactUnserved(deps: RefundDeps, row: RefundRow) {
   const reqId = row.req_ids[0]
   if (!deps.escrow || row.req_ids.length !== 1 || row.id !== `exact-unserved:${reqId}`) return false
   const view = await deps.reader.readContract({ address: deps.escrow, abi: X402EscrowAbi, functionName: "escrowView", args: [reqId as Hex] })
   if (view.status !== ESCROW_STATUS_EXACT || view.payer.toLowerCase() !== row.payer.toLowerCase() || view.captured !== BigInt(row.amount)) return false
-  const served = await deps.db.query("SELECT 1 FROM shared.agent_payments WHERE payment_id = $1", [reqId])
-  return served.rows.length === 0
+  const spent = await deps.db.query("SELECT 1 FROM shared.agent_payments WHERE payment_id = $1 UNION ALL SELECT 1 FROM chain.swept_payments WHERE source = $1", [reqId])
+  return spent.rows.length === 0
 }
 
 /** Disputes and lost lines return at most what this payer was billed in hours that settled, once per record. */

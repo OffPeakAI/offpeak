@@ -242,9 +242,10 @@ function addRecord(payout: Payout, host: string, hostCost: bigint, fee: bigint) 
 }
 
 /**
- * Every collected unit leaves the pool, so nothing strands there and no hour stalls. A payment that
- * paid for an excluded record hands the difference back to its payer as a refund, and a host never
- * gets paid for a record this hour excluded.
+ * Every collected unit a payment owes leaves the pool, so no hour stalls. A payment that paid for an
+ * excluded record hands the difference back to its payer as a refund, and a host never gets paid for
+ * a record this hour excluded. The vault pays refunds from the reserve, so that difference stays in
+ * the pool, because drawing it into fees would spend the same money twice.
  */
 function applyPayments(input: HourInput, payout: Payout, excluded: Set<string>, gasLeft: number) {
   const drawn: Hex[] = []
@@ -285,15 +286,14 @@ function applyPayments(input: HourInput, payout: Payout, excluded: Set<string>, 
     } else {
       const due = cost + payment.recoveredMicro
       const shortfall = due > payment.amountMicro ? due - payment.amountMicro : 0n
-      if (reserveDraw + shortfall > input.protocolReserve || !poolCovers(payment.amountMicro)) continue
+      const draw = payment.amountMicro < due ? payment.amountMicro : due
+      if (reserveDraw + shortfall > input.protocolReserve || !poolCovers(draw)) continue
       reserveDraw += shortfall
-      agentPoolDraw += payment.amountMicro
+      agentPoolDraw += draw
       payout.fees += payment.recoveredMicro
       drawn.push(payment.paymentId)
       if (payment.amountMicro > due) {
-        const excess = payment.amountMicro - due
-        payout.fees += excess
-        refunds.push({ id: `agent-excess:${payment.paymentId}`, payer: payment.payer, amount: excess, reason: "excluded_record", reqIds: payment.reqIds })
+        refunds.push({ id: `agent-excess:${payment.paymentId}`, payer: payment.payer, amount: payment.amountMicro - due, reason: "excluded_record", reqIds: payment.reqIds })
       }
     }
     for (const c of covered) addRecord(payout, c.host, c.hostCost, c.fee)

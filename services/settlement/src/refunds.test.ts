@@ -214,6 +214,13 @@ describe("refund rows need facts behind them", () => {
       expect((await round(db)).sent.length).toBe(0)
     })
 
+    test("money already swept to fees does not", async () => {
+      const db = await openDatabase("pglite://memory")
+      await row(db, 5n * USDG)
+      await db.query("INSERT INTO chain.swept_payments (payment_id, source, amount, hour) VALUES ($1,$2,$3,1)", [hash("sweep"), REQ, (5n * USDG).toString()])
+      expect((await round(db, taken)).sent.length).toBe(0)
+    })
+
     test("a paid refund naming the same request does not stop it", async () => {
       const db = await openDatabase("pglite://memory")
       await refundRow(db, "agent-excess:p", BUYER, 7n, "excluded_record", [REQ])
