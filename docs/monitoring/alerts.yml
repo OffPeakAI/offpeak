@@ -27,6 +27,19 @@ groups:
         expr: reserve_balance_usdg < 500
         labels: { severity: warn }
         annotations: { summary: "The protocol reserve covers shortfalls and refunds; top it up" }
+      # A starting threshold, to be tuned against real traffic. The reserve is the only outflow with a metric.
+      - alert: ReserveLargeOutflow
+        expr: reserve_balance_usdg < 0.75 * (reserve_balance_usdg offset 6h)
+        labels: { severity: page }
+        annotations: { summary: "The protocol reserve fell by more than a quarter in 6 hours. Find the refunds or draws behind it. See docs/runbooks/pause.md" }
+      - alert: KeeperGasRunningOut
+        expr: keeper_balance_days < 3
+        labels: { severity: warn }
+        annotations: { summary: "The keeper key has under 3 days of gas at its current burn. Top it up" }
+      - alert: KeeperGasLow
+        expr: gas_balance_wei{role="keeper"} < 10000000000000000
+        labels: { severity: page }
+        annotations: { summary: "The keeper key holds under 0.01 ETH. Exits, channel claims and expiries stop when it runs out" }
       - alert: ChannelCloseAtRisk
         expr: channel_close_margin_seconds < 1800
         labels: { severity: page }
