@@ -59,7 +59,7 @@ const chainWithHosts = () => {
   return { ...reader, readContract: read } as PublicClient
 }
 
-const client = (close?: CloseHandler, opts: Partial<OffpeakOptions> = {}) => new Offpeak({ baseURL: BASE, wallet, publicClient: chainWithHosts(), deployment: "local", fetch: close ? withCloseStub(close) : inProcess(booted.app), ...opts })
+const client = (close?: CloseHandler, opts: Partial<OffpeakOptions> = {}) => new Offpeak({ baseURL: BASE, wallet, publicClient: chainWithHosts(), deployment: "local", fetch: close ? withCloseStub(close) : inProcess(booted.app), ...opts, channel: { payUncounted: true, ...opts.channel } })
 
 async function openAndSpend(op: Offpeak) {
   const opened = await op.channels.open(2n * USDG, nowish() + 7 * 3600)
