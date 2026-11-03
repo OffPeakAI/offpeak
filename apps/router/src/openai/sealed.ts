@@ -17,7 +17,7 @@ import { flushCapture } from "../pay/captures.ts"
 import { parseMaxPrice, priceAboveCap } from "../pay/quote.ts"
 import { noteWindowMinute, type PerfFlow } from "../pay/window-perf.ts"
 import { relayAttest, verifiedHost } from "../routing/attest.ts"
-import { firstTokenLimitMs, promptExplainsWait } from "../routing/dispatch.ts"
+import { firstTokenLimitMs, requestExplainsWait } from "../routing/dispatch.ts"
 import { selectHost, type HostCandidate } from "../routing/select.ts"
 import { candidates, hostPrice, windowHostFailing } from "./chat.ts"
 import { commitRecord, flagMetering } from "./commit.ts"
@@ -414,7 +414,7 @@ export async function serveSealed(stack: Stack, req: Request): Promise<Response>
   const control = new AbortController()
   const startedAt = performance.now()
   const timer = setTimeout(() => control.abort(), firstTokenLimitMs(stack, tokensIn))
-  const outran = () => control.signal.aborted && promptExplainsWait(tokensIn)
+  const outran = () => control.signal.aborted && requestExplainsWait(tokensIn)
   const failed = async (res: Response, healthy: boolean) => {
     clearTimeout(timer)
     control.abort()

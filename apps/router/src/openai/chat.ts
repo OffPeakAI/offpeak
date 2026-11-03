@@ -39,7 +39,7 @@ import { nextCheaper } from "../offpeak/forecast.ts"
 import { authorize, paymentRequiredResponse, release, resolveWindow, waitAuthorized } from "../pay/authorize.ts"
 import { flushCapture } from "../pay/captures.ts"
 import { noteWindowMinute, type PerfFlow } from "../pay/window-perf.ts"
-import { absorb, emptyAssembly, openHost, type Assembled, type HostEvent, type Opened } from "../routing/dispatch.ts"
+import { absorb, emptyAssembly, openHost, startCost, type Assembled, type HostEvent, type Opened } from "../routing/dispatch.ts"
 import { featureOff, oai } from "../http.ts"
 import { noteForAudit } from "../audit/capture.ts"
 import { isSealed, serveSealed } from "./sealed.ts"
@@ -55,6 +55,8 @@ const CANDIDATE_TTL_MS = 200
 const BILLING_MARGIN_S = 30
 // Load moves the price between a 402 and the paid retry, and a payment under the new quote is refused.
 const QUOTE_MARGIN_BPS = 11_000n
+// Room for any real schema. An engine compiles this unbilled, since it is no part of the prompt.
+const MAX_RESPONSE_FORMAT_BYTES = 64 * 1024
 
 /** A burst for one model shares one view of hosts and prices. Any chain push clears it. */
 export async function candidates(stack: Stack, model: Hex, now: number, feeBps: number): Promise<HostCandidate[]> {
@@ -443,6 +445,7 @@ export async function serveChat(stack: Stack, req: Request, night?: NightLine, i
   if (!model) return oai(404, "Unknown model", "invalid_request", "model_not_found")
   if (!unpaid && (authed as Payer).mode === 2) return oai(400, "exact is for fixed-cost calls such as embeddings", "invalid_request", "exact_not_allowed")
   if (!messagesOk(body.messages)) return oai(400, "Messages need text content", "invalid_request", "bad_messages")
+  if (formatTooLarge(body.response_format)) return oai(400, "response_format is too large", "invalid_request", "response_format_too_large")
   const refused = await beforeCounting(stack, unpaid ? null : (authed as Payer), raw, ip)
   if (refused) return refused
   const tokensIn = Buffer.byteLength(raw) + 64
@@ -508,7 +511,7 @@ export async function serveChat(stack: Stack, req: Request, night?: NightLine, i
     flow?.drop()
     return pay
   }
-  const opened = await openHost(stack, route.ranked, payload, await headerP, inputTokens)
+  const opened = await openHost(stack, route.ranked, payload, await headerP, startCost(inputTokens, payload, body))
   if (opened.ok) stack.hostWaitMs?.push(opened.ttftMs)
   if (!opened.ok) {
     const refused = opened.error === "refused"
@@ -549,6 +552,15 @@ export function messagesOk(messages: unknown): messages is ChatMessage[] {
     if (content === null || content === undefined || typeof content === "string") return true
     return Array.isArray(content) && content.every((part) => part?.type === "text" && typeof part.text === "string")
   })
+}
+
+/** Stringifying can throw on a value nested too deep, and an engine could not compile that either. */
+function formatTooLarge(format: unknown) {
+  try {
+    return Buffer.byteLength(JSON.stringify(format) ?? "") > MAX_RESPONSE_FORMAT_BYTES
+  } catch {
+    return true
+  }
 }
 
 /**

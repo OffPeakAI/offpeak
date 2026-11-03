@@ -102,20 +102,34 @@ export type Opened = {
   abort: () => void
 }
 
-/** First tokens wait on prefill, so a prompt past the length `noteTtft` scales to gets its time in proportion. */
-export function firstTokenLimitMs(stack: Stack, promptTokens: number) {
-  return Math.min((stack.ttftFailoverMs * Math.max(promptTokens, TTFT_PROMPT_TOKENS)) / TTFT_PROMPT_TOKENS, MAX_REQUEST_S * 1000)
+/** Roughly a token of text, so a body's bytes read in the same unit as its prompt. */
+const BYTES_PER_TOKEN = 4
+/** Past `TTFT_PROMPT_TOKENS`, because even a small schema can take an engine seconds to compile. */
+const COMPILE_TOKENS = 4 * TTFT_PROMPT_TOKENS
+
+/** What a request costs a host to start, in prompt tokens. `compiles` marks a wait the host cannot be judged on. */
+export type StartCost = { tokens: number; compiles: boolean }
+
+/** An engine reads the whole body and compiles any schema or tool list first, and the prompt's tokens show neither. */
+export function startCost(promptTokens: number, payload: string, body: { response_format?: unknown; tools?: unknown }): StartCost {
+  const compiles = body.response_format != null || body.tools != null
+  return { tokens: Math.max(promptTokens, Buffer.byteLength(payload) / BYTES_PER_TOKEN, compiles ? COMPILE_TOKENS : 0), compiles }
 }
 
-/** A buyer picks a prompt's length, so a long one running out of time says nothing about the host. */
-export const promptExplainsWait = (promptTokens: number) => promptTokens > TTFT_PROMPT_TOKENS
+/** First tokens wait on the start, so a request past the length `noteTtft` scales to gets its time in proportion. */
+export function firstTokenLimitMs(stack: Stack, startTokens: number) {
+  return Math.min((stack.ttftFailoverMs * Math.max(startTokens, TTFT_PROMPT_TOKENS)) / TTFT_PROMPT_TOKENS, MAX_REQUEST_S * 1000)
+}
+
+/** A buyer picks what a request costs to start, so a costly one running out of time says nothing about the host. */
+export const requestExplainsWait = (startTokens: number) => startTokens > TTFT_PROMPT_TOKENS
 
 /**
  * Opens a stream on the best host, failing over once before any token has reached the client. Only a 5xx, a
- * timeout on a prompt too short to explain it or a broken stream counts against a host: a 4xx answers this
+ * timeout on a request too cheap to explain it or a broken stream counts against a host: a 4xx answers this
  * request, and a buyer can ask for those. `status` is that 4xx, for a caller to say whose it was.
  */
-export async function openHost(stack: Stack, ranked: HostCandidate[], payload: string, signedHeader: string, promptTokens: number): Promise<Opened | { ok: false; error: string; status?: number }> {
+export async function openHost(stack: Stack, ranked: HostCandidate[], payload: string, signedHeader: string, start: StartCost): Promise<Opened | { ok: false; error: string; status?: number }> {
   let last = "down"
   let status: number | undefined
   for (const host of ranked.slice(0, 2)) {
@@ -125,7 +139,7 @@ export async function openHost(stack: Stack, ranked: HostCandidate[], payload: s
     const timer = setTimeout(() => {
       timedOut = true
       control.abort()
-    }, firstTokenLimitMs(stack, promptTokens))
+    }, firstTokenLimitMs(stack, start.tokens))
     try {
       const res = await stack.hosts.request(host.host, host.endpoint, "/offpeak/v1/chat/completions", {
         method: "POST",
@@ -146,13 +160,13 @@ export async function openHost(stack: Stack, ranked: HostCandidate[], payload: s
       clearTimeout(timer)
       if (first.done) throw new Error("host sent an empty stream")
       const ttftMs = Math.round(performance.now() - started)
-      stack.load.noteTtft(host.host, ttftMs, promptTokens)
+      if (!start.compiles) stack.load.noteTtft(host.host, ttftMs, start.tokens)
       stack.load.noteResult(host.host, true)
       return { ok: true, host: host.host, endpoint: host.endpoint, ttftMs, first: first.value, events, abort: () => control.abort() }
     } catch {
       clearTimeout(timer)
       control.abort()
-      const explained = timedOut && promptExplainsWait(promptTokens)
+      const explained = timedOut && requestExplainsWait(start.tokens)
       if (!explained) stack.load.noteResult(host.host, false)
       last = explained ? "prefill" : timedOut ? "slow" : "error"
     }

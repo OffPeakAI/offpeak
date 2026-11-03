@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import type { Hex } from "viem"
 import { keccak256, toBytes } from "viem"
 import { WindowPerf, sweepWindows } from "../src/pay/window-perf.ts"
-import { firstTokenLimitMs } from "../src/routing/dispatch.ts"
+import { firstTokenLimitMs, startCost } from "../src/routing/dispatch.ts"
 import { bootStack } from "./support/stack.ts"
 
 type Booted = Awaited<ReturnType<typeof bootStack>>
@@ -351,6 +351,85 @@ describe("the wait for a first token", () => {
     booted.stack.ttftFailoverMs = 5
     slowHost(booted, () => 10_000)
     expect((await draw(booted, "short")).status).toBe(503)
+    expect(booted.stack.load.errorRate(booted.host)).toBe(1)
+    await sweepAfter(booted, 2)
+    expect((await demanded(booted))[0]!.tokens_per_s).toBe(0)
+  })
+
+  /** A short prompt with `extra` on the body, from a holder or, with `hold` off, an ordinary buyer. */
+  const drawWith = (booted: Booted, extra: object, hold = true) =>
+    booted.app.request("/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${booted.key.token}`, "content-type": "application/json", ...(hold ? { "x-offpeak-window": WINDOW } : {}) },
+      body: JSON.stringify({ model: "ofm-8b", messages: [{ role: "user", content: "short" }], max_tokens: 8, ...extra }),
+    })
+
+  const schemaOf = (bytes: number) => ({ type: "json_schema", json_schema: { name: "s", schema: { description: "x".repeat(bytes) } } })
+
+  test("counts the whole body and any compiling, not only the prompt", () => {
+    expect(startCost(10, "x".repeat(100), {})).toEqual({ tokens: 25, compiles: false })
+    expect(startCost(10, "x".repeat(40_000), {})).toEqual({ tokens: 10_000, compiles: false })
+    expect(startCost(10, "x".repeat(100), { temperature: 0.5 } as object)).toEqual({ tokens: 25, compiles: false })
+    expect(startCost(10, "x".repeat(100), { response_format: { type: "json_object" } })).toEqual({ tokens: 4_096, compiles: true })
+    expect(startCost(10, "x".repeat(100), { tools: [] })).toEqual({ tokens: 4_096, compiles: true })
+  })
+
+  test("a 4 MB schema on a short prompt is refused unsent, and leaves the error rate and window_perf as they were", async () => {
+    const booted = await bootStack()
+    holdWindow(booted)
+    let asked = 0
+    const real = booted.stack.hosts.request
+    booted.stack.hosts.request = (host, endpoint, path, init) => {
+      asked += 1
+      return real(host, endpoint, path, init)
+    }
+    const res = await drawWith(booted, { response_format: schemaOf(4_000_000) })
+    expect(res.status).toBe(400)
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("response_format_too_large")
+    expect(asked).toBe(0)
+    expect(booted.stack.load.errorRate(booted.host)).toBe(0)
+    await sweepAfter(booted, 2)
+    expect(await demanded(booted)).toEqual([])
+  })
+
+  test("a schema that runs out of time on a short prompt leaves the error rate and window_perf as they were, and the host in routing", async () => {
+    const booted = await bootStack()
+    holdWindow(booted)
+    booted.stack.ttftFailoverMs = 5
+    slowHost(booted, (payload) => (payload.includes("response_format") ? 10_000 : 0))
+    expect((await drawWith(booted, { response_format: schemaOf(1_000) })).status).toBe(503)
+    expect(booted.stack.load.errorRate(booted.host)).toBe(0)
+    await sweepAfter(booted, 2)
+    expect(await demanded(booted)).toEqual([])
+    booted.stack.candidateCache.clear()
+    expect((await drawWith(booted, {}, false)).status).toBe(200)
+  })
+
+  test("a padded body that runs out of time on a short prompt is no failure of the host either", async () => {
+    const booted = await bootStack()
+    holdWindow(booted)
+    booted.stack.ttftFailoverMs = 5
+    slowHost(booted, (payload) => (payload.includes("padding") ? 10_000 : 0))
+    expect((await drawWith(booted, { padding: "x".repeat(20_000) })).status).toBe(503)
+    expect(booted.stack.load.errorRate(booted.host)).toBe(0)
+    await sweepAfter(booted, 2)
+    expect(await demanded(booted)).toEqual([])
+  })
+
+  test("a first token slowed by a schema does not read as a slow host", async () => {
+    const booted = await bootStack()
+    booted.stack.ttftFailoverMs = 1_000
+    slowHost(booted, (payload) => (payload.includes("response_format") ? 30 : 0))
+    expect((await drawWith(booted, { response_format: schemaOf(1_000) }, false)).status).toBe(200)
+    expect(booted.stack.load.ttftP95(booted.host)).toBe(0)
+  })
+
+  test("a host silent on a short prompt with ordinary settings still counts", async () => {
+    const booted = await bootStack()
+    holdWindow(booted)
+    booted.stack.ttftFailoverMs = 5
+    slowHost(booted, () => 10_000)
+    expect((await drawWith(booted, { temperature: 0.7, top_p: 0.9 })).status).toBe(503)
     expect(booted.stack.load.errorRate(booted.host)).toBe(1)
     await sweepAfter(booted, 2)
     expect((await demanded(booted))[0]!.tokens_per_s).toBe(0)
