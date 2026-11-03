@@ -29,6 +29,7 @@ export async function verifyLogin(stack: Stack, message: string, signature: `0x$
 
 /** Nonces nobody spent and sessions past their time. */
 export async function sweepSessions(stack: Stack) {
+  await stack.db.query("DELETE FROM serving.expansion_replays WHERE expires_at <= $1", [stack.clock()])
   await stack.db.query("DELETE FROM serving.siwe_sessions WHERE expires_at <= to_timestamp($1)", [stack.clock()])
 }
 

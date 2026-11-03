@@ -420,13 +420,17 @@ function parseFlex(header: string | null) {
   return parsed.success ? Math.floor(Date.parse(parsed.data) / 1000) : null
 }
 
-export async function serveChat(stack: Stack, req: Request, night?: NightLine, ip = "unknown"): Promise<Response> {
+export async function serveChat(stack: Stack, req: Request, night?: NightLine, ip = "unknown", sessionPayer?: Payer): Promise<Response> {
   const entered = performance.now()
   const started = stack.clock()
+  if (isSealed(req) && req.headers.has("x-offpeak-max-charge")) return oai(400, "Total charge caps are not supported for sealed requests", "invalid_request", "charge_cap_sealed")
   if (isSealed(req)) return serveSealed(stack, req)
   const flexDeadline = night ? undefined : parseFlex(req.headers.get("x-offpeak-flex"))
   if (flexDeadline === null) return oai(400, "X-Offpeak-Flex cannot be read", "invalid_request", "bad_flex")
   if (flexDeadline !== undefined && !stack.flags.night_jobs) return featureOff("Night jobs")
+  const charge = req.headers.get("x-offpeak-max-charge")
+  if (charge !== null && (!/^[1-9]\d{0,17}$/.test(charge))) return oai(400, "Maximum charge must be positive micro-USDG", "invalid_request", "bad_max_charge")
+  if (charge !== null && flexDeadline !== undefined) return oai(400, "A per-call charge cap cannot authorize a delayed job", "invalid_request", "charge_cap_flex")
   const raw = await req.text()
   if (raw.length > 4 * 1024 * 1024) return oai(413, "Body too large", "invalid_request", "body_too_large")
   let body: Record<string, any>
@@ -437,7 +441,7 @@ export async function serveChat(stack: Stack, req: Request, night?: NightLine, i
     return oai(400, "Body is not valid JSON", "invalid_request", "bad_json")
   }
   if (body.n && body.n > 1) return oai(400, "Only n = 1 is supported", "invalid_request", "n_unsupported")
-  const authed = night ? night.actor : await auth(stack, req)
+  const authed = night ? night.actor : sessionPayer ?? await auth(stack, req)
   const unpaid = authed instanceof Response && authed.status === 402 && ((await authed.clone().json()) as { error: { code: string } }).error.code === "payment_required"
   if (authed instanceof Response && !unpaid) return authed
   const modelName = String(body.model ?? "")
@@ -464,7 +468,10 @@ export async function serveChat(stack: Stack, req: Request, night?: NightLine, i
   }
   if (authed instanceof Response) {
     const unpaidRoute = await chooseRoute(stack, { cap, model, modelName, feeBps: FEE_BPS_DEFAULT, started, tokensIn, maxTokens, unattended: false })
-    return unpaidRoute instanceof Response ? unpaidRoute : paymentRequiredResponse(stack, ceilDiv(unpaidRoute.quote * QUOTE_MARGIN_BPS, 10_000n), false)
+    if (unpaidRoute instanceof Response) return unpaidRoute
+    if (charge !== null && unpaidRoute.quote > BigInt(charge)) return oai(429, "This request exceeds your maximum charge", "rate_limit", "charge_above_cap")
+    const offered = ceilDiv(unpaidRoute.quote * QUOTE_MARGIN_BPS, 10_000n)
+    return paymentRequiredResponse(stack, charge !== null && BigInt(charge) < offered ? BigInt(charge) : offered, false)
   }
   const sent = hostChatBody(body, maxTokens)
   const metered = meterable(model, body, sent)
@@ -502,6 +509,11 @@ export async function serveChat(stack: Stack, req: Request, night?: NightLine, i
     else flow?.drop()
     await dropWindow()
     return route
+  }
+  if (charge !== null && route.quote > BigInt(charge)) {
+    flow?.drop()
+    await dropWindow()
+    return oai(429, "This request exceeds your maximum charge", "rate_limit", "charge_above_cap")
   }
   const pay = await authorize(stack, payer, route.quote, raw, windowRun, night?.fromHold).catch(async (err) => {
     flow?.drop()

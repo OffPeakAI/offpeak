@@ -23,7 +23,7 @@ export type Network = {
   serverTime: number
 }
 
-export type ModelRow = { id: string; offpeak: { digest: Hex; context_length: number; hosts: number; live_price_from: { in: string; out: string } | null; sealed_available: boolean } }
+export type ModelRow = { id: string; offpeak: { kind?: "chat" | "embeddings"; digest: Hex; context_length: number; hosts: number; live_price_from: { in: string; out: string } | null; sealed_available: boolean } }
 
 export type Leg = { in: string; out: string }
 

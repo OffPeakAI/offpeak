@@ -18,6 +18,7 @@ export async function listModels(stack: Stack) {
         owned_by: "offpeak",
         offpeak: {
           digest: model.digest,
+          kind: model.kind,
           context_length: model.contextLength,
           hosts: hosts.filter((host) => host.models.some((row) => row.digest === model.digest)).length,
           live_price_from: price ? { in: buyerUnitPrice(price.in, 400).toString(), out: buyerUnitPrice(price.out, 400).toString() } : null,

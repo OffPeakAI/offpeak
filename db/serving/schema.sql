@@ -509,3 +509,11 @@ ALTER TABLE serving.audit_filings ADD COLUMN IF NOT EXISTS signed_tx text;
 
 -- A refused signature leaves no usage record, so the flag has to carry its own time.
 ALTER TABLE serving.metering_flags ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();
+
+-- Expiring replay identifiers, shared by all router instances.
+CREATE TABLE IF NOT EXISTS serving.expansion_replays (
+  id text PRIMARY KEY,
+  expires_at bigint NOT NULL
+);
+CREATE INDEX IF NOT EXISTS expansion_replays_expiry_idx ON serving.expansion_replays(expires_at);
+GRANT SELECT, INSERT, DELETE ON serving.expansion_replays TO offpeak_router;

@@ -235,3 +235,7 @@ Source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE). You 
 Third-party components keep their own licenses, including the tokenizer fixtures in `packages/shared/fixtures/tokenizers/` and the vendored files under `website/`. Models served through Offpeak are licensed by their authors.
 
 <sub>Third-party names describe compatibility only; no affiliation.</sub>
+
+## Expansion components
+
+The [first-five rollout guide](docs/expansion-first-five.md) covers agent adapters, MPP and Bursar payments, wallet Chat with Telegram handoff, host Window creation, and the signed price index. It lists implementation scope, configuration, checks and remaining deployment steps.

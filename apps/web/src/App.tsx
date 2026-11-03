@@ -1,8 +1,9 @@
+import { Chat } from "./pages/Chat.tsx"
+import { Index } from "./pages/Index.tsx"
+import { Agents } from "./pages/Agents.tsx"
 import { useEffect, useState, type MouseEvent } from "react"
 import { WalletChip } from "./components/session.tsx"
-import { useNow } from "./components/ui.tsx"
 import { PAGES, PAGE_PATHS, pageFor, type Page } from "./lib/labels.ts"
-import { hourOfWeek } from "./lib/shared.ts"
 import { Dashboard } from "./pages/Dashboard.tsx"
 import { Docs } from "./pages/Docs.tsx"
 import { Hosts } from "./pages/Hosts.tsx"
@@ -10,7 +11,17 @@ import { Prices } from "./pages/Prices.tsx"
 import { Terms } from "./pages/Terms.tsx"
 import { Windows } from "./pages/Windows.tsx"
 
-const TITLES: Record<Page, string> = { prices: "Prices", dashboard: "Dashboard", windows: "Windows", hosts: "Hosts", docs: "Docs", terms: "Terms" }
+const TITLES: Record<Page, string> = {
+  chat: "Chat",
+  index: "Index",
+  agents: "Agents",
+  prices: "Prices",
+  dashboard: "Dashboard",
+  windows: "Windows",
+  hosts: "Hosts",
+  docs: "Docs",
+  terms: "Terms",
+}
 
 function usePath() {
   const [path, setPath] = useState(location.pathname)
@@ -22,9 +33,19 @@ function usePath() {
   // In-page links stay real anchors, so they work without any of this.
   const follow = (event: MouseEvent) => {
     const link = (event.target as HTMLElement).closest("a")
-    if (!link || link.origin !== location.origin || link.target || event.metaKey || event.ctrlKey || event.shiftKey || event.button !== 0) return
+    if (
+      !link ||
+      link.origin !== location.origin ||
+      link.hasAttribute("data-native") ||
+      link.target ||
+      event.metaKey ||
+      event.ctrlKey ||
+      event.shiftKey ||
+      event.button !== 0
+    )
+      return
     event.preventDefault()
-    history.pushState(null, "", link.pathname + link.hash)
+    history.pushState(null, "", link.pathname + link.search + link.hash)
     setPath(link.pathname)
     if (link.hash) requestAnimationFrame(() => document.getElementById(link.hash.slice(1))?.scrollIntoView())
     else scrollTo(0, 0)
@@ -32,41 +53,55 @@ function usePath() {
   return { path, follow }
 }
 
-/** The week as one line across the top of every page, with this hour marked. */
-function WeekRule() {
-  const now = useNow()
-  const how = hourOfWeek(now)
-  return (
-    <div className="week-rule" aria-hidden="true">
-      <span style={{ left: `${((how + 0.5) / 168) * 100}%` }} />
-    </div>
-  )
-}
-
 export function App() {
   const { path, follow } = usePath()
+  const [menuOpen, setMenuOpen] = useState(false)
   const page = pageFor(path)
   useEffect(() => {
     document.title = page ? `${TITLES[page]} · OFFPEAK` : "OFFPEAK"
     if (location.hash) document.getElementById(location.hash.slice(1))?.scrollIntoView()
   }, [page])
   return (
-    <div className="shell" onClick={follow}>
-      <WeekRule />
-      <header className="nav">
-        <a className="brand" href="/">
-          OFFPEAK
+    <div
+      className="shell"
+      onClick={(event) => {
+        if ((event.target as HTMLElement).closest("a")) setMenuOpen(false)
+        follow(event)
+      }}
+      onKeyDown={(event) => {
+        if (event.key === "Escape") setMenuOpen(false)
+      }}
+    >
+      <header className="nav" data-menu-open={menuOpen}>
+        <a className="brand" data-native href="https://offpeakai.app/" aria-label="OFFPEAK home">
+          <img src="/brand/offpeak-wordmark.svg" alt="OFFPEAK" width="112" height="17" />
         </a>
-        <nav aria-label="Main">
+        <nav aria-label="Main" id="app-menu">
           {PAGES.map((name) => (
             <a key={name} href={PAGE_PATHS[name]} aria-current={page === name ? "page" : undefined}>
               {TITLES[name]}
             </a>
           ))}
         </nav>
-        <WalletChip />
+        <div className="nav-actions">
+          <WalletChip />
+          <button
+            type="button"
+            className="menu-toggle"
+            aria-expanded={menuOpen}
+            aria-controls="app-menu"
+            aria-label={menuOpen ? "Close navigation" : "Open navigation"}
+            onClick={() => setMenuOpen(!menuOpen)}
+          >
+            <span />
+            <span />
+          </button>
+        </div>
       </header>
       <main>
+        {page === "chat" && <Chat />}
+        {page === "index" && <Index />}
+        {page === "agents" && <Agents />}
         {page === "prices" && <Prices />}
         {page === "dashboard" && <Dashboard />}
         {page === "windows" && <Windows />}
