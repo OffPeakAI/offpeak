@@ -1,3 +1,6 @@
+import { Chat } from "./pages/Chat.tsx"
+import { Index } from "./pages/Index.tsx"
+import { Agents } from "./pages/Agents.tsx"
 import { useEffect, useState, type MouseEvent } from "react"
 import { WalletChip } from "./components/session.tsx"
 import { useNow } from "./components/ui.tsx"
@@ -10,7 +13,7 @@ import { Prices } from "./pages/Prices.tsx"
 import { Terms } from "./pages/Terms.tsx"
 import { Windows } from "./pages/Windows.tsx"
 
-const TITLES: Record<Page, string> = { prices: "Prices", dashboard: "Dashboard", windows: "Windows", hosts: "Hosts", docs: "Docs", terms: "Terms" }
+const TITLES: Record<Page, string> = { chat: "Chat", index: "Index", agents: "Agents", prices: "Prices", dashboard: "Dashboard", windows: "Windows", hosts: "Hosts", docs: "Docs", terms: "Terms" }
 
 function usePath() {
   const [path, setPath] = useState(location.pathname)
@@ -67,6 +70,9 @@ export function App() {
         <WalletChip />
       </header>
       <main>
+        {page === "chat" && <Chat />}
+        {page === "index" && <Index />}
+        {page === "agents" && <Agents />}
         {page === "prices" && <Prices />}
         {page === "dashboard" && <Dashboard />}
         {page === "windows" && <Windows />}

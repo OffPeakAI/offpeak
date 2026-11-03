@@ -1,3 +1,4 @@
+import { telegramConfig } from "./expansion/telegram.ts"
 import { readFileSync } from "node:fs"
 import { readDeployment, routerEnv } from "@offpeak/common"
 import { HOUR_CLOSE_GRACE_S, PERMIT2, hourIndex, keepSigners, type Hex } from "@offpeak/shared"
@@ -60,6 +61,7 @@ export function payeeAccount(key: string | undefined, payee: string) {
 export async function bootRouter(source: NodeJS.ProcessEnv = process.env) {
   assertKeySeparation(source, ["OFFPEAK_ROUTER_SIGNER_KEY", "OFFPEAK_CHANNEL_PAYEE_KEY"])
   const env = routerEnv.parse(source)
+  if (source.OFFPEAK_MPP_SECRET && source.OFFPEAK_MPP_SECRET.length < 32) throw new Error("OFFPEAK_MPP_SECRET needs at least 32 characters")
   const payee = payeeAccount(env.OFFPEAK_CHANNEL_PAYEE_KEY, env.OFFPEAK_CHANNEL_PAYEE)
   keepSigners(SIGNER_IDLE_MS)
   const models: ModelEntry[] = modelsFile.parse(JSON.parse(readFileSync(env.OFFPEAK_MODELS_FILE, "utf8")))
@@ -76,6 +78,8 @@ export async function bootRouter(source: NodeJS.ProcessEnv = process.env) {
   }
   const clock = () => Math.floor(Date.now() / 1000)
   const stack: Stack = {
+    telegram: telegramConfig(source),
+    mppSecret: source.OFFPEAK_MPP_SECRET,
     clock,
     setClock: () => undefined,
     ledger: new RedisHolds(redis),

@@ -1,7 +1,7 @@
-export const PAGES = ["prices", "dashboard", "windows", "hosts", "docs"] as const
+export const PAGES = ["chat", "prices", "index", "windows", "agents", "dashboard", "hosts", "docs"] as const
 export type Page = (typeof PAGES)[number] | "terms"
 
-export const PAGE_PATHS: Record<Page, string> = { prices: "/", dashboard: "/dashboard", windows: "/windows", hosts: "/hosts", docs: "/docs", terms: "/terms" }
+export const PAGE_PATHS: Record<Page, string> = { chat: "/chat", index: "/index", agents: "/agents", prices: "/", dashboard: "/dashboard", windows: "/windows", hosts: "/hosts", docs: "/docs", terms: "/terms" }
 
 export function pageFor(pathname: string): Page | null {
   const path = pathname.replace(/\/+$/, "") || "/"

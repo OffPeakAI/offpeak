@@ -1,3 +1,4 @@
+import { createWindowInput, createWindowPlan } from "../../expansion/window-plan.ts"
 import { windowResaleFeeMicro } from "@offpeak/shared"
 import { windowMarketAbi } from "@offpeak/abis"
 import { encodeFunctionData } from "viem"
@@ -20,6 +21,7 @@ async function held(stack: Stack, wallet: string, id: bigint) {
 }
 
 export const windows = router({
+  createPlan: on.input(createWindowInput).mutation(({ctx:{stack,wallet},input})=>createWindowPlan(stack,wallet,input)),
   list: publicProcedure.query(async ({ ctx }) => (await ctx.stack.indexer.windowList()).map((row) => ({ id: row.id.toString(), host: row.host }))),
   /** The Dutch price here is as fresh as the indexer's read of `windowView`. */
   board: publicProcedure.query(async ({ ctx: { stack } }) => {

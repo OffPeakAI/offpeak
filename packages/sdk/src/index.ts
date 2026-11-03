@@ -8,3 +8,6 @@ export { checkProof, envelopeSchema, verifyUsage, type MaxPrice, type Recount, t
 export * from "./sealed/hpke.ts"
 export { ACCEPTED_TCB, attestationRefOf, bindingsHash, checkTranscript, measurementSchema, parseQuote, reportDataFor, type Bindings, type Measurement, type Transcript } from "./sealed/attest.ts"
 export { SealedClient, SealedStream, type HostCheck, type SealedChatOptions, type SealedHost, type SealedOptions, type SealedParams, type SealedResult } from "./sealed/client.ts"
+
+export { mppChannelFetch } from "./mpp.ts"
+export { verifyIndex, type SignedIndex } from "./index-feed.ts"

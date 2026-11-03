@@ -10,7 +10,7 @@ import { SealedClient, addTool, type EngineChunk, type SealedOptions, type Seale
 import { HPKE_STREAM_CONTENT_TYPE } from "./sealed/hpke.ts"
 import { tapSealed, type SealedGate } from "./sealed/stream.ts"
 import { SseParser, tapStream, type SseEvent } from "./sse.ts"
-import { DEFAULT_UPTO_CAP_MICRO, X402, findUpto } from "./upto.ts"
+import { DEFAULT_UPTO_CAP_MICRO, X402, findUpto, uptoRequirementSchema } from "./upto.ts"
 import { assertWithinCap, capFrom, envelopeSchema, verifyUsage, type MaxPrice, type VerifyOptions, type VerifyReport } from "./verify.ts"
 
 const NO_KEY = "offpeak-no-key"
@@ -42,6 +42,8 @@ export type OffpeakOptions = {
 }
 
 export type ChatOptions = {
+  /** Maximum total charge for this request, including fees, in micro-USDG. */
+  maxChargeMicro?: Micro
   /** Buyer price per 1M tokens, fee included, in µUSDG. */
   maxPrice?: { inPerM: Micro; outPerM: Micro }
   /** Wait for a cheaper hour up to this time instead of failing at the cap. */
@@ -72,6 +74,7 @@ export type ChatQueued = { queued: true; jobId: string }
 const chatParams = z.looseObject({ model: z.string().min(1), messages: z.array(z.looseObject({ role: z.string() })).min(1), stream: z.boolean().optional() })
 
 const chatOptions = z.object({
+  maxChargeMicro: z.bigint().positive().max(999999999999999999n).optional(),
   maxPrice: z.object({ inPerM: z.bigint().nonnegative(), outPerM: z.bigint().nonnegative() }).optional(),
   flex: z.union([z.date(), z.iso.datetime()]).optional(),
   windowId: z.union([z.bigint().nonnegative(), z.number().int().nonnegative(), digitsSchema]).optional(),
@@ -125,6 +128,7 @@ function foldChunk(output: { text: string; toolCalls: ToolCall[]; finish: string
 
 function offpeakHeaders(opts: ChatOptions) {
   const headers: Record<string, string> = {}
+  if (opts.maxChargeMicro !== undefined) headers["x-offpeak-max-charge"] = opts.maxChargeMicro.toString()
   if (opts.maxPrice) headers["x-offpeak-max-price"] = `in=${microToUsd(opts.maxPrice.inPerM)},out=${microToUsd(opts.maxPrice.outPerM)}`
   if (opts.flex !== undefined) headers["x-offpeak-flex"] = new Date(opts.flex).toISOString()
   if (opts.windowId !== undefined) headers["x-offpeak-window"] = String(opts.windowId)
@@ -248,6 +252,7 @@ export class Offpeak {
   async chat(params: ChatParams, opts: ChatOptions = {}): Promise<ChatResult | ChatQueued | ChatStream | SealedResult | SealedStream> {
     const body = chatParams.parse(params)
     chatOptions.parse(opts)
+    if (opts.sealed && opts.maxChargeMicro !== undefined) throw new Error("maxChargeMicro is not supported for sealed requests")
     if (opts.sealed) {
       if (opts.flex !== undefined) throw new OffpeakError("sealed_no_flex", "Night jobs cannot be sealed")
       return this.sealed.chat(body as SealedParams, { headers: offpeakHeaders(opts) })
@@ -401,7 +406,7 @@ export class Offpeak {
     if (!usesWindow && this.channels.inUse) return this.viaChannel(url, init, headers, hideEvents, capFrom(headers), gate)
     if (this.apiKey) {
       headers.set("authorization", `Bearer ${this.apiKey}`)
-      return this.follow(await this.ctx.fetch(url, { ...init, headers }), hideEvents)
+      return this.follow(await this.ctx.fetch(url, { ...init, headers }), hideEvents, undefined, undefined, headers.get("x-offpeak-max-charge"))
     }
     return this.viaUpto(url, init, headers, hideEvents)
   }
@@ -419,13 +424,13 @@ export class Offpeak {
       await this.channels.finish(ticket, { delivered: false })
       throw err
     }
-    return this.follow(res, hideEvents, ticket, gate)
+    return this.follow(res, hideEvents, ticket, gate, headers.get("x-offpeak-max-charge"))
   }
 
   /** The fallback path: a 402 names the payment, this client signs it, and the same request goes once more. */
   private async viaUpto(url: string, init: RequestInit, headers: Headers, hideEvents: boolean) {
     const res = await this.ctx.fetch(url, { ...init, headers })
-    if (res.status !== 402 || !this.ctx.signer) return this.follow(res, hideEvents)
+    if (res.status !== 402 || !this.ctx.signer) return this.follow(res, hideEvents, undefined, undefined, headers.get("x-offpeak-max-charge"))
     const offer = findUpto(
       await res
         .clone()
@@ -433,14 +438,23 @@ export class Offpeak {
         .catch(() => null),
     )
     if (!offer) return res
-    const payment = await this.x402.payUpto(offer)
+    const charge = headers.get("x-offpeak-max-charge")
+    const required = BigInt(uptoRequirementSchema.parse(offer).maxAmountRequired)
+    if (charge !== null && required > BigInt(charge)) throw new OffpeakError("above_charge_cap", "Payment offer exceeds the per-request charge cap")
+    const payment = await this.x402.payUpto(offer, charge === null ? {} : { maxAmount: required })
     headers.set("payment-signature", payment.header)
-    return this.follow(await this.ctx.fetch(url, { ...init, headers }), hideEvents)
+    return this.follow(await this.ctx.fetch(url, { ...init, headers }), hideEvents, undefined, undefined, headers.get("x-offpeak-max-charge"))
   }
 
   /** Reads the usage record and owed amount off a response, leaving the response itself to the caller. */
-  private async follow(res: Response, hideEvents: boolean, ticket?: Ticket, gate?: SealedGate) {
-    const settle = (done: Finished) => (ticket ? this.channels.finish(ticket, done) : Promise.resolve())
+  private async follow(res: Response, hideEvents: boolean, ticket?: Ticket, gate?: SealedGate, charge?: string | null) {
+    const settle = async (done: Finished) => {
+      if (charge != null && done.envelope && done.envelope.record.hostCostMicro + done.envelope.record.feeMicro > BigInt(charge)) {
+        if (ticket) await this.channels.finish(ticket, { delivered: false })
+        throw new OffpeakError("above_charge_cap", "Usage record exceeds the per-request charge cap")
+      }
+      if (ticket) await this.channels.finish(ticket, done)
+    }
     if (!res.ok) {
       const refused = res.status === 402 && (await errorFrom(res)).code === "bad_voucher"
       await settle({ delivered: false, voucherRefused: refused })

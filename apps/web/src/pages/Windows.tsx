@@ -1,3 +1,4 @@
+import { WindowCreate } from "./WindowCreate.tsx"
 import { useState, type FormEvent } from "react"
 import { useQuery } from "@tanstack/react-query"
 import { publicActions } from "viem"
@@ -25,6 +26,7 @@ export function Windows() {
       </header>
       <Flagged flag="windows" name="Windows">
         <Board />
+        <WindowCreate />
       </Flagged>
     </>
   )
@@ -100,6 +102,7 @@ function WindowCard({ row, serverTime }: { row: WindowRow; serverTime: number })
         <dd>{formatTokens(row.units)}</dd>
       </dl>
       {phase === "before" && <Buy row={row} />}
+      {phase === "running" && !row.failed && <a className="btn small" href={`/chat?window=${row.id}`}>Use in Chat ↗</a>}
     </li>
   )
 }

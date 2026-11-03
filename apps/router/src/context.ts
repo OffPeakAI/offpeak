@@ -104,6 +104,8 @@ export type Stack = {
   /** Absent means no host is sealed-verified. */
   attest?: AttestBook
   internalToken?: string
+  telegram?: { secret: string; url: string }
+  mppSecret?: string
   production: boolean
   /** Proxies in front of the router that append to `X-Forwarded-For`. Zero or absent means callers connect directly. */
   proxyHops?: number

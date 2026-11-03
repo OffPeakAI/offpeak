@@ -1,3 +1,7 @@
+import { mppChat } from "./expansion/mpp.ts"
+import { telegramWebhook } from "./expansion/telegram.ts"
+import { indexFeed } from "./expansion/index-feed.ts"
+import { sessionChat } from "./expansion/chat.ts"
 import { Hono, type Context, type Next } from "hono"
 import { bodyLimit } from "hono/body-limit"
 import { HOUR_CLOSE_GRACE_S, hourEnd } from "@offpeak/shared"
@@ -52,6 +56,9 @@ export function createApp(stack: Stack) {
   })
   app.get("/health", (c) => c.json({ ok: true }))
   app.get("/v1/status", (c) => c.json(serviceStatus(stack)))
+  app.post("/v1/telegram/webhook", bodyLimit({ maxSize: 64 * 1024 }), (c) => telegramWebhook(stack,c.req.raw))
+  app.get("/v1/index", perIp("index", 30n), async (c) => { c.header("Cache-Control", "no-store"); return c.json(await indexFeed(stack)) })
+  app.post("/v1/chat/session", bodyLimit({ maxSize: 128 * 1024 }), (c) => sessionChat(stack, c.req.raw, ipOf(c)))
   app.get("/v1/models", async (c) => c.json(await listModels(stack)))
   app.get("/v1/tokenizers/:digest", (c) => {
     const digest = c.req.param("digest").toLowerCase()
@@ -60,7 +67,7 @@ export function createApp(stack: Stack) {
     const body = `{"context_length":${model.contextLength},"tokenizer":${publishedTokenizer(digest) ?? "null"}}`
     return c.body(body, 200, { "content-type": "application/json", "cache-control": "public, max-age=86400" })
   })
-  app.post("/v1/chat/completions", (c) => serveChat(stack, c.req.raw, undefined, ipOf(c)))
+  app.post("/v1/chat/completions", bodyLimit({ maxSize: 4 * 1024 * 1024 }), (c) => mppChat(stack, c.req.raw, req => serveChat(stack, req, undefined, ipOf(c))))
   app.post("/v1/embeddings", (c) => serveEmbeddings(stack, c.req.raw, ipOf(c)))
   app.post("/v1/files", (c) => serveUploadFile(stack, c.req.raw))
   app.get("/v1/files/:id/content", (c) => serveFileContent(stack, c.req.raw, c.req.param("id")))

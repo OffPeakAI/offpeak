@@ -1,0 +1,14 @@
+{
+  "name": "@offpeak/agents",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@offpeak/sdk": "workspace:*",
+    "@offpeak/shared": "workspace:*",
+    "zod": "^4.0.0"
+  }
+}
