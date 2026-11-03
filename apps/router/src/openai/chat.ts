@@ -446,6 +446,7 @@ export async function serveChat(stack: Stack, req: Request, night?: NightLine, i
   if (!unpaid && (authed as Payer).mode === 2) return oai(400, "exact is for fixed-cost calls such as embeddings", "invalid_request", "exact_not_allowed")
   if (!messagesOk(body.messages)) return oai(400, "Messages need text content", "invalid_request", "bad_messages")
   if (formatTooLarge(body.response_format)) return oai(400, "response_format is too large", "invalid_request", "response_format_too_large")
+  if (!wellFormed(body)) return oai(400, "Strings must be well-formed Unicode", "invalid_request", "bad_unicode")
   const refused = await beforeCounting(stack, unpaid ? null : (authed as Payer), raw, ip)
   if (refused) return refused
   const tokensIn = Buffer.byteLength(raw) + 64
@@ -561,6 +562,26 @@ function formatTooLarge(format: unknown) {
   } catch {
     return true
   }
+}
+
+/** Read by code point, so a valid pair never matches. */
+const LONE_SURROGATE = /\p{Cs}/u
+
+/** A lone surrogate survives JSON but not a tokenizer, so an engine would refuse what the router vouched for. Nesting can run deep, so this keeps its own stack. */
+function wellFormed(body: unknown) {
+  const pending = [body]
+  while (pending.length > 0) {
+    const value = pending.pop()
+    if (typeof value === "string") {
+      if (LONE_SURROGATE.test(value)) return false
+    } else if (typeof value === "object" && value !== null) {
+      for (const [key, item] of Object.entries(value)) {
+        if (LONE_SURROGATE.test(key)) return false
+        pending.push(item)
+      }
+    }
+  }
+  return true
 }
 
 /**

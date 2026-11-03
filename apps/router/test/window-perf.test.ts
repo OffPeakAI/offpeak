@@ -436,6 +436,69 @@ describe("the wait for a first token", () => {
   })
 })
 
+describe("strings that are not well-formed", () => {
+  /** A holder's raw JSON, with the host counting how often it is asked. */
+  function rawDraw(booted: Booted) {
+    let asked = 0
+    const real = booted.stack.hosts.request
+    booted.stack.hosts.request = (host, endpoint, path, init) => {
+      if (path === "/offpeak/v1/chat/completions") asked += 1
+      return real(host, endpoint, path, init)
+    }
+    const send = (body: string) =>
+      booted.app.request("/v1/chat/completions", {
+        method: "POST",
+        headers: { authorization: `Bearer ${booted.key.token}`, "content-type": "application/json", "x-offpeak-window": WINDOW },
+        body,
+      })
+    return { send, asked: () => asked }
+  }
+
+  const records = async (booted: Booted) => (await booted.stack.db.query("SELECT 1 FROM shared.usage_records")).rows.length
+
+  test("a lone surrogate anywhere in the body is refused before the Window flow, and bills nothing", async () => {
+    const booted = await bootStack()
+    holdWindow(booted)
+    const { send, asked } = rawDraw(booted)
+    const user = { role: "user", content: "hi" }
+    const bodies = [
+      { model: "ofm-8b", messages: [{ role: "user", content: "hi \ud800" }] },
+      { model: "ofm-8b", messages: [{ role: "user", content: [{ type: "text", text: "\udc00 reversed \ud83d" }] }] },
+      { model: "ofm-8b", messages: [user], stop: ["\ud800"] },
+      { model: "ofm-8b", messages: [user], response_format: { type: "json_schema", json_schema: { schema: { "\ud800": 1 } } } },
+    ]
+    for (const body of bodies) {
+      const res = await send(JSON.stringify(body))
+      expect(res.status).toBe(400)
+      expect(((await res.json()) as { error: { code: string } }).error.code).toBe("bad_unicode")
+    }
+    expect(asked()).toBe(0)
+    expect(await records(booted)).toBe(0)
+    await sweepAfter(booted, 2)
+    expect((await samples(booted)).rows.filter((row) => row.demanded)).toEqual([])
+    expect(booted.stack.load.errorRate(booted.host)).toBe(0)
+  })
+
+  test("normal Unicode is served, written out or escaped as a pair", async () => {
+    const booted = await bootStack()
+    holdWindow(booted)
+    const { send } = rawDraw(booted)
+    expect((await send(JSON.stringify({ model: "ofm-8b", max_tokens: 8, messages: [{ role: "user", content: "naïve 日本語 😀" }] }))).status).toBe(200)
+    expect((await send('{"model":"ofm-8b","max_tokens":8,"messages":[{"role":"user","content":"\\ud83d\\ude00 and a literal \\\\ud800"}]}')).status).toBe(200)
+    expect(await records(booted)).toBe(2)
+  })
+
+  test("a body nested too deep to walk by recursion is still refused cleanly", async () => {
+    const booted = await bootStack()
+    holdWindow(booted)
+    const { send, asked } = rawDraw(booted)
+    const deep = "[".repeat(1_000_000) + "]".repeat(1_000_000)
+    const res = await send(`{"model":"ofm-8b","messages":[{"role":"user","content":"hi"}],"junk":${deep}}`)
+    expect(res.status).toBe(400)
+    expect(asked()).toBe(0)
+  })
+})
+
 describe("X-Offpeak-Window", () => {
   test("a Window for another model does not draw, and says why", async () => {
     const booted = await bootStack()
