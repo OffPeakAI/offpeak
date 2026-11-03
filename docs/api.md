@@ -6,7 +6,7 @@ Prepaid buyers send `Authorization: Bearer op_live_…`. Agents pay by channel o
 
 ## Chat
 
-`POST /v1/chat/completions` accepts an OpenAI-shaped chat body. `n` greater than 1 is rejected. The output limit is the lowest of what you asked, 4096, and what is left of the model's context.
+`POST /v1/chat/completions` accepts an OpenAI-shaped chat body. `n` greater than 1 is rejected. Bodies with ill-formed Unicode are refused with `bad_unicode`, and an oversized `response_format` with `response_format_too_large`. The output limit is the lowest of what you asked, 4096, and what is left of the model's context.
 
 Every message needs a `role` of `system`, `developer`, `user`, `assistant`, `tool` or `function`, or the request is `400 bad_messages`. `max_tokens` and `max_completion_tokens` must be positive whole numbers, or `400 bad_max_tokens`. A body that cannot be billed is `400 bad_body` before any payment is taken: a number too large to represent, such as `1e999`, or messages the model's chat template refuses. If the host turns a request down with a 4xx, you get `400 host_refused` and nothing is charged.
 
