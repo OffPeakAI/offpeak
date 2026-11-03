@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <img alt="Status: pre-launch" src="https://img.shields.io/badge/status-pre--launch-242523?style=flat-square">
+  <img alt="Status: P1 live on mainnet" src="https://img.shields.io/badge/status-P1%20live%20on%20mainnet-242523?style=flat-square">
   <img alt="Chain: Robinhood Chain 4663" src="https://img.shields.io/badge/chain-4663-242523?style=flat-square">
   <img alt="Contracts: Solidity 0.8.26" src="https://img.shields.io/badge/solidity-0.8.26-242523?style=flat-square">
   <img alt="Runtime: Bun" src="https://img.shields.io/badge/runtime-bun-242523?style=flat-square">
@@ -27,7 +27,7 @@
 </p>
 
 > [!IMPORTANT]
-> **Pre-launch.** Nothing here is on mainnet yet, and the addresses in [`packages/abis/deployments/4663.json`](packages/abis/deployments/4663.json) stay zero until a deployment is published. The contracts have had internal reviews but no external audit. Launch status lives in [`docs/launch/`](docs/launch/).
+> **P1 is live on Robinhood Chain mainnet (chain 4663).** The vault, host registry, usage ledger, audit court and fee splitter are deployed and owned by a timelock, with a 500 USDG per-buyer beta deposit cap. Addresses are in [`packages/abis/deployments/4663.json`](packages/abis/deployments/4663.json); the vault is [`0x696C1Bb94522924deBAB672936AfEb59a532a8D3`](https://robinhoodchain.blockscout.com/address/0x696C1Bb94522924deBAB672936AfEb59a532a8D3). No host is serving yet, so paid inference starts once the first hosts finish their 72-hour probation. P2 and P3 contracts are not deployed. The contracts have had internal reviews but no external audit, which comes before the cap lifts. Launch status lives in [`docs/launch/`](docs/launch/).
 
 ## Why
 
