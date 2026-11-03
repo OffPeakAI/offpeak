@@ -34,6 +34,20 @@ Out of scope:
 
 [`docs/audit-scope.md`](docs/audit-scope.md) has the same list path by path.
 
+## Privileged roles
+
+Nothing is deployed, so these holders are the plan. [`docs/architecture.md`](docs/architecture.md) has each role's functions and how it changes.
+
+- **Owner.** A timelock with a 48 hour delay, driven by the `multisig` Safe (2 of 3). The deployer key holds nothing after handoff.
+- **Guardian.** The `guardian` Safe (2 of 3), separate people from the multisig. It can pause and claw back without a delay.
+- **Settlers.** Three keys on separate machines, 2 of 3.
+- **Rulers.** Three keys on separate machines, 2 of 3.
+- **Panel.** The `panel` Safe, at least 3 of 5 human reviewers who hold no other Offpeak key.
+- **Router signer and channel payee.** Two separate keys, both held by the router.
+- **Relay and capturer.** Two keys, both held by the facilitator.
+- **Keeper.** One key, held by the keepers.
+- **Burn keeper.** Unset until the legal gate passes.
+
 ## Known risks
 
 These come from [`docs/launch/security-review.md`](docs/launch/security-review.md) and [`docs/launch/gate-p3.md`](docs/launch/gate-p3.md), which call them accepted, for the external auditors to weigh. That external audit has not happened yet, so this list can change. It covers only these items. It does not say the code has no other issues.
