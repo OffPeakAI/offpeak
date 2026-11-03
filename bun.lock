@@ -75,8 +75,7 @@
       "name": "@offpeak/web",
       "version": "0.1.0",
       "dependencies": {
-        "@fontsource/fraunces": "^5.2.0",
-        "@fontsource/outfit": "^5.2.0",
+        "@fontsource-variable/manrope": "5.3.0",
         "@offpeak/shared": "workspace:*",
         "@tanstack/react-query": "^5.80.0",
         "react": "^19.0.0",
@@ -380,9 +379,7 @@
 
     "@ethereumjs/util": ["@ethereumjs/util@8.1.0", "", { "dependencies": { "@ethereumjs/rlp": "^4.0.1", "ethereum-cryptography": "^2.0.0", "micro-ftch": "^0.3.1" } }, "sha512-zQ0IqbdX8FZ9aw11vP+dZkKDkS+kgIvQPHnSAXzP9pLu+Rfu3D3XEeLbicvoXJTYnhZiPmsZUxgdzXwNKxRPbA=="],
 
-    "@fontsource/fraunces": ["@fontsource/fraunces@5.3.0", "", {}, "sha512-LEHTOBiZufQzAvnAe2rZ8ZknbDS28Q9kzwb0L+gZJEmjLGr8hhZ/5NuHXwDuHBWhVXYoiGGXmrb0H6Ko/RrHTg=="],
-
-    "@fontsource/outfit": ["@fontsource/outfit@5.3.0", "", {}, "sha512-0AVHzTTVJSxWDOxPKSfMeHhZeBFDU3cmgrcOb76ZEyhGo0+xgyG3GsLF3h9+X8w0IX7G4jzjJgFQEBiWdX6VgA=="],
+    "@fontsource-variable/manrope": ["@fontsource-variable/manrope@5.3.0", "", {}, "sha512-6D5dgokHsWDDMtmXHznKa0hK229NN+1a4BLPmUCLqcO1Pw5EEhWY5RFt0AcXnVRAljFFPfRtLkJePQj6LSsV6g=="],
 
     "@gemini-wallet/core": ["@gemini-wallet/core@0.3.2", "", { "dependencies": { "@metamask/rpc-errors": "7.0.2", "eventemitter3": "5.0.1" }, "peerDependencies": { "viem": ">=2.0.0" } }, "sha512-Z4aHi3ECFf5oWYWM3F1rW83GJfB9OvhBYPTmb5q+VyK3uvzvS48lwo+jwh2eOoCRWEuT/crpb9Vwp2QaS5JqgQ=="],
 

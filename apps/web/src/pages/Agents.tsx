@@ -19,7 +19,7 @@ export function Agents() {
         </p>
       </header>
       <div className="chat-layout">
-        <section className="section">
+        <section className="section agent-connection">
           <h2>Connect your runtime</h2>
           <p>API base URL</p>
           <pre>{`${origin}/v1`}</pre>
