@@ -2,7 +2,24 @@ name: CI
 
 on:
   push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "website/**"
+      - "assets/**"
   pull_request:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "website/**"
+      - "assets/**"
+  workflow_dispatch:
+
+# A newer push replaces a run still going on the same ref, so minutes go to the latest code only.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -10,7 +27,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 30
     services:
       redis:
         image: redis:7.4-alpine@sha256:8da19c7399dca900c6822a1cf30f9d2285585e2c4b457ff4095b0f4500054d3f

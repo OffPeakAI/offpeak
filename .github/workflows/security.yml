@@ -1,8 +1,14 @@
 name: Security
 
+# Weekly and on demand. The pre-commit and pre-push hooks already scan for secrets on every change.
 on:
-  push:
-  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: security
+  cancel-in-progress: true
 
 permissions:
   contents: read
